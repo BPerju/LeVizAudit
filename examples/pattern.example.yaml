@@ -1,0 +1,27 @@
+# vizaudit-overlay pattern config -- pixel coordinates on the configured camera image,
+# NOT world/robot-frame units. See CLAUDE.md's vision-only/no-FK decision.
+
+camera_key: observation.images.top   # must match a key in the dataset's meta/info.json features
+
+objects:
+  - name: cube
+    count: 12          # number of episodes this object's pattern covers; wraps if the
+                        # session runs longer
+    variable: true      # tracked -- a target marker is shown for this object each episode
+    pattern:
+      shape: arc                # arc | line
+      center: [320, 240]          # pixel xy, image center for a 640x480 camera
+      radius: 150                  # pixels
+      angle_start_deg: 0            # 0 = +x axis (rightward)
+      angle_end_deg: 180             # 0-180 = semicircle below center; 0-360 = full circle
+
+  - name: distractor_block
+    count: 1
+    variable: false    # not tracked -- no marker is ever drawn for this object; the
+                        # operator places it anywhere
+    pattern: null
+
+marker:
+  radius_px: 10
+  color_rgba: [255, 64, 64, 255]
+  label: true            # draw the object name next to its target point

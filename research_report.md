@@ -3,6 +3,17 @@
 Pre-implementation research conducted June 16, 2026. All findings are from direct source
 fetches unless flagged with ⚠️ UNVERIFIED.
 
+**Update 2026-06-17 — scope narrowed to visual features only.** Confirmed against a real
+dataset (`Bperju/so101_cube_pick_place_50`, see §1) that `observation.state`/`action` are
+joint-angle space only — no `eef_pos`/`eef_rot`, so there is no Cartesian pose to read off
+the parquet schema. Forward kinematics would need a robot-specific URDF chain, which breaks
+the robot-agnostic goal and isn't needed anyway: for a pick-place task the thing worth
+auditing (object/cube position diversity) is only visible in the camera image, not in joint
+state. **v1 scope is therefore vision-only**: the core engine consumes camera frames
+(`observation.images.*`), not robot state. FK/6D-pose is out of scope until there's a
+concrete need for it post-v1. Detection-model options (YOLO/SAM/FoundPose) below are kept as
+reference but are also deferred — v1 starts with classical CV (contour → PCA) only.
+
 ---
 
 ## 1. huggingface/lerobot (v0.5.2)
@@ -130,11 +141,15 @@ production-ready.
 
 **Other requirements:** Python >= 3.12, torch >= 2.7.
 
-⚠️ UNVERIFIED: Whether the standard Parquet schema includes Cartesian end-effector pose
-columns (e.g., `observation.eef_pos`, `observation.eef_rot`) or only joint angles. This is
-load-bearing for the audit tool — if only joint angles are present, forward kinematics is
-needed to get spatial positions. Verify by inspecting `dataset.meta.features` on a real
-dataset before committing to a detection approach.
+✅ CONFIRMED (2026-06-17) against `Bperju/so101_cube_pick_place_50`
+(`meta/info.json`): `action`/`observation.state` are joint-angle space only
+(`shoulder_pan.pos`, `shoulder_lift.pos`, `elbow_flex.pos`, `wrist_flex.pos`,
+`wrist_roll.pos`, `gripper.pos`) — no Cartesian pose fields at all. Two camera streams:
+`observation.images.top`, `observation.images.wrist`. Dataset is `codebase_version: v3.0`
+(chunked parquet) — confirms read access must go through the installed `LeRobotDataset`
+class rather than assuming v2.x single-episode-file layout, though read-only access is
+unaffected by the v3.0 editing bugs listed above. **Decision: core engine is vision-only,
+operating on `observation.images.top`/`.wrist` frames. No FK.**
 
 ---
 
@@ -255,6 +270,12 @@ preprocessing step.
 
 ## 4. Object detection and orientation on GTX 1660 Ti (6 GB VRAM)
 
+**v1 scope: classical CV only (contour → PCA → `minAreaRect`).** It's zero-cost,
+deterministic, CPU-only, and sufficient for an isolated cube on a fixed top-down camera.
+The detection-model tables below (YOLO, SAM variants, FoundPose) are kept as reference for
+when classical CV proves insufficient (clutter, occlusion, variable lighting) — not part of
+the current build.
+
 ### Detection models
 
 | Model | VRAM | 30 fps on 1660 Ti? | Notes |
@@ -315,14 +336,15 @@ No mainstream lightweight 6D pose model exists as a simple `pip install`. Do not
 
 ### Recommended approach
 
-1. **Start with classical CV** (OpenCV contour → PCA) for clean workspaces. It's zero-cost,
-   deterministic, and sufficient for simple elongated tools on a solid background.
-2. **Fall back to YOLOv8n + MobileSAM** when robustness is needed (multiple objects,
-   variable lighting, partial occlusion). Total overhead ~1 GB VRAM.
-3. **Do not implement 6D pose** initially — no pip-installable solution exists.
+1. **v1: classical CV only** (OpenCV contour → PCA) on `observation.images.top`. Zero-cost,
+   deterministic, sufficient for an isolated cube on a solid background.
+2. **Deferred:** YOLOv8n + MobileSAM fallback for robustness (multiple objects, variable
+   lighting, partial occlusion) — only if v1 classical CV proves insufficient on real footage.
+3. **Out of scope:** 6D pose and FK — no pip-installable 6D solution exists, and FK isn't
+   needed since the audit target (cube position) is only observable visually anyway.
 
-Hybrid pipeline: use learned segmentation to get the object mask, then run OpenCV PCA on
-the masked contour for orientation. Best of both: semantic robustness + lightweight orientation.
+Hybrid pipeline (deferred): learned segmentation for the object mask, then OpenCV PCA on the
+masked contour for orientation. Not needed unless classical CV fails on real footage.
 
 ---
 
@@ -349,10 +371,65 @@ lerobot-dataset-visualizer.**
 
 ## 6. Open questions requiring manual testing
 
-| Question | Why it matters |
-|----------|----------------|
-| Default Rerun gRPC port after `rr.spawn()` in lerobot ≥ 0.24 | Required for Option A (attach to spawned viewer) |
-| What `--display_data` actually renders in the Rerun viewer | Determines how to integrate the overlay visually |
-| Does `dataset.meta.features` include `eef_pos`/`eef_rot` for SO-101 datasets? | If not, FK or external detection needed before audit can extract spatial positions |
-| `episode-viewer.tsx` file structure in lerobot-dataset-visualizer | Needed if a panel contribution is considered later |
-| `minAreaRect` reliability on your specific objects under your lighting | Determines whether classical CV path is viable without a learned fallback |
+| Question | Why it matters | Status |
+|----------|----------------|--------|
+| Can Phase 1 (Rerun overlay) and Phase 2 (dataset-visualizer panel) be served by one package? | Determines whether there's a single `vizaudit/core` or two diverging implementations | ✅ resolved — yes, see §7 |
+| Default Rerun gRPC port after `rr.spawn()` in lerobot ≥ 0.24 | Required for Option A (attach to spawned viewer) | open |
+| What `--display_data` actually renders in the Rerun viewer | Determines how to integrate the overlay visually | open |
+| `episode-viewer.tsx` file structure in lerobot-dataset-visualizer | Needed if a panel contribution is considered later | open |
+| `minAreaRect` reliability on your specific objects under your lighting | Determines whether classical CV path is viable without a learned fallback | open |
+| ~~Does `dataset.meta.features` include `eef_pos`/`eef_rot`?~~ | ~~Determines FK need~~ | ✅ resolved — no, vision-only (see §1) |
+
+---
+
+## 7. Shared core engine: Phase 1 (live overlay) vs Phase 2 (dataset panel)
+
+Verified 2026-06-17 by reading source and loading a real frame from
+`Bperju/so101_cube_pick_place_50`.
+
+### Frame format comparison
+
+| | Phase 1 (live) | Phase 2 (dataset) |
+|---|---|---|
+| Source | `robot.get_observation()` → camera `.read()`/`.read_latest()` | `LeRobotDataset[i]["observation.images.top"]` |
+| Confirmed via | `src/lerobot/cameras/opencv/camera_opencv.py` (`ColorMode.RGB` default), `src/lerobot/robots/so_follower/so_follower.py:72` (`(h, w, 3)` shape) | `src/lerobot/datasets/video_utils.py:144` (`frame.to_ndarray(format="rgb24")`), live-loaded: `torch.Tensor`, `torch.float32`, shape `[3, 480, 640]`, range `[0.0, 1.0]` |
+| Container | `np.ndarray` | `torch.Tensor` |
+| Layout | HWC | CHW |
+| Dtype / range | `uint8`, `[0, 255]` | `float32`, `[0.0, 1.0]` |
+| Color space | RGB | RGB (same — both paths use `rgb24`/`COLOR_BGR2RGB`) |
+
+Color space matches on both paths, so there's no semantic conversion needed — only a
+layout/dtype reshape. That reshape is one line:
+
+```python
+frame_hwc_uint8 = (tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)  # dataset -> canonical
+```
+
+### Conclusion
+
+**One package is correct, not two.** Define the core engine's input contract as canonical
+`HWC uint8 RGB np.ndarray` — which is exactly the live format already, so Phase 1 pays zero
+conversion cost — and give Phase 2 a one-line adapter at the dataset-read boundary. Layout:
+
+- `vizaudit/core/` — `compute_frame_metrics(frame: np.ndarray) -> dict`, no knowledge of Rerun
+  or `LeRobotDataset`. Same function called by both sinks below.
+- `vizaudit/overlay/` — Phase 1 sink. Separate process attaching to the shared Rerun gRPC
+  server (§1 Option B), feeding live frames into `compute_frame_metrics()` and logging the
+  result back into the same recording.
+- `vizaudit/export/` — Phase 2 sink. Batch-iterates a `LeRobotDataset`, applies the one-line
+  adapter above, calls the same `compute_frame_metrics()`, and writes the aggregated result
+  as a sidecar artifact for the dataset-visualizer panel to read.
+
+### Environment check
+
+All dependencies needed for both sinks are already present in the project's conda env
+(`lerobot`, not a separate `uv` env on this machine) — vizaudit adds no new heavy
+dependencies for this part:
+
+| Package | Installed version |
+|---|---|
+| rerun-sdk | 0.26.2 |
+| opencv-python | 4.13.0 |
+| av (PyAV) | 15.1.0 |
+| torch | 2.11.0+cu130 |
+| numpy | 2.2.6 |

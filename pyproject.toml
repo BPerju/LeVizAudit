@@ -1,0 +1,23 @@
+[project]
+name = "vizaudit"
+version = "0.1.0"
+description = "Spatial-diversity guidance overlay and audit tool for lerobot-record sessions."
+requires-python = ">=3.12"
+dependencies = [
+    "rerun-sdk>=0.24.0,<0.27.0",
+    "numpy>=2.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+vizaudit-overlay = "vizaudit.overlay.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
