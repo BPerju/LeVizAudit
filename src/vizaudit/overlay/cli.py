@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+from pathlib import Path
 
+from vizaudit.overlay.calibrate import DEFAULT_SAVE_PATH
 from vizaudit.overlay.config import load_config
 from vizaudit.overlay.dataset_watcher import resolve_dataset_root
 from vizaudit.overlay.session import run_session
@@ -21,7 +23,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Guided data-collection overlay: shows per-episode placement targets in Rerun."
     )
-    parser.add_argument("--config", required=True, help="Path to a pattern/object YAML config.")
+    parser.add_argument(
+        "--config",
+        default=DEFAULT_SAVE_PATH,
+        help=f"Path to a pattern/object YAML config. Defaults to {DEFAULT_SAVE_PATH!r} -- "
+        f"the same path vizaudit-calibrate's 'Save to file...' button writes to, so running "
+        f"the two tools in sequence from the same directory needs no --config flag.",
+    )
     parser.add_argument(
         "--connect",
         required=True,
@@ -45,7 +53,14 @@ def main() -> None:
     args = build_arg_parser().parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
 
-    config = load_config(args.config)
+    config_path = Path(args.config)
+    if not config_path.exists():
+        raise SystemExit(
+            f"Config file not found: {config_path}. Run vizaudit-calibrate first (its "
+            f"'Save to file...' button writes to {DEFAULT_SAVE_PATH!r} by default), or pass "
+            f"--config explicitly."
+        )
+    config = load_config(config_path)
     dataset_root = resolve_dataset_root(args.repo_id, args.root)
     host, port = args.connect
 

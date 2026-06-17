@@ -1,0 +1,1762 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>VizAudit calibration</title>
+<style>
+  :root {
+    --bg: #0a0e17;
+    --surface-0: #0d1220;
+    --surface-1: #11172a;
+    --surface-2: #151c33;
+    --border-subtle: rgba(255,255,255,0.05);
+    --border-strong: rgba(255,255,255,0.1);
+    --text-primary: #e7ebf3;
+    --text-muted: #9aa3b5;
+    --text-faint: #5b6274;
+    --accent: #38bdf8;
+    --accent-soft: rgba(56,189,248,0.18);
+    --result: #34d399;
+    --cut: #f87171;
+    --marker: #f5f5f5;
+    --radius: 6px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text-primary);
+    font-family: -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
+    margin: 0;
+    padding: 24px;
+    -webkit-font-smoothing: antialiased;
+  }
+  h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 4px; }
+  h2 { font-size: 0.85rem; font-weight: 600; color: var(--text-muted); margin: 0 0 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .subtitle { color: var(--text-muted); font-size: 0.85rem; max-width: 860px; margin: 0 0 18px; }
+  .note { color: var(--text-faint); font-size: 0.78rem; max-width: 860px; }
+  code { background: var(--surface-2); border-radius: 4px; padding: 1px 5px; font-size: 0.85em; }
+
+  .panel {
+    border-radius: var(--radius);
+    border: 1px solid var(--border-subtle);
+    background: rgba(255,255,255,0.02);
+    padding: 14px;
+    margin-bottom: 16px;
+  }
+
+  .toolbar { display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-end; }
+  .toolbar-group { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .toolbar-label {
+    font-size: 0.72rem; color: var(--text-faint); text-transform: uppercase;
+    letter-spacing: 0.05em; width: 100%; margin-bottom: 2px;
+  }
+  .toolbar-group-inner { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+  button, select, input[type="number"] {
+    background: var(--surface-1);
+    color: var(--text-primary);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    padding: 6px 10px;
+    font-size: 0.82rem;
+    font-family: inherit;
+  }
+  button { cursor: pointer; transition: border-color 0.15s, color 0.15s, background 0.15s; }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button.danger:hover:not(:disabled) { border-color: var(--cut); color: var(--cut); }
+  button.icon-btn { font-size: 1rem; padding: 6px 9px; line-height: 1; }
+  button.icon-btn svg { display: block; }
+  button.active { border-color: var(--cut); color: var(--cut); background: rgba(248,113,113,0.12); }
+  button.active:hover:not(:disabled) { border-color: var(--cut); color: var(--cut); }
+  input[type="number"] { width: 64px; }
+  label { font-size: 0.82rem; color: var(--text-muted); display: flex; align-items: center; gap: 5px; }
+  input[type="checkbox"] { accent-color: var(--accent); }
+
+  .views { display: flex; flex-wrap: wrap; gap: 16px; }
+  .view-panel { flex: 1 1 380px; min-width: 320px; }
+  .video-wrap { position: relative; width: 100%; line-height: 0; }
+  video, #cameraCanvas {
+    width: 100%;
+    height: auto;
+    border-radius: var(--radius);
+    background: var(--surface-0);
+    display: block;
+  }
+  #orthoCanvas {
+    width: 100%;
+    height: auto;
+    border-radius: var(--radius);
+    background: var(--surface-0);
+    display: block;
+  }
+  /* #cameraCanvas is a transparent overlay on top of the live <video> -- it must NOT
+     inherit an opaque background, or it paints over and hides the feed. */
+  #cameraCanvas { position: absolute; top: 0; left: 0; cursor: crosshair; background: transparent; }
+  #orthoCanvas { cursor: crosshair; }
+  /* A knife cursor while a cut-drawing tool is active, requested explicitly so the cut
+     tool reads as "cut" rather than the generic crosshair used for every other mode. The
+     ", crosshair" fallback covers browsers that can't parse the inline-SVG cursor.
+     This used to render the actual knife emoji via an SVG <text> element, with a
+     hand-picked hotspot (2, 26) guessed to land on the blade's visual tip -- a real,
+     reported bug: an emoji glyph's rendered shape (and therefore where its "tip" actually
+     falls within the image) varies by font/platform/browser, so a hotspot tuned by eye on
+     one system reliably looks offset on another. Replaced with a plain vector wedge drawn
+     with explicit coordinates, so the tip is a known point (2, 2) -- not a guess about
+     glyph metrics -- and the hotspot is set to that exact point. */
+  #cameraCanvas.cut-cursor {
+    cursor: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22"><polygon points="2,2 20,8 8,20" fill="white" stroke="black" stroke-width="1.5" stroke-linejoin="round"/></svg>') 2 2, crosshair;
+  }
+  #cameraCanvas.edit-cursor, #orthoCanvas.edit-cursor { cursor: grab; }
+
+  textarea {
+    width: 100%;
+    height: 180px;
+    background: var(--surface-0);
+    color: var(--text-primary);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    font-family: "SF Mono", Consolas, monospace;
+    font-size: 0.82rem;
+    padding: 10px;
+  }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 0.78rem; color: var(--text-muted); margin-top: 8px; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+</style>
+</head>
+<body>
+<h1>VizAudit calibration</h1>
+<p class="subtitle">
+  Connects directly to a camera on this machine -- no dataset, no recording session, no
+  Rerun. <strong>Camera view</strong> (left): drag the 4 corners onto the real workspace
+  surface, mark extreme-reach points while moving the arm, or pick an Edit tool to mark
+  regions points shouldn't spawn in. <strong>Orthographic view</strong> (right): the same
+  surface undistorted, where the marked points get fit to a circle, and where cuts can also
+  be edited directly -- drag either view's handles to fine-tune, and watch the other view
+  update to match. Lock the corners (the padlock icon) once they're aligned, to avoid
+  nudging them by accident while marking points or drawing cuts. While drawing a polygon
+  cut: double-click, or the checkmark button, closes it; <kbd>Esc</kbd> cancels it, or click
+  the active tool icon again to stop. Set "Steps" and a distribution, and the live preview
+  always shows exactly that many points, confined to the circle, the workspace, and outside
+  every cut, in both views.
+</p>
+
+<div class="panel toolbar">
+  <div class="toolbar-group">
+    <span class="toolbar-label">Camera</span>
+    <div class="toolbar-group-inner">
+      <select id="deviceSelect"></select>
+      <button id="startBtn">Start camera</button>
+    </div>
+  </div>
+  <div class="toolbar-group">
+    <span class="toolbar-label">Reach circle</span>
+    <div class="toolbar-group-inner">
+      <button id="toolExtreme" title="Mark extreme points">Mark extreme points</button>
+      <button id="fitCircleBtn" disabled>Fit from points</button>
+      <button id="clearExtremeBtn">Clear points</button>
+    </div>
+  </div>
+  <div class="toolbar-group">
+    <span class="toolbar-label">Edit</span>
+    <div class="toolbar-group-inner">
+      <button id="toolCorners" class="icon-btn active" title="Drag corners / circle">
+        <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+          <rect x="2" y="2" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6"/>
+          <circle cx="2" cy="2" r="1.8" fill="currentColor"/>
+          <circle cx="14" cy="2" r="1.8" fill="currentColor"/>
+          <circle cx="14" cy="14" r="1.8" fill="currentColor"/>
+          <circle cx="2" cy="14" r="1.8" fill="currentColor"/>
+        </svg>
+      </button>
+      <button id="lockCornersBtn" class="icon-btn" title="Lock corners">&#x1F513;</button>
+      <button id="resetCornersBtn">Reset corners</button>
+      <button id="toolRect" class="icon-btn" title="Rectangle cut">&#9645;</button>
+      <button id="toolCircle" class="icon-btn" title="Circle cut">&#9711;</button>
+      <button id="toolPolygon" class="icon-btn" title="Polygon cut">&#11040;</button>
+      <button id="toolEditCuts" class="icon-btn" title="Edit cuts">&#9998;</button>
+      <button id="finishCutBtn" class="icon-btn" title="Finish polygon" disabled>&#10003;</button>
+      <button id="clearCutsBtn" class="danger">Clear all cuts</button>
+    </div>
+  </div>
+  <div class="toolbar-group">
+    <span class="toolbar-label">Display</span>
+    <div class="toolbar-group-inner">
+      <label><input type="checkbox" id="gridToggle" checked> Grid</label>
+    </div>
+  </div>
+  <div class="toolbar-group">
+    <span class="toolbar-label">Pattern preview</span>
+    <div class="toolbar-group-inner">
+      <label>Steps <input type="number" id="stepsInput" value="20" min="1"></label>
+      <label>Seed <input type="number" id="seedInput" value="0"></label>
+      <label>Distribution
+        <select id="distributionSelect">
+          <option value="grid" selected>Grid</option>
+          <option value="radial">Radial</option>
+          <option value="random">Random</option>
+        </select>
+      </label>
+      <label>Border width <input type="number" id="borderWidthInput" value="0" min="0"></label>
+    </div>
+  </div>
+</div>
+
+<div class="views">
+  <div class="panel view-panel">
+    <h2>Camera view</h2>
+    <div class="video-wrap">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="cameraCanvas"></canvas>
+    </div>
+  </div>
+  <div class="panel view-panel">
+    <h2>Orthographic view</h2>
+    <canvas id="orthoCanvas"></canvas>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--accent)"></i> surface / grid</span>
+      <span><i class="dot" style="background:var(--marker)"></i> extreme-reach points</span>
+      <span><i class="dot" style="background:var(--result)"></i> fitted circle / samples</span>
+      <span><i class="dot" style="background:var(--cut)"></i> cuts (no points spawn here)</span>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Config snippet</h2>
+  <textarea id="yamlOut" readonly></textarea>
+  <div class="toolbar-group" style="margin-top: 10px;">
+    <button id="saveConfigBtn">Save to file...</button>
+    <span id="saveStatus" class="note"></span>
+  </div>
+</div>
+
+<p class="note">If the browser refuses camera access on this page: <code>vizaudit-calibrate</code>
+serves it on <code>http://localhost</code> and opens your default browser automatically by
+default, which avoids the camera-permission restrictions some browsers apply to
+<code>file://</code> pages (and that a VS Code/editor preview pane applies regardless of
+origin). If you opened this file directly some other way, run
+<code>vizaudit-calibrate --output calibration.html</code> without <code>--no-serve</code>
+instead, or manually serve it yourself, e.g. <code>python -m http.server</code> in this
+file's directory.</p>
+
+<script>
+// ── Camera setup ─────────────────────────────────────────────────────────
+const video = document.getElementById("video");
+const cameraCanvas = document.getElementById("cameraCanvas");
+const orthoCanvas = document.getElementById("orthoCanvas");
+const deviceSelect = document.getElementById("deviceSelect");
+const startBtn = document.getElementById("startBtn");
+const toolExtreme = document.getElementById("toolExtreme");
+const toolCorners = document.getElementById("toolCorners");
+const lockCornersBtn = document.getElementById("lockCornersBtn");
+const resetCornersBtn = document.getElementById("resetCornersBtn");
+const fitCircleBtn = document.getElementById("fitCircleBtn");
+const clearExtremeBtn = document.getElementById("clearExtremeBtn");
+const toolRect = document.getElementById("toolRect");
+const toolCircle = document.getElementById("toolCircle");
+const toolPolygon = document.getElementById("toolPolygon");
+const toolEditCuts = document.getElementById("toolEditCuts");
+const finishCutBtn = document.getElementById("finishCutBtn");
+const clearCutsBtn = document.getElementById("clearCutsBtn");
+const gridToggle = document.getElementById("gridToggle");
+const stepsInput = document.getElementById("stepsInput");
+const seedInput = document.getElementById("seedInput");
+const distributionSelect = document.getElementById("distributionSelect");
+const borderWidthInput = document.getElementById("borderWidthInput");
+const yamlOut = document.getElementById("yamlOut");
+const saveConfigBtn = document.getElementById("saveConfigBtn");
+const saveStatus = document.getElementById("saveStatus");
+
+let currentStream = null;
+
+async function listDevices() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const videoInputs = devices.filter(function (d) { return d.kind === "videoinput"; });
+  deviceSelect.innerHTML = "";
+  videoInputs.forEach(function (d, i) {
+    const opt = document.createElement("option");
+    opt.value = d.deviceId;
+    opt.textContent = d.label || ("Camera " + (i + 1));
+    deviceSelect.appendChild(opt);
+  });
+}
+
+async function startCamera() {
+  if (currentStream) {
+    currentStream.getTracks().forEach(function (t) { t.stop(); });
+  }
+  const deviceId = deviceSelect.value;
+  const constraints = { video: deviceId ? { deviceId: { exact: deviceId } } : true };
+  currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+  video.srcObject = currentStream;
+  await listDevices();
+}
+
+startBtn.addEventListener("click", function () {
+  startCamera().catch(function (err) {
+    alert("Could not access camera: " + err.message);
+  });
+});
+
+video.addEventListener("loadedmetadata", function () {
+  cameraCanvas.width = video.videoWidth;
+  cameraCanvas.height = video.videoHeight;
+  if (cameraCorners.length === 0) {
+    resetCorners();
+  }
+  renderAll();
+});
+
+window.addEventListener("resize", function () { renderAll(); });
+
+listDevices();
+// Request camera permission proactively on load, rather than waiting for the operator to
+// find and click "Start camera" first. If this is denied or there's no camera yet, the
+// button below still works as a manual retry (e.g. after granting permission in the
+// browser's UI, or after plugging in a camera).
+startCamera().catch(function (err) {
+  console.warn("Camera not started automatically on load:", err.message);
+});
+
+// ── State (source of truth; everything else is derived in renderAll()) ───
+// One mutually-exclusive radio-button state for every interaction mode -- "corners" |
+// "extreme" | "rectangle" | "circle" | "polygon" | "editCuts". All six are plain icon/text
+// buttons in the toolbar (see setTool()); there is no "none" value because "corners" already
+// serves as the neutral default to click back to.
+let tool = "corners";
+let cornersLocked = false; // independent of `tool` -- suppresses corner-drag only
+let cameraCorners = []; // 4 [x,y] points, camera/video pixel space
+let extremePointsCamera = []; // clicked on the live video, camera pixel space
+let fittedCircle = null; // {center:[x,y], radius} in CANONICAL space -- sticky, manual-editable
+
+// Cut shapes are stored in CANONICAL space (exactly like fittedCircle), not pixel space --
+// this is what makes them "follow the surface" when corners are twisted: their rendered
+// pixel position is forward-mapped through the CURRENT homography every render, just like
+// the fitted circle already was, instead of staying pinned to a fixed pixel location that
+// silently drifts out of sync with the workspace once the corners move. It's also what
+// fixes the orthographic view showing samples inside cuts: validity checks now compare
+// candidates directly against these canonical shapes, with no separate pixel<->canonical
+// conversion step that could fall out of sync.
+//
+// Each shape keeps its own type (not flattened to a generic polygon) so editing respects
+// its natural degrees of freedom -- dragging one of a circle's many vertices was fiddly and
+// pointless; a circle should just have a center + radius handle.
+// type: "circle" {center, radius} | "rectangle" {corners: [4 pts]} | "polygon" {vertices}
+let cutShapesCanonical = [];
+
+let draggingCornerIndex = null;
+let circleDragMode = null; // "center" | "radius" | null -- fittedCircle, either view
+let cutAnchor = null, cutPreview = null, cutDragging = false; // rectangle/circle cut creation (canonical)
+let polyDraft = []; // in-progress cut polygon vertices (canonical)
+let lastMousePos = null; // raw pixel mouse pos, for the polygon-draft rubber-band line
+let editDragTarget = null; // a handle {onDrag(canonicalPoint)} from getCutHandles(), while dragging a cut
+
+function activeInteraction() {
+  return tool;
+}
+
+function resetCorners() {
+  const w = video.videoWidth || 640, h = video.videoHeight || 480;
+  const mx = w * 0.1, my = h * 0.1;
+  cameraCorners = [[mx, my], [w - mx, my], [w - mx, h - my], [mx, h - my]];
+}
+
+// ── Math: ported from vizaudit/overlay/perspective.py and pattern.py.
+// Calibration is deliberately backend-free (no Python process while calibrating, see
+// CLAUDE.md), so this duplicates -- rather than shares -- that math. Keep the two in sync
+// conceptually if either changes. ──────────────────────────────────────────
+
+function solveLinearSystem(A, b) {
+  // Gauss-Jordan elimination with partial pivoting. A: NxN array of arrays, b: length-N array.
+  const n = A.length;
+  const M = A.map(function (row, i) { return row.concat([b[i]]); });
+  for (let col = 0; col < n; col++) {
+    let pivotRow = col, maxVal = Math.abs(M[col][col]);
+    for (let r = col + 1; r < n; r++) {
+      if (Math.abs(M[r][col]) > maxVal) { maxVal = Math.abs(M[r][col]); pivotRow = r; }
+    }
+    if (pivotRow !== col) { const tmp = M[col]; M[col] = M[pivotRow]; M[pivotRow] = tmp; }
+    const pivot = M[col][col];
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const factor = M[r][col] / pivot;
+      for (let c = col; c <= n; c++) { M[r][c] -= factor * M[col][c]; }
+    }
+  }
+  return M.map(function (row, i) { return row[n] / row[i]; });
+}
+
+function canonicalRectDims(corners) {
+  // Mirrors perspective.py's canonical_rect_dims (aspect_ratio always derived here, not
+  // configurable from this tool -- keeps the UI to one less number to manage).
+  const dist = function (a, b) { return Math.hypot(b[0] - a[0], b[1] - a[1]); };
+  const top = dist(corners[0], corners[1]), bottom = dist(corners[3], corners[2]);
+  const left = dist(corners[0], corners[3]), right = dist(corners[1], corners[2]);
+  return [(top + bottom) / 2, (left + right) / 2];
+}
+
+function computeHomography(corners) {
+  // Mirrors perspective.py's compute_homography exactly (same 8-equation linear system).
+  const dims = canonicalRectDims(corners);
+  const width = dims[0], height = dims[1];
+  const canonical = [[0, 0], [width, 0], [width, height], [0, height]];
+  const A = [], b = [];
+  for (let i = 0; i < 4; i++) {
+    const u = canonical[i][0], v = canonical[i][1];
+    const x = corners[i][0], y = corners[i][1];
+    A.push([u, v, 1, 0, 0, 0, -u * x, -v * x]); b.push(x);
+    A.push([0, 0, 0, u, v, 1, -u * y, -v * y]); b.push(y);
+  }
+  const h = solveLinearSystem(A, b);
+  return [[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], 1]];
+}
+
+function applyHomography(H, point) {
+  const x = point[0], y = point[1];
+  const px = H[0][0] * x + H[0][1] * y + H[0][2];
+  const py = H[1][0] * x + H[1][1] * y + H[1][2];
+  const pw = H[2][0] * x + H[2][1] * y + H[2][2];
+  return [px / pw, py / pw];
+}
+
+function invertMatrix3(M) {
+  const a = M[0][0], b = M[0][1], c = M[0][2];
+  const d = M[1][0], e = M[1][1], f = M[1][2];
+  const g = M[2][0], h = M[2][1], i = M[2][2];
+  const det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+  const id = 1 / det;
+  return [
+    [(e * i - f * h) * id, (c * h - b * i) * id, (b * f - c * e) * id],
+    [(f * g - d * i) * id, (a * i - c * g) * id, (c * d - a * f) * id],
+    [(d * h - e * g) * id, (b * g - a * h) * id, (a * e - b * d) * id],
+  ];
+}
+
+function fitCircleLeastSquares(points) {
+  // Kasa method: x^2+y^2+Dx+Ey+F=0, solved via the normal equations of [x,y,1]*[D,E,F]=-(x^2+y^2).
+  // Same closed form for exactly-3 points (reduces to the exact circumcircle) and N>3.
+  let Sx = 0, Sy = 0, Sxx = 0, Syy = 0, Sxy = 0, Bx = 0, By = 0, B1 = 0;
+  const n = points.length;
+  points.forEach(function (p) {
+    const x = p[0], y = p[1];
+    Sx += x; Sy += y; Sxx += x * x; Syy += y * y; Sxy += x * y;
+    const bi = -(x * x + y * y);
+    Bx += x * bi; By += y * bi; B1 += bi;
+  });
+  const A = [[Sxx, Sxy, Sx], [Sxy, Syy, Sy], [Sx, Sy, n]];
+  const sol = solveLinearSystem(A, [Bx, By, B1]);
+  const D = sol[0], E = sol[1], F = sol[2];
+  const center = [-D / 2, -E / 2];
+  const radius = Math.sqrt(Math.max(center[0] * center[0] + center[1] * center[1] - F, 0));
+  return { center: center, radius: radius };
+}
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const GOLDEN_ANGLE_DEG = 137.50776405003785; // 360 * (1 - 1/phi)
+
+function pointInPolygon(point, vertices) {
+  // Standard ray-casting test. Mirrors pattern.py's _point_in_polygon.
+  const x = point[0], y = point[1];
+  let inside = false;
+  const n = vertices.length;
+  for (let i = 0; i < n; i++) {
+    const x1 = vertices[i][0], y1 = vertices[i][1];
+    const x2 = vertices[(i + 1) % n][0], y2 = vertices[(i + 1) % n][1];
+    if ((y1 > y) !== (y2 > y)) {
+      const xIntersect = x1 + (y - y1) * (x2 - x1) / (y2 - y1);
+      if (x < xIntersect) inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function pointToSegmentDistance(point, a, b) {
+  const px = point[0], py = point[1], ax = a[0], ay = a[1], bx = b[0], by = b[1];
+  const abx = bx - ax, aby = by - ay;
+  const lengthSq = abx * abx + aby * aby;
+  if (lengthSq === 0) return Math.hypot(px - ax, py - ay);
+  let t = ((px - ax) * abx + (py - ay) * aby) / lengthSq;
+  t = Math.max(0, Math.min(1, t));
+  const projX = ax + t * abx, projY = ay + t * aby;
+  return Math.hypot(px - projX, py - projY);
+}
+
+function pointNearPolygon(point, vertices, borderWidth) {
+  // True if inside, or within borderWidth of any edge -- the polygon "buffered" outward.
+  if (pointInPolygon(point, vertices)) return true;
+  if (borderWidth <= 0) return false;
+  const n = vertices.length;
+  for (let i = 0; i < n; i++) {
+    if (pointToSegmentDistance(point, vertices[i], vertices[(i + 1) % n]) < borderWidth) return true;
+  }
+  return false;
+}
+
+function cutShapeVertices(shape) {
+  return shape.type === "rectangle" ? shape.corners : shape.type === "polygon" ? shape.vertices : null;
+}
+
+function pointInCutShape(point, shape) {
+  if (shape.type === "circle") {
+    return Math.hypot(point[0] - shape.center[0], point[1] - shape.center[1]) <= shape.radius;
+  }
+  return pointInPolygon(point, cutShapeVertices(shape));
+}
+
+const CUT_CIRCLE_SEGMENTS = 32;
+
+function cutShapeBoundary(shape) {
+  // The shape's boundary as a polygon, in whatever space its own fields are in (always
+  // canonical, for shapes already in cutShapesCanonical). A circle becomes a fixed-segment
+  // polygon approximation -- used uniformly for the canonical-space validity check, the
+  // orthographic-view render, the camera-view render (forward-mapped), and the YAML export
+  // (also forward-mapped), so all four always agree on exactly the same boundary.
+  if (shape.type === "circle") {
+    const boundary = [];
+    for (let i = 0; i < CUT_CIRCLE_SEGMENTS; i++) {
+      const theta = 2 * Math.PI * i / CUT_CIRCLE_SEGMENTS;
+      boundary.push([shape.center[0] + shape.radius * Math.cos(theta), shape.center[1] + shape.radius * Math.sin(theta)]);
+    }
+    return boundary;
+  }
+  return cutShapeVertices(shape);
+}
+
+function circleHandles(circle) {
+  // {point, onDrag(newPoint)} pair shared by fittedCircle and circle-type cut shapes --
+  // onDrag mutates `circle` in place. `point`s are in whatever space `circle` itself is in
+  // (canonical, for both current callers).
+  return [
+    { point: circle.center, onDrag: function (p) { circle.center = p; } },
+    {
+      point: [circle.center[0] + circle.radius, circle.center[1]],
+      onDrag: function (p) { circle.radius = Math.hypot(p[0] - circle.center[0], p[1] - circle.center[1]); },
+    },
+  ];
+}
+
+function getCutHandles(shape) {
+  // One handle per vertex for rectangle/polygon; center + radius-edge for circle -- keeps
+  // each shape type's natural degrees of freedom (a circle has 2 handles, not N).
+  if (shape.type === "circle") return circleHandles(shape);
+  const vertices = cutShapeVertices(shape);
+  return vertices.map(function (v, i) {
+    return { point: v, onDrag: function (p) { vertices[i] = p; } };
+  });
+}
+
+function pixelHandlesForShape(shape, H) {
+  // Same handles, forward-mapped to pixel space for camera-view hit-testing/rendering --
+  // onDrag still expects a CANONICAL point, so callers must convert back via the inverse
+  // homography before invoking it.
+  return getCutHandles(shape).map(function (h) {
+    return { pixelPoint: applyHomography(H, h.point), onDrag: h.onDrag };
+  });
+}
+
+function toCanonical(pixelPoint) { return applyHomography(inverseHomography, pixelPoint); }
+function toPixel(canonicalPoint) { return applyHomography(homography, canonicalPoint); }
+
+// isValidCandidate operates entirely in canonical space -- this mirrors pattern.py's
+// generate_sector_points: border_width applies uniformly to the circle, the workspace
+// bounds, AND every cut. cutPolygonsCanonical is precomputed once per render, not per
+// candidate, and (now that cuts are canonical-native) needs no homography at all.
+function isValidCandidate(candidateCanonical) {
+  const borderWidth = Math.max(0, parseFloat(borderWidthInput.value) || 0);
+  const dx = candidateCanonical[0] - fittedCircle.center[0];
+  const dy = candidateCanonical[1] - fittedCircle.center[1];
+  const r = Math.hypot(dx, dy);
+  if (r > fittedCircle.radius - borderWidth) return false;
+  if (canonicalSize) {
+    if (candidateCanonical[0] < borderWidth || candidateCanonical[0] > canonicalSize[0] - borderWidth) return false;
+    if (candidateCanonical[1] < borderWidth || candidateCanonical[1] > canonicalSize[1] - borderWidth) return false;
+  }
+  for (let i = 0; i < cutPolygonsCanonical.length; i++) {
+    if (pointNearPolygon(candidateCanonical, cutPolygonsCanonical[i], borderWidth)) return false;
+  }
+  return true;
+}
+
+function allocateShares(sizes, count) {
+  // Largest-remainder apportionment (the standard method for splitting a fixed total across
+  // groups proportionally to size, e.g. parliamentary seat allocation): splits `count` picks
+  // across groups proportionally to `sizes`, every share within +/-1 of its exact
+  // proportional value, summing to exactly `count`. Mirrors pattern.py's _allocate_shares.
+  const total = sizes.reduce((a, b) => a + b, 0);
+  const exact = sizes.map((s) => (count * s) / total);
+  const shares = exact.map((e) => Math.floor(e));
+  let remainder = count - shares.reduce((a, b) => a + b, 0);
+  const order = sizes.map((_, i) => i).sort((a, b) => (exact[b] - shares[b]) - (exact[a] - shares[a]));
+  for (let k = 0; k < remainder; k++) shares[order[k]] += 1;
+  return shares;
+}
+
+function clampToRegion(candidate, cx, cy, effectiveOuter, bounds, borderWidth) {
+  // Disk-only clamp (mirrors pattern.py's _clamp_to_region, specialized: this tool never
+  // has an inner_radius or a restricted angle span, so there's no angle-snap/inner-radius
+  // step here). Radius clamps to effectiveOuter; if STILL outside `bounds` (the workspace
+  // rectangle, [width, height]), shrinks along the SAME ray from center until inside it --
+  // not an independent x/y clamp, which would collapse every point whose ideal x exceeds
+  // the bound onto the exact same vertical line regardless of its own y.
+  const dx = candidate[0] - cx, dy = candidate[1] - cy;
+  let r = Math.min(effectiveOuter, Math.hypot(dx, dy));
+  const theta = Math.atan2(dy, dx);
+  const cosT = Math.cos(theta), sinT = Math.sin(theta);
+  let x = cx + r * cosT, y = cy + r * sinT;
+  if (bounds) {
+    const bw = bounds[0], bh = bounds[1];
+    const inBounds = (px, py) => px >= borderWidth && px <= bw - borderWidth && py >= borderWidth && py <= bh - borderWidth;
+    if (!inBounds(x, y)) {
+      if (inBounds(cx, cy)) {
+        let lo = 0, hi = r;
+        for (let i = 0; i < 30; i++) {
+          const mid = (lo + hi) / 2;
+          if (inBounds(cx + mid * cosT, cy + mid * sinT)) lo = mid; else hi = mid;
+        }
+        x = cx + lo * cosT; y = cy + lo * sinT;
+      } else {
+        x = Math.max(borderWidth, Math.min(bw - borderWidth, x));
+        y = Math.max(borderWidth, Math.min(bh - borderWidth, y));
+      }
+    }
+  }
+  return [x, y];
+}
+
+function occupancyGuard(isValid, minSeparation) {
+  // Wraps `isValid` so a point within `minSeparation` of one already returned by a previous
+  // call also counts as invalid. Two cases need this: (1) two different ideal points that
+  // happen to share an angle from `center` can both shrink to the literal same nearest
+  // boundary point when `bounds` clips that side; (2) a small minSeparation (the default)
+  // only catches literal coincidences -- several points relocated off a shared central
+  // obstacle landing a small fraction of the expected spacing apart is visually distinct
+  // from a "missing point" but still visibly clumped, so minSeparation is set to a fraction
+  // of the expected inter-point spacing instead, pushing a relocation search past merely
+  // "different" into "different enough to blend in." Mirrors pattern.py's _occupancy_guard.
+  minSeparation = minSeparation || 1e-6;
+  const placed = [];
+  return {
+    isValid: function (candidate) {
+      if (!isValid(candidate)) return false;
+      return placed.every((p) => Math.hypot(candidate[0] - p[0], candidate[1] - p[1]) >= minSeparation);
+    },
+    markPlaced: function (point) { placed.push(point); },
+  };
+}
+
+function relocateIfInvalid(candidate, isValid, clamp, rng, searchScale, label, index, cx, cy, effectiveOuter) {
+  // Returns `candidate` unchanged if already valid. Otherwise tries, in order: (1) the
+  // closed-form `clamp`; (2) a radial search along the point's OWN angle from `center` --
+  // the remaining violation is usually an exclude_zones cut, which is typically small
+  // relative to the whole disk, so moving outward (then inward) at the point's own angle
+  // very often clears it, keeping points relocated off a shared central obstacle fanned out
+  // at their original angles instead of clumping at arbitrary ones; (3) only if that also
+  // fails, a local random search of growing radius around the clamped point. Mirrors
+  // pattern.py's _relocate_if_invalid.
+  if (isValid(candidate)) return candidate;
+  const clamped = clamp(candidate);
+  if (isValid(clamped)) return clamped;
+  const dx0 = clamped[0] - cx, dy0 = clamped[1] - cy;
+  const r0 = Math.hypot(dx0, dy0);
+  if (r0 > 1e-9) {
+    const cosT = dx0 / r0, sinT = dy0 / r0;
+    const step = Math.max(searchScale * 0.1, 1e-9);
+    for (const direction of [1, -1]) {
+      let r = r0;
+      for (let i = 0; i < 200; i++) {
+        r += direction * step;
+        if (r > effectiveOuter || r < 0) break;
+        const probe = [cx + r * cosT, cy + r * sinT];
+        if (isValid(probe)) return probe;
+      }
+    }
+  }
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const radius = searchScale * (0.5 + 0.25 * Math.floor(attempt / 3));
+    const probe = [clamped[0] + (rng() * 2 - 1) * radius, clamped[1] + (rng() * 2 - 1) * radius];
+    if (isValid(probe)) return probe;
+  }
+  throw new Error("Could not find a valid position near " + label + " point index " + index);
+}
+
+// ── Zone-aware structural fixes (mirrors pattern.py's _merge_intervals /
+// _subtract_intervals / _inflate_polygon / _polygon_vertical_intervals / _polygon_angle_block
+// / _merge_angle_intervals / _radial_available_area_cdf / _invert_radial_cdf) -- see
+// CLAUDE.md for why relocating individual out-of-zone points (the previous design) isn't
+// enough on its own: it patches one point at a time instead of letting the WHOLE pattern's
+// density adapt to the area a zone/border actually removes, which is what caused points to
+// pile into a dense ring right at a central zone's edge instead of spreading across the rest
+// of the disk. No circle-zone closed form is needed here (unlike pattern.py): cuts are
+// always stored canonical-native and a circle cut is already approximated as a fixed 32-gon
+// by cutShapeBoundary() by the time anything in this file sees it, so every zone these
+// functions deal with is already "just a polygon."
+
+function mergeIntervals(intervals) {
+  if (intervals.length === 0) return [];
+  const ordered = intervals.slice().sort((a, b) => a[0] - b[0]);
+  const merged = [ordered[0].slice()];
+  for (let i = 1; i < ordered.length; i++) {
+    const lo = ordered[i][0], hi = ordered[i][1];
+    const last = merged[merged.length - 1];
+    if (lo <= last[1]) last[1] = Math.max(last[1], hi);
+    else merged.push([lo, hi]);
+  }
+  return merged;
+}
+
+function subtractIntervals(baseLo, baseHi, excluded) {
+  const valid = [];
+  let cursor = baseLo;
+  for (const [rawLo, rawHi] of excluded) {
+    const lo = Math.max(rawLo, baseLo), hi = Math.min(rawHi, baseHi);
+    if (hi <= cursor || lo >= baseHi) continue;
+    if (lo > cursor) valid.push([cursor, lo]);
+    cursor = Math.max(cursor, hi);
+  }
+  if (cursor < baseHi) valid.push([cursor, baseHi]);
+  return valid;
+}
+
+function inflatePolygon(vertices, borderWidth) {
+  if (borderWidth <= 0) return vertices;
+  const n = vertices.length;
+  const centroidX = vertices.reduce((a, v) => a + v[0], 0) / n;
+  const centroidY = vertices.reduce((a, v) => a + v[1], 0) / n;
+  return vertices.map(function ([vx, vy]) {
+    const dx = vx - centroidX, dy = vy - centroidY;
+    const d = Math.hypot(dx, dy);
+    if (d < 1e-9) return [vx, vy];
+    const scale = (d + borderWidth) / d;
+    return [centroidX + dx * scale, centroidY + dy * scale];
+  });
+}
+
+function polygonVerticalIntervals(x, vertices) {
+  const ys = [];
+  const n = vertices.length;
+  for (let i = 0; i < n; i++) {
+    const [x1, y1] = vertices[i];
+    const [x2, y2] = vertices[(i + 1) % n];
+    if (x1 === x2) continue;
+    if ((x1 <= x && x <= x2) || (x2 <= x && x <= x1)) {
+      const t = (x - x1) / (x2 - x1);
+      ys.push(y1 + t * (y2 - y1));
+    }
+  }
+  ys.sort((a, b) => a - b);
+  const intervals = [];
+  for (let i = 0; i + 1 < ys.length; i += 2) intervals.push([ys[i], ys[i + 1]]);
+  return intervals;
+}
+
+function excludedYIntervalsAtX(x, borderWidth) {
+  const raw = [];
+  for (const poly of cutPolygonsCanonical) {
+    raw.push(...polygonVerticalIntervals(x, inflatePolygon(poly, borderWidth)));
+  }
+  return mergeIntervals(raw);
+}
+
+function segmentCircleIntersectionAngles(a, b, cx, cy, r) {
+  const [ax, ay] = a, [bx, by] = b;
+  const dx = bx - ax, dy = by - ay;
+  const ex = ax - cx, ey = ay - cy;
+  const coeffA = dx * dx + dy * dy;
+  if (coeffA < 1e-12) return [];
+  const coeffB = 2 * (ex * dx + ey * dy);
+  const coeffC = ex * ex + ey * ey - r * r;
+  const disc = coeffB * coeffB - 4 * coeffA * coeffC;
+  if (disc < 0) return [];
+  const sq = Math.sqrt(disc);
+  const angles = [];
+  for (const s of [(-coeffB - sq) / (2 * coeffA), (-coeffB + sq) / (2 * coeffA)]) {
+    if (s >= -1e-9 && s <= 1 + 1e-9) {
+      const sClamped = Math.min(1, Math.max(0, s));
+      const px = ax + sClamped * dx, py = ay + sClamped * dy;
+      angles.push(((Math.atan2(py - cy, px - cx) * 180 / Math.PI) % 360 + 360) % 360);
+    }
+  }
+  return angles;
+}
+
+function polygonAngleBlock(r, cx, cy, vertices) {
+  if (r <= 0) return pointInPolygon([cx, cy], vertices) ? [[0, 360]] : [];
+  let crossings = [];
+  const n = vertices.length;
+  for (let i = 0; i < n; i++) {
+    crossings.push(...segmentCircleIntersectionAngles(vertices[i], vertices[(i + 1) % n], cx, cy, r));
+  }
+  if (crossings.length === 0) {
+    const sample = [cx + r, cy];
+    return pointInPolygon(sample, vertices) ? [[0, 360]] : [];
+  }
+  crossings = Array.from(new Set(crossings.map((a) => Math.round(a * 1e9) / 1e9))).sort((a, b) => a - b);
+  const blocked = [];
+  const nC = crossings.length;
+  for (let i = 0; i < nC; i++) {
+    const lo = crossings[i];
+    const hi = i + 1 < nC ? crossings[i + 1] : crossings[0] + 360;
+    const midDeg = ((lo + hi) / 2) % 360;
+    const px = cx + r * Math.cos(midDeg * Math.PI / 180), py = cy + r * Math.sin(midDeg * Math.PI / 180);
+    if (pointInPolygon([px, py], vertices)) blocked.push([lo, hi]);
+  }
+  return blocked;
+}
+
+function mergeAngleIntervals(intervals) {
+  if (intervals.length === 0) return [];
+  const expanded = intervals.map(function ([lo, hi]) {
+    const loMod = ((lo % 360) + 360) % 360;
+    const span = hi - lo;
+    return [loMod, loMod + span];
+  });
+  const shifted = [];
+  for (const [lo, hi] of expanded) {
+    for (const offset of [-360, 0, 360]) shifted.push([lo + offset, hi + offset]);
+  }
+  const merged = mergeIntervals(shifted);
+  const clipped = [];
+  for (const [lo, hi] of merged) {
+    const clippedLo = Math.max(lo, 0), clippedHi = Math.min(hi, 360);
+    if (clippedHi > clippedLo) clipped.push([clippedLo, clippedHi]);
+  }
+  return mergeIntervals(clipped);
+}
+
+const RADIAL_CDF_SAMPLES = 300;
+
+function outsideBoundsAngleIntervals(r, cx, cy, bw, bh, borderWidth) {
+  // The angular interval(s) where the circle of radius r centered at (cx, cy) falls OUTSIDE
+  // the canonicalSize rectangle (inset by borderWidth) -- mirrors pattern.py's
+  // _outside_bounds_angle_intervals: reuses polygonAngleBlock by passing the inset rectangle
+  // itself (giving the INSIDE intervals), then takes the complement within [0, 360).
+  const xLo = borderWidth, xHi = bw - borderWidth;
+  const yLo = borderWidth, yHi = bh - borderWidth;
+  if (xHi <= xLo || yHi <= yLo) return [[0, 360]];
+  const rect = [[xLo, yLo], [xHi, yLo], [xHi, yHi], [xLo, yHi]];
+  const insideRaw = polygonAngleBlock(r, cx, cy, rect);
+  if (insideRaw.length === 0) return [[0, 360]];
+  return subtractIntervals(0, 360, mergeAngleIntervals(insideRaw));
+}
+
+function availableAngleIntervalsAtRadius(r, cx, cy, borderWidth) {
+  // The angular sub-interval(s) within [0, 360) where the circle of radius r centered at
+  // (cx, cy) is actually open -- not inside any cut, and not outside canonicalSize. Used by
+  // both radialAvailableAreaCdf (which only needs the total length) and, per point, by
+  // sampleSectorPoints's "radial" branch (which needs the actual intervals -- see the
+  // comment at that call site for why this is necessary, not just an optimization). Mirrors
+  // pattern.py's _available_angle_intervals_at_radius.
+  let blockedRaw = [];
+  for (const poly of cutPolygonsCanonical) {
+    blockedRaw.push(...polygonAngleBlock(r, cx, cy, inflatePolygon(poly, borderWidth)));
+  }
+  if (canonicalSize) {
+    blockedRaw.push(...outsideBoundsAngleIntervals(r, cx, cy, canonicalSize[0], canonicalSize[1], borderWidth));
+  }
+  if (blockedRaw.length === 0) return [[0, 360]];
+  const blockedMerged = mergeAngleIntervals(blockedRaw);
+  return subtractIntervals(0, 360, blockedMerged);
+}
+
+function placeInAvailableIntervals(intervals, fraction) {
+  // Maps `fraction` (in [0, 1)) to a point within `intervals`, positioned proportionally to
+  // where it falls within their concatenated total length. Returns null if there's nowhere
+  // to place a point at all (zero total length). Mirrors pattern.py's
+  // _place_in_available_intervals.
+  const total = intervals.reduce((a, [lo, hi]) => a + (hi - lo), 0);
+  if (total <= 0) return null;
+  const target = Math.max(0, Math.min(total, fraction * total));
+  let cursor = 0;
+  for (const [lo, hi] of intervals) {
+    const length = hi - lo;
+    if (target <= cursor + length) return lo + (target - cursor);
+    cursor += length;
+  }
+  return intervals[intervals.length - 1][1];
+}
+
+function candidateThetasInIntervals(intervals, numSamples) {
+  const candidates = [];
+  for (let k = 0; k < numSamples; k++) {
+    const theta = placeInAvailableIntervals(intervals, (k + 0.5) / numSamples);
+    if (theta !== null) candidates.push(theta);
+  }
+  return candidates;
+}
+
+function refineRadialLocalSeparation(placed, cx, cy, borderWidth, expectedSpacing) {
+  // Post-process pass that nudges any point too close to its nearest neighbor toward a
+  // better angle -- at the SAME radius, since that's already correct in aggregate via the
+  // area CDF -- within whatever's actually open there. Mirrors pattern.py's
+  // _refine_radial_local_separation: mapping each point's golden-angle fraction into its
+  // own radius's available interval preserves AGGREGATE density per radius shell but not
+  // golden angle's point-to-point separation guarantee, so two points at different radii
+  // can coincidentally land at nearly the same angle. A real, reported bug: adding
+  // borderWidth on top of an already-asymmetric canonicalSize clip made the
+  // nearest-neighbor ratio swing non-monotonically (0.57-0.89) across a borderWidth sweep
+  // on the same self-similarly-scaled shape, instead of degrading predictably.
+  const n = placed.length;
+  if (n < 2) return placed;
+  const passes = 3, minAcceptableRatio = 0.75, numCandidates = 24;
+  for (let pass = 0; pass < passes; pass++) {
+    const nnDistances = placed.map(function (p, i) {
+      return Math.min(...placed.filter((_, j) => j !== i).map((q) => Math.hypot(p[0] - q[0], p[1] - q[1])));
+    });
+    const avgNn = nnDistances.reduce((a, b) => a + b, 0) / n;
+    const minSeparation = minAcceptableRatio * Math.max(avgNn, expectedSpacing);
+    let improvedAny = false;
+    for (let i = 0; i < n; i++) {
+      const [xi, yi] = placed[i];
+      const bestD = Math.min(...placed.filter((_, j) => j !== i).map((q) => Math.hypot(xi - q[0], yi - q[1])));
+      if (bestD >= minSeparation) continue;
+      const r = Math.hypot(xi - cx, yi - cy);
+      const avail = availableAngleIntervalsAtRadius(r, cx, cy, borderWidth);
+      let bestTheta = null, bestScore = bestD;
+      for (const theta of candidateThetasInIntervals(avail, numCandidates)) {
+        const cx2 = cx + r * Math.cos(theta * Math.PI / 180), cy2 = cy + r * Math.sin(theta * Math.PI / 180);
+        const score = Math.min(...placed.filter((_, j) => j !== i).map((q) => Math.hypot(cx2 - q[0], cy2 - q[1])));
+        if (score > bestScore) { bestScore = score; bestTheta = theta; }
+      }
+      if (bestTheta !== null) {
+        placed[i] = [cx + r * Math.cos(bestTheta * Math.PI / 180), cy + r * Math.sin(bestTheta * Math.PI / 180)];
+        improvedAny = true;
+      }
+    }
+    if (!improvedAny) break;
+  }
+  return placed;
+}
+
+function radialAvailableAreaCdf(cx, cy, effectiveOuter, borderWidth) {
+  // Numerically integrates, over RADIAL_CDF_SAMPLES radius samples, the angular span
+  // actually open at each radius -- see the comment block above this section for why this
+  // replaces a plain closed-form radius formula whenever any cuts or canonicalSize bounds
+  // restrict the disk.
+  const n = RADIAL_CDF_SAMPLES;
+  const radii = [];
+  for (let i = 0; i <= n; i++) radii.push((effectiveOuter * i) / n);
+  const availableSpan = radii.map(function (r) {
+    return availableAngleIntervalsAtRadius(r, cx, cy, borderWidth).reduce((a, [lo, hi]) => a + (hi - lo), 0);
+  });
+  const cumulative = [0];
+  for (let i = 1; i < radii.length; i++) {
+    const r0 = radii[i - 1], r1 = radii[i];
+    const area0 = availableSpan[i - 1] * r0, area1 = availableSpan[i] * r1;
+    cumulative.push(cumulative[cumulative.length - 1] + 0.5 * (area0 + area1) * (r1 - r0));
+  }
+  return { radii: radii, cumulative: cumulative };
+}
+
+function invertRadialCdf(cdf, targetFraction) {
+  const radii = cdf.radii, cumulative = cdf.cumulative;
+  const total = cumulative[cumulative.length - 1];
+  if (total <= 0) throw new Error("No available area to place radial points in");
+  const target = targetFraction * total;
+  for (let i = 1; i < cumulative.length; i++) {
+    if (cumulative[i] >= target) {
+      const c0 = cumulative[i - 1], c1 = cumulative[i];
+      const r0 = radii[i - 1], r1 = radii[i];
+      if (c1 === c0) return r1;
+      const t = (target - c0) / (c1 - c0);
+      return r0 + t * (r1 - r0);
+    }
+  }
+  return radii[radii.length - 1];
+}
+
+function sampleSectorPoints(count, seed, distribution) {
+  // Disk-specialized (inner_radius=0, full circle) version of pattern.py's
+  // generate_sector_points -- this tool only ever produces full disks. Always returns
+  // CANONICAL-space points; the caller maps them to pixel space for the camera-view overlay.
+  if (!fittedCircle) return [];
+  const cx = fittedCircle.center[0], cy = fittedCircle.center[1];
+  const outerRadius = fittedCircle.radius;
+  const borderWidth = Math.max(0, parseFloat(borderWidthInput.value) || 0);
+  const effectiveOuter = outerRadius - borderWidth;
+  // The scale relocateIfInvalid's fallback jitter search grows from -- the expected spacing
+  // between neighboring points for a roughly area-uniform disk packing of `count` points.
+  const expectedSpacing = effectiveOuter / Math.max(1, Math.sqrt(count));
+
+  if (distribution === "random") {
+    const rng = mulberry32(seed);
+    const points = [];
+    const maxAttempts = count * 200;
+    let attempts = 0;
+    while (points.length < count) {
+      attempts++;
+      if (attempts > maxAttempts) { throw new Error("Could not sample " + count + " points"); }
+      const r = Math.sqrt(rng() * outerRadius * outerRadius);
+      const theta = rng() * 2 * Math.PI;
+      const candidate = [cx + r * Math.cos(theta), cy + r * Math.sin(theta)];
+      if (!isValidCandidate(candidate)) continue;
+      points.push(candidate);
+    }
+    return points;
+  }
+
+  const clamp = (p) => clampToRegion(p, cx, cy, effectiveOuter, canonicalSize, borderWidth);
+
+  if (distribution === "grid") {
+    // Each lattice column gets its OWN continuously-computed valid y-range (the circle's
+    // chord at that x, intersected with the workspace bounds), and places its proportional
+    // share of `count` evenly spaced within that range -- instead of an earlier version that
+    // shared a single global row grid across every column and then trimmed a discrete
+    // candidate pool down to `count`. Sharing a row grid meant any two columns landing on
+    // the exact row through `center`'s own y were co-radial: when bounds clipped that side,
+    // "shrink along this point's own ray" found the literal same nearest point for both.
+    // Per-column continuous placement can't collide this way (no candidates are ever
+    // generated/discarded, so there's nothing to trim unevenly either). Mirrors pattern.py's
+    // "grid" full-disk fast path exactly -- this tool never has an inner_radius or a
+    // restricted angle span, so there's no annulus/sector fallback path here at all.
+    //
+    // Columns are spaced over the ACTUAL available x-range, not the full circle diameter --
+    // and `cols` itself is chosen from that range's aspect ratio, not a bare sqrt(count).
+    // An earlier version spaced `cols` columns over the full diameter, then dropped
+    // whichever fell outside the workspace bounds: the survivors stayed at their original
+    // (full-diameter) spacing while every dropped column's share of `count` piled into the
+    // survivors' own y-ranges, visibly stretching x-spacing far wider than y-spacing once
+    // bounds clipped a meaningful fraction of the circle away.
+    let xMin = cx - effectiveOuter, xMax = cx + effectiveOuter;
+    let yMin = cy - effectiveOuter, yMax = cy + effectiveOuter;
+    if (canonicalSize) {
+      const bw = canonicalSize[0], bh = canonicalSize[1];
+      xMin = Math.max(xMin, borderWidth); xMax = Math.min(xMax, bw - borderWidth);
+      yMin = Math.max(yMin, borderWidth); yMax = Math.min(yMax, bh - borderWidth);
+    }
+    if (xMax <= xMin || yMax <= yMin) { throw new Error("Could not place " + count + " grid points"); }
+    const aspect = (xMax - xMin) / (yMax - yMin);
+    const cols = Math.max(1, Math.round(Math.sqrt(count * aspect)));
+    const stepX = (xMax - xMin) / cols;
+    // Each column's chord is further split around any cuts it crosses, via
+    // excludedYIntervalsAtX/subtractIntervals -- a column halved by a central cut gets half
+    // its previous share below, instead of every point that would have landed in the cut
+    // being relocated onto a dense ring right at its edge (see the comment block above
+    // mergeIntervals for the regression this fixes).
+    const colRanges = [];
+    for (let i = 0; i < cols; i++) {
+      const x = xMin + (i + 0.5) * stepX;
+      const halfChordSq = effectiveOuter * effectiveOuter - (x - cx) * (x - cx);
+      if (halfChordSq <= 0) continue;
+      const halfChord = Math.sqrt(halfChordSq);
+      const yLo = Math.max(cy - halfChord, yMin), yHi = Math.min(cy + halfChord, yMax);
+      if (yHi <= yLo) continue;
+      const excluded = cutPolygonsCanonical.length > 0 ? excludedYIntervalsAtX(x, borderWidth) : [];
+      const subRanges = excluded.length > 0 ? subtractIntervals(yLo, yHi, excluded) : [[yLo, yHi]];
+      for (const [subLo, subHi] of subRanges) {
+        if (subHi > subLo) colRanges.push([x, subLo, subHi]);
+      }
+    }
+    if (colRanges.length === 0) { throw new Error("Could not place " + count + " grid points"); }
+    const shares = allocateShares(colRanges.map((c) => c[2] - c[1]), count);
+    const ideal = [];
+    colRanges.forEach(function (col, idx) {
+      const share = shares[idx];
+      if (share <= 0) return;
+      const x = col[0], yLo = col[1], yHi = col[2];
+      const stepY = (yHi - yLo) / share;
+      for (let k = 0; k < share; k++) ideal.push([x, yLo + (k + 0.5) * stepY]);
+    });
+    const jitterRng = mulberry32(0); // fixed, NOT `seed` -- grid stays deterministic regardless
+    const guard = occupancyGuard(isValidCandidate, 0.5 * expectedSpacing);
+    return ideal.map(function (p, i) {
+      const point = relocateIfInvalid(p, guard.isValid, clamp, jitterRng, expectedSpacing, "grid", i, cx, cy, effectiveOuter);
+      guard.markPlaced(point);
+      return point;
+    });
+  }
+
+  // distribution === "radial": a Fermat/Vogel spiral (the "sunflower seed" arrangement) --
+  // r_i = sqrt(t_i) * effectiveOuter (effectiveOuter, not the raw outerRadius -- using the
+  // raw radius here was a real, reported bug: a border_width of 2 on a radius-10 disk
+  // collapsed 45% of 60 points onto the exact effectiveOuter boundary ring instead of
+  // spreading them down to fill the now-smaller disk, since `clamp`'s ray-shrink caught every
+  // point whose ideal r exceeded it). theta_i = i * golden_angle. No two points ever align
+  // radially or angularly, so there's no visible row/column/spoke structure, unlike a
+  // Cartesian (even jittered) lattice.
+  //
+  // When any cuts OR canonicalSize bounds restrict the disk, r is instead drawn from
+  // radialAvailableAreaCdf's inverse -- the available-angle-at-this-radius integral -- so a
+  // radius band mostly covered/clipped is assigned proportionally fewer points up front,
+  // instead of being assigned the unobstructed share and then relocating every one of those
+  // points outward along its own angle onto a dense ring right at the obstruction's edge (a
+  // real, reported regression -- mirrors pattern.py's _radial_available_area_cdf exactly).
+  // canonicalSize was missing from the first pass at this fix (which only covered cuts) --
+  // found from a follow-up report that radial was "just as broken" even after that fix,
+  // since canonicalSize (the workspace quad) is this tool's primary, near-universal use case
+  // and was still relying on relocateIfInvalid's clamp for any boundary violation.
+  const rng = mulberry32(seed);
+  const angleOffsetDeg = rng() * 360;
+  const guard = occupancyGuard(isValidCandidate, 0.5 * expectedSpacing);
+  const restricted = cutPolygonsCanonical.length > 0 || !!canonicalSize;
+  const radialCdf = restricted ? radialAvailableAreaCdf(cx, cy, effectiveOuter, borderWidth) : null;
+  const placed = [];
+  for (let i = 0; i < count; i++) {
+    const t = (i + 0.5) / count;
+    const r = radialCdf !== null ? invertRadialCdf(radialCdf, t) : Math.sqrt(t) * effectiveOuter;
+    let thetaDeg = (angleOffsetDeg + i * GOLDEN_ANGLE_DEG) % 360;
+    if (radialCdf !== null) {
+      // The blind golden-angle theta can land in a blocked sector at THIS point's own radius
+      // even though the CDF above already accounted for blocking when deciding how many
+      // points this radius shell gets overall -- and relocateIfInvalid's clamp step, for a
+      // canonicalSize violation specifically, shrinks the point INWARD along this same angle
+      // until back in bounds, silently overriding the CDF's carefully chosen radius rather
+      // than preserving it. So instead of leaving this to relocate, place the angle directly
+      // within whatever's actually open at r (the same idea as the grid fast path placing a
+      // point within a column's available sub-interval, just in angle instead of y).
+      const avail = availableAngleIntervalsAtRadius(r, cx, cy, borderWidth);
+      const placedTheta = placeInAvailableIntervals(avail, thetaDeg / 360);
+      if (placedTheta !== null) thetaDeg = placedTheta;
+    }
+    const ideal = [cx + r * Math.cos(thetaDeg * Math.PI / 180), cy + r * Math.sin(thetaDeg * Math.PI / 180)];
+    const point = relocateIfInvalid(ideal, guard.isValid, clamp, rng, expectedSpacing, "radial", i, cx, cy, effectiveOuter);
+    guard.markPlaced(point);
+    placed.push(point);
+  }
+  if (radialCdf !== null) {
+    return refineRadialLocalSeparation(placed, cx, cy, borderWidth, expectedSpacing);
+  }
+  return placed;
+}
+
+// ── Derived state, recomputed every render ─────────────────────────────────
+let homography = null, inverseHomography = null, canonicalSize = null, extremePointsCanonical = [];
+let samplePointsCanonical = [], samplePointsCamera = [], cutPolygonsCanonical = [];
+let orthoScale = 1;
+let lastCanonicalSize = null; // for rescaleCanonicalShapes() -- see below
+
+function rescaleCanonicalShapes(scaleX, scaleY) {
+  // canonicalSize is RE-DERIVED from the corners' own pixel distances every render
+  // (canonicalRectDims) -- so nudging a corner even slightly changes the canonical
+  // coordinate system's scale. fittedCircle/cutShapesCanonical hold ABSOLUTE canonical
+  // numbers, so without this they'd silently drift out of physical proportion to the
+  // workspace on every corner edit (symptom: "the sampled circle gets cut" more or less
+  // each time a corner moves, even a tiny amount) instead of staying visually/physically
+  // anchored to the workspace the way the grid lines already do. Applied every render, so
+  // it also tracks smoothly frame-by-frame during a live corner drag.
+  const avgScale = Math.sqrt(scaleX * scaleY);
+  if (fittedCircle) {
+    fittedCircle.center = [fittedCircle.center[0] * scaleX, fittedCircle.center[1] * scaleY];
+    fittedCircle.radius *= avgScale;
+  }
+  cutShapesCanonical.forEach(function (shape) {
+    if (shape.type === "circle") {
+      shape.center = [shape.center[0] * scaleX, shape.center[1] * scaleY];
+      shape.radius *= avgScale;
+    } else {
+      const verts = cutShapeVertices(shape);
+      for (let i = 0; i < verts.length; i++) verts[i] = [verts[i][0] * scaleX, verts[i][1] * scaleY];
+    }
+  });
+}
+
+function renderAll() {
+  homography = (cameraCorners.length === 4) ? computeHomography(cameraCorners) : null;
+  inverseHomography = homography ? invertMatrix3(homography) : null;
+  canonicalSize = homography ? canonicalRectDims(cameraCorners) : null;
+  if (canonicalSize && lastCanonicalSize &&
+      (canonicalSize[0] !== lastCanonicalSize[0] || canonicalSize[1] !== lastCanonicalSize[1])) {
+    rescaleCanonicalShapes(canonicalSize[0] / lastCanonicalSize[0], canonicalSize[1] / lastCanonicalSize[1]);
+  }
+  lastCanonicalSize = canonicalSize;
+  extremePointsCanonical = inverseHomography
+    ? extremePointsCamera.map(function (p) { return toCanonical(p); })
+    : [];
+  cutPolygonsCanonical = cutShapesCanonical.map(cutShapeBoundary);
+  samplePointsCanonical = [];
+  let sampleError = null;
+  if (fittedCircle) {
+    try {
+      const steps = Math.max(1, parseInt(stepsInput.value) || 1);
+      const seed = parseInt(seedInput.value) || 0;
+      // isValidCandidate reads cutPolygonsCanonical/canonicalSize/fittedCircle as
+      // module-level state, already up to date above.
+      samplePointsCanonical = sampleSectorPoints(steps, seed, distributionSelect.value);
+    } catch (e) { sampleError = e.message; }
+  }
+  samplePointsCamera = homography
+    ? samplePointsCanonical.map(function (p) { return toPixel(p); })
+    : [];
+
+  renderCameraView();
+  renderOrthoView();
+  updateExportText(sampleError);
+}
+
+// ── Rendering ───────────────────────────────────────────────────────────────
+function drawPolygon(ctx, vertices, fillStyle, strokeStyle, lineWidth, dash) {
+  if (vertices.length < 2) return;
+  ctx.beginPath();
+  ctx.moveTo(vertices[0][0], vertices[0][1]);
+  for (let i = 1; i < vertices.length; i++) ctx.lineTo(vertices[i][0], vertices[i][1]);
+  ctx.closePath();
+  if (fillStyle) { ctx.fillStyle = fillStyle; ctx.fill(); }
+  if (strokeStyle) {
+    ctx.setLineDash(dash || []);
+    ctx.strokeStyle = strokeStyle;
+    ctx.lineWidth = lineWidth || 2;
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+function renderCutShapeCamera(ctx, shape, H) {
+  const boundary = cutShapeBoundary(shape).map(function (p) { return applyHomography(H, p); });
+  drawPolygon(ctx, boundary, "rgba(248,113,113,0.2)", "#f87171", 2, [6, 4]);
+  pixelHandlesForShape(shape, H).forEach(function (h) {
+    ctx.beginPath(); ctx.arc(h.pixelPoint[0], h.pixelPoint[1], 4, 0, 2 * Math.PI);
+    ctx.fillStyle = "#f87171"; ctx.fill();
+  });
+}
+
+function renderCameraView() {
+  const ctx = cameraCanvas.getContext("2d");
+  ctx.clearRect(0, 0, cameraCanvas.width, cameraCanvas.height);
+  const interaction = activeInteraction();
+
+  if (cameraCorners.length === 4) {
+    drawPolygon(ctx, cameraCorners, "rgba(56,189,248,0.15)", "#38bdf8", 2);
+
+    if (gridToggle.checked && homography && canonicalSize) {
+      ctx.strokeStyle = "rgba(56,189,248,0.5)";
+      ctx.lineWidth = 1;
+      const n = 8;
+      for (let i = 0; i <= n; i++) {
+        const u = canonicalSize[0] * i / n;
+        const p1 = toPixel([u, 0]);
+        const p2 = toPixel([u, canonicalSize[1]]);
+        ctx.beginPath(); ctx.moveTo(p1[0], p1[1]); ctx.lineTo(p2[0], p2[1]); ctx.stroke();
+      }
+      for (let i = 0; i <= n; i++) {
+        const v = canonicalSize[1] * i / n;
+        const p1 = toPixel([0, v]);
+        const p2 = toPixel([canonicalSize[0], v]);
+        ctx.beginPath(); ctx.moveTo(p1[0], p1[1]); ctx.lineTo(p2[0], p2[1]); ctx.stroke();
+      }
+    }
+
+    cameraCorners.forEach(function (c) {
+      ctx.beginPath();
+      ctx.arc(c[0], c[1], 7, 0, 2 * Math.PI);
+      ctx.fillStyle = cornersLocked ? "#5b6274" : "#38bdf8";
+      ctx.fill();
+      ctx.strokeStyle = "#0a0e17";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    });
+  }
+
+  if (homography) {
+    cutShapesCanonical.forEach(function (shape) { renderCutShapeCamera(ctx, shape, homography); });
+  }
+
+  // In-progress cut draft preview -- built in canonical space, then forward-mapped, exactly
+  // like a committed cut shape would be.
+  if (interaction === "polygon" && polyDraft.length > 0 && homography) {
+    const lastCanonical = (lastMousePos && inverseHomography) ? toCanonical(lastMousePos) : null;
+    const previewCanonical = lastCanonical ? polyDraft.concat([lastCanonical]) : polyDraft;
+    const previewPixel = previewCanonical.map(function (cp) { return toPixel(cp); });
+    drawPolygon(ctx, previewPixel, null, "#f87171", 2, [3, 3]);
+    polyDraft.forEach(function (v) {
+      const vp = toPixel(v);
+      ctx.beginPath(); ctx.arc(vp[0], vp[1], 4, 0, 2 * Math.PI);
+      ctx.fillStyle = "#f87171"; ctx.fill();
+    });
+  }
+  if (cutDragging && cutAnchor && cutPreview && homography) {
+    let draftShape = null;
+    if (interaction === "rectangle") {
+      draftShape = { type: "rectangle", corners: rectangleVertices(cutAnchor, cutPreview) };
+    } else if (interaction === "circle") {
+      draftShape = { type: "circle", center: cutAnchor, radius: Math.hypot(cutPreview[0] - cutAnchor[0], cutPreview[1] - cutAnchor[1]) };
+    }
+    if (draftShape) {
+      const boundary = cutShapeBoundary(draftShape).map(function (cp) { return toPixel(cp); });
+      drawPolygon(ctx, boundary, "rgba(248,113,113,0.15)", "#f87171", 2, [3, 3]);
+    }
+  }
+
+  extremePointsCamera.forEach(function (p) {
+    ctx.beginPath();
+    ctx.arc(p[0], p[1], 5, 0, 2 * Math.PI);
+    ctx.fillStyle = "#f5f5f5";
+    ctx.fill();
+  });
+
+  if (homography && fittedCircle && cameraCorners.length === 4) {
+    // Clip to the workspace quad: the valid sampling region is the INTERSECTION of the
+    // fitted circle and the workspace, not the circle alone, so the circle should visually
+    // stop at the quad's edge instead of appearing to expand past it.
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(cameraCorners[0][0], cameraCorners[0][1]);
+    for (let i = 1; i < 4; i++) ctx.lineTo(cameraCorners[i][0], cameraCorners[i][1]);
+    ctx.closePath();
+    ctx.clip();
+
+    ctx.strokeStyle = "#34d399";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    const segs = 64;
+    for (let i = 0; i <= segs; i++) {
+      const theta = 2 * Math.PI * i / segs;
+      const cp = [
+        fittedCircle.center[0] + fittedCircle.radius * Math.cos(theta),
+        fittedCircle.center[1] + fittedCircle.radius * Math.sin(theta),
+      ];
+      const pp = toPixel(cp);
+      if (i === 0) ctx.moveTo(pp[0], pp[1]); else ctx.lineTo(pp[0], pp[1]);
+    }
+    ctx.stroke();
+
+    samplePointsCamera.forEach(function (p) {
+      ctx.beginPath();
+      ctx.arc(p[0], p[1], 3, 0, 2 * Math.PI);
+      ctx.fillStyle = "#34d399";
+      ctx.fill();
+    });
+
+    if (interaction === "corners") {
+      // The fitted circle is now editable on the camera view too (forward-mapped handles),
+      // not just the orthographic view -- shown only in "corners" mode, the same mode that
+      // also drags the 4 surface corners, since both edit the workspace/circle structure.
+      circleHandles(fittedCircle).forEach(function (h) {
+        const hp = toPixel(h.point);
+        ctx.beginPath(); ctx.arc(hp[0], hp[1], 4, 0, 2 * Math.PI);
+        ctx.fillStyle = "#34d399"; ctx.fill();
+      });
+    }
+
+    ctx.restore();
+  }
+}
+
+function rectangleVertices(a, b) {
+  return [[a[0], a[1]], [b[0], a[1]], [b[0], b[1]], [a[0], b[1]]];
+}
+
+function getOrthoContainerWidth() {
+  return orthoCanvas.parentElement.clientWidth || 480;
+}
+
+function renderOrthoView() {
+  const ctx = orthoCanvas.getContext("2d");
+  if (!canonicalSize) {
+    orthoCanvas.width = getOrthoContainerWidth(); orthoCanvas.height = orthoCanvas.width * 0.75;
+    ctx.clearRect(0, 0, orthoCanvas.width, orthoCanvas.height);
+    return;
+  }
+  const maxW = getOrthoContainerWidth();
+  const maxH = Math.max(240, window.innerHeight * 0.55);
+  orthoScale = Math.min(maxW / canonicalSize[0], maxH / canonicalSize[1]);
+  orthoCanvas.width = canonicalSize[0] * orthoScale;
+  orthoCanvas.height = canonicalSize[1] * orthoScale;
+  ctx.clearRect(0, 0, orthoCanvas.width, orthoCanvas.height);
+
+  ctx.fillStyle = "rgba(56,189,248,0.15)";
+  ctx.fillRect(0, 0, orthoCanvas.width, orthoCanvas.height);
+  ctx.strokeStyle = "#38bdf8";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(0, 0, orthoCanvas.width, orthoCanvas.height);
+
+  if (gridToggle.checked) {
+    ctx.strokeStyle = "rgba(56,189,248,0.5)";
+    ctx.lineWidth = 1;
+    const n = 8;
+    for (let i = 1; i < n; i++) {
+      const x = orthoCanvas.width * i / n;
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, orthoCanvas.height); ctx.stroke();
+      const y = orthoCanvas.height * i / n;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(orthoCanvas.width, y); ctx.stroke();
+    }
+  }
+
+  cutPolygonsCanonical.forEach(function (poly) {
+    const scaled = poly.map(function (p) { return [p[0] * orthoScale, p[1] * orthoScale]; });
+    drawPolygon(ctx, scaled, "rgba(248,113,113,0.2)", "#f87171", 2, [6, 4]);
+  });
+  cutShapesCanonical.forEach(function (shape) {
+    getCutHandles(shape).forEach(function (h) {
+      ctx.beginPath(); ctx.arc(h.point[0] * orthoScale, h.point[1] * orthoScale, 4, 0, 2 * Math.PI);
+      ctx.fillStyle = "#f87171"; ctx.fill();
+    });
+  });
+
+  extremePointsCanonical.forEach(function (p) {
+    ctx.beginPath();
+    ctx.arc(p[0] * orthoScale, p[1] * orthoScale, 5, 0, 2 * Math.PI);
+    ctx.fillStyle = "#f5f5f5";
+    ctx.fill();
+  });
+
+  if (fittedCircle) {
+    ctx.beginPath();
+    ctx.arc(fittedCircle.center[0] * orthoScale, fittedCircle.center[1] * orthoScale, fittedCircle.radius * orthoScale, 0, 2 * Math.PI);
+    ctx.strokeStyle = "#34d399";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    circleHandles(fittedCircle).forEach(function (h) {
+      ctx.beginPath();
+      ctx.arc(h.point[0] * orthoScale, h.point[1] * orthoScale, 4, 0, 2 * Math.PI);
+      ctx.fillStyle = "#34d399";
+      ctx.fill();
+    });
+  }
+
+  samplePointsCanonical.forEach(function (p) {
+    ctx.beginPath();
+    ctx.arc(p[0] * orthoScale, p[1] * orthoScale, 3, 0, 2 * Math.PI);
+    ctx.fillStyle = "#34d399";
+    ctx.fill();
+  });
+}
+
+function updateExportText(sampleError) {
+  const cornersStr = cameraCorners
+    .map(function (c) { return "[" + Math.round(c[0]) + ", " + Math.round(c[1]) + "]"; })
+    .join(", ");
+  let body = "surface_calibration:\n  corners: [" + cornersStr + "]\n";
+  if (fittedCircle) {
+    const steps = Math.max(1, parseInt(stepsInput.value) || 1);
+    const seed = parseInt(seedInput.value) || 0;
+    const borderWidth = Math.max(0, parseFloat(borderWidthInput.value) || 0);
+    body += "\n# paste into the relevant object's pattern:\n";
+    body += "pattern:\n";
+    body += "  shape: sector\n";
+    body += "  center: [" + fittedCircle.center[0].toFixed(1) + ", " + fittedCircle.center[1].toFixed(1) + "]\n";
+    body += "  radius: " + fittedCircle.radius.toFixed(1) + "\n";
+    body += "  inner_radius: 0\n";
+    body += "  angle_start_deg: 0\n";
+    body += "  angle_end_deg: 360\n";
+    body += "  seed: " + seed + "\n";
+    body += "  distribution: " + distributionSelect.value + "\n";
+    body += "  border_width: " + borderWidth + "\n";
+    body += "# set this object's count to: " + steps + "\n";
+  }
+  if (cutShapesCanonical.length > 0 && homography) {
+    // exclude_zones in the YAML are always pixel-space facts about the image (see
+    // pattern.py) -- forward-map each canonical cut through the current homography here.
+    // A canonical circle maps to an ellipse under perspective, and config.py's exclude_zone
+    // schema has no ellipse shape, so every cut exports as `shape: polygon` (a circle's
+    // forward-mapped boundary approximation), never `shape: circle` -- that would otherwise
+    // be a second, redundant, lossy circle approximation on top of this one.
+    body += "\nexclude_zones:\n";
+    cutShapesCanonical.forEach(function (shape, i) {
+      body += "  - name: cut_" + (i + 1) + "\n";
+      const verts = cutShapeBoundary(shape)
+        .map(function (cp) { return toPixel(cp); })
+        .map(function (p) { return "[" + Math.round(p[0]) + ", " + Math.round(p[1]) + "]"; })
+        .join(", ");
+      body += "    shape: polygon\n";
+      body += "    vertices: [" + verts + "]\n";
+    });
+  }
+  if (sampleError) {
+    body += "\n# WARNING: could not generate a valid preview with current settings:\n# " + sampleError + "\n";
+  }
+  yamlOut.value = body;
+}
+
+// ── Save ────────────────────────────────────────────────────────────────────
+async function saveConfigToFile() {
+  const content = yamlOut.value;
+  if (!content) { return; }
+  // Primary path: POST to our own local server (vizaudit-calibrate's --save-to path) --
+  // this is what makes saving land in a predictable, reusable location automatically, with
+  // no dialog and not the browser's generic downloads folder. Only falls back to a native
+  // save dialog or a plain download if there's no server to talk to (e.g. --no-serve).
+  try {
+    const response = await fetch("/save", { method: "POST", body: content });
+    if (response.ok) {
+      saveStatus.textContent = await response.text();
+      return;
+    }
+  } catch (err) {
+    console.warn("POST /save failed, falling back:", err);
+  }
+  if (window.showSaveFilePicker) {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: "vizaudit_calibration.yaml",
+        types: [{ description: "YAML", accept: { "text/yaml": [".yaml", ".yml"] } }],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(content);
+      await writable.close();
+      saveStatus.textContent = "Saved.";
+      return;
+    } catch (err) {
+      if (err.name === "AbortError") { return; }
+      console.warn("showSaveFilePicker failed, falling back to a plain download:", err);
+    }
+  }
+  const blob = new Blob([content], { type: "text/yaml" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "vizaudit_calibration.yaml";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  saveStatus.textContent = "Saved to your downloads folder.";
+}
+
+saveConfigBtn.addEventListener("click", function () {
+  saveStatus.textContent = "";
+  saveConfigToFile();
+});
+
+// ── Interaction ───────────────────────────────────────────────────────────
+function getCanvasPoint(canvas, evt) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  return [(evt.clientX - rect.left) * scaleX, (evt.clientY - rect.top) * scaleY];
+}
+
+function updateModeUI() {
+  const interaction = activeInteraction();
+  finishCutBtn.disabled = !(interaction === "polygon" && polyDraft.length >= 3);
+}
+
+function resetCutDraftState() {
+  polyDraft = [];
+  cutDragging = false; cutAnchor = null; cutPreview = null;
+  updateModeUI();
+}
+
+function updateToolUI() {
+  toolExtreme.classList.toggle("active", tool === "extreme");
+  toolCorners.classList.toggle("active", tool === "corners");
+  toolRect.classList.toggle("active", tool === "rectangle");
+  toolCircle.classList.toggle("active", tool === "circle");
+  toolPolygon.classList.toggle("active", tool === "polygon");
+  toolEditCuts.classList.toggle("active", tool === "editCuts");
+  updateCursors();
+  updateModeUI();
+}
+
+function updateCursors() {
+  cameraCanvas.classList.remove("cut-cursor", "edit-cursor");
+  orthoCanvas.classList.remove("edit-cursor");
+  if (tool === "rectangle" || tool === "circle" || tool === "polygon") {
+    cameraCanvas.classList.add("cut-cursor");
+  } else if (tool === "editCuts") {
+    cameraCanvas.classList.add("edit-cursor");
+    orthoCanvas.classList.add("edit-cursor");
+  }
+}
+
+function setTool(newTool) {
+  tool = newTool;
+  resetCutDraftState();
+  updateToolUI();
+  renderAll();
+}
+toolExtreme.addEventListener("click", function () { setTool("extreme"); });
+toolCorners.addEventListener("click", function () { setTool("corners"); });
+toolRect.addEventListener("click", function () { setTool("rectangle"); });
+toolCircle.addEventListener("click", function () { setTool("circle"); });
+toolPolygon.addEventListener("click", function () { setTool("polygon"); });
+toolEditCuts.addEventListener("click", function () { setTool("editCuts"); });
+
+lockCornersBtn.addEventListener("click", function () {
+  cornersLocked = !cornersLocked;
+  lockCornersBtn.classList.toggle("active", cornersLocked);
+  lockCornersBtn.innerHTML = cornersLocked ? "&#x1F512;" : "&#x1F513;";
+  resetCornersBtn.disabled = cornersLocked;
+  renderAll();
+});
+resetCornersBtn.addEventListener("click", function () { resetCorners(); renderAll(); });
+
+document.addEventListener("keydown", function (e) {
+  if (e.key === "Escape" && polyDraft.length > 0) {
+    resetCutDraftState();
+    renderAll();
+  }
+});
+
+cameraCanvas.addEventListener("mousedown", function (e) {
+  const p = getCanvasPoint(cameraCanvas, e);
+  const interaction = activeInteraction();
+  if (interaction === "corners") {
+    let bestIdx = -1, bestDist = 20;
+    if (!cornersLocked) {
+      cameraCorners.forEach(function (c, i) {
+        const d = Math.hypot(c[0] - p[0], c[1] - p[1]);
+        if (d < bestDist) { bestDist = d; bestIdx = i; }
+      });
+    }
+    if (bestIdx >= 0) {
+      draggingCornerIndex = bestIdx;
+    } else if (homography && fittedCircle) {
+      // Fitted-circle editing on the camera view: hit-test against the forward-mapped
+      // handles (the circle itself renders as an ellipse here under perspective).
+      let bestMode = null, bestDist2 = 15;
+      circleHandles(fittedCircle).forEach(function (h, idx) {
+        const hp = toPixel(h.point);
+        const d = Math.hypot(hp[0] - p[0], hp[1] - p[1]);
+        if (d < bestDist2) { bestDist2 = d; bestMode = idx === 0 ? "center" : "radius"; }
+      });
+      if (bestMode) circleDragMode = bestMode;
+    }
+  } else if (interaction === "extreme") {
+    extremePointsCamera.push(p);
+    fitCircleBtn.disabled = extremePointsCamera.length < 3;
+    renderAll();
+  } else if (interaction === "rectangle" || interaction === "circle") {
+    if (!inverseHomography) return;
+    const cp = toCanonical(p);
+    cutAnchor = cp; cutPreview = cp; cutDragging = true;
+  } else if (interaction === "polygon") {
+    if (!inverseHomography) return;
+    polyDraft.push(toCanonical(p));
+    updateModeUI();
+    renderAll();
+  } else if (interaction === "editCuts") {
+    let best = null, bestDist = 20;
+    if (homography) {
+      cutShapesCanonical.forEach(function (shape) {
+        pixelHandlesForShape(shape, homography).forEach(function (h) {
+          const d = Math.hypot(h.pixelPoint[0] - p[0], h.pixelPoint[1] - p[1]);
+          if (d < bestDist) { bestDist = d; best = h; }
+        });
+      });
+    }
+    editDragTarget = best;
+  }
+});
+cameraCanvas.addEventListener("dblclick", function () {
+  if (activeInteraction() === "polygon" && polyDraft.length >= 3) {
+    cutShapesCanonical.push({ type: "polygon", vertices: polyDraft });
+    resetCutDraftState();
+    renderAll();
+  }
+});
+cameraCanvas.addEventListener("mousemove", function (e) {
+  const p = getCanvasPoint(cameraCanvas, e);
+  lastMousePos = p;
+  if (draggingCornerIndex !== null) {
+    cameraCorners[draggingCornerIndex] = p;
+    renderAll();
+  } else if (circleDragMode) {
+    if (inverseHomography) {
+      const cp = toCanonical(p);
+      if (circleDragMode === "center") fittedCircle.center = cp;
+      else fittedCircle.radius = Math.hypot(cp[0] - fittedCircle.center[0], cp[1] - fittedCircle.center[1]);
+      renderAll();
+    }
+  } else if (cutDragging) {
+    if (inverseHomography) { cutPreview = toCanonical(p); renderAll(); }
+  } else if (editDragTarget) {
+    if (inverseHomography) { editDragTarget.onDrag(toCanonical(p)); renderAll(); }
+  } else if (activeInteraction() === "polygon" && polyDraft.length > 0) {
+    renderAll();
+  }
+});
+finishCutBtn.addEventListener("click", function () {
+  if (polyDraft.length >= 3) {
+    cutShapesCanonical.push({ type: "polygon", vertices: polyDraft });
+    resetCutDraftState();
+    renderAll();
+  }
+});
+clearCutsBtn.addEventListener("click", function () {
+  cutShapesCanonical = [];
+  renderAll();
+});
+
+orthoCanvas.addEventListener("mousedown", function (e) {
+  if (!canonicalSize) return;
+  const p = getCanvasPoint(orthoCanvas, e);
+  const cp = [p[0] / orthoScale, p[1] / orthoScale];
+  if (activeInteraction() === "editCuts") {
+    // Cuts are editable directly on the orthographic view too, in the same canonical space
+    // they're already stored in -- no homography conversion needed here at all.
+    let best = null, bestDist = 10 / orthoScale;
+    cutShapesCanonical.forEach(function (shape) {
+      getCutHandles(shape).forEach(function (h) {
+        const d = Math.hypot(h.point[0] - cp[0], h.point[1] - cp[1]);
+        if (d < bestDist) { bestDist = d; best = h; }
+      });
+    });
+    editDragTarget = best;
+    return;
+  }
+  if (!fittedCircle) return;
+  const dCenter = Math.hypot(cp[0] - fittedCircle.center[0], cp[1] - fittedCircle.center[1]);
+  const threshold = 10 / orthoScale;
+  if (dCenter < threshold) {
+    circleDragMode = "center";
+  } else if (Math.abs(dCenter - fittedCircle.radius) < threshold) {
+    circleDragMode = "radius";
+  }
+});
+orthoCanvas.addEventListener("mousemove", function (e) {
+  const p = getCanvasPoint(orthoCanvas, e);
+  const cp = [p[0] / orthoScale, p[1] / orthoScale];
+  if (editDragTarget) {
+    editDragTarget.onDrag(cp);
+    renderAll();
+    return;
+  }
+  if (!circleDragMode) return;
+  if (circleDragMode === "center") {
+    fittedCircle.center = cp;
+  } else {
+    fittedCircle.radius = Math.hypot(cp[0] - fittedCircle.center[0], cp[1] - fittedCircle.center[1]);
+  }
+  renderAll();
+});
+window.addEventListener("mouseup", function () {
+  draggingCornerIndex = null;
+  circleDragMode = null;
+  editDragTarget = null;
+  if (cutDragging && cutAnchor && cutPreview) {
+    const interaction = activeInteraction();
+    if (interaction === "rectangle") {
+      cutShapesCanonical.push({ type: "rectangle", corners: rectangleVertices(cutAnchor, cutPreview) });
+    } else if (interaction === "circle") {
+      const r = Math.hypot(cutPreview[0] - cutAnchor[0], cutPreview[1] - cutAnchor[1]);
+      cutShapesCanonical.push({ type: "circle", center: cutAnchor, radius: r });
+    }
+    cutDragging = false; cutAnchor = null; cutPreview = null;
+    renderAll();
+  }
+});
+
+fitCircleBtn.addEventListener("click", function () {
+  if (extremePointsCanonical.length < 3) return;
+  fittedCircle = fitCircleLeastSquares(extremePointsCanonical);
+  renderAll();
+});
+clearExtremeBtn.addEventListener("click", function () {
+  extremePointsCamera = [];
+  fittedCircle = null;
+  fitCircleBtn.disabled = true;
+  renderAll();
+});
+gridToggle.addEventListener("change", renderAll);
+stepsInput.addEventListener("input", renderAll);
+seedInput.addEventListener("input", renderAll);
+distributionSelect.addEventListener("change", renderAll);
+borderWidthInput.addEventListener("input", renderAll);
+
+updateModeUI();
+updateToolUI();
+renderAll();
+</script>
+</body>
+</html>

@@ -15,6 +15,7 @@ from vizaudit.overlay.dataset_watcher import (
     wait_for_dataset_root,
 )
 from vizaudit.overlay.pattern import Point, build_pattern, target_for_episode
+from vizaudit.overlay.perspective import canonical_rect_dims, compute_homography
 from vizaudit.overlay.rerun_client import connect, log_target
 
 logger = logging.getLogger(__name__)
@@ -38,10 +39,23 @@ def run_session(config: OverlayConfig, dataset_root: Path, rerun_host: str, reru
         logger.warning("No variable objects configured -- nothing to guide. Exiting.")
         return
 
+    # Computed once: corrects sector sampling for a non-top-down camera, and confines it to
+    # the marked workspace rectangle (not just the sector itself). arc/line ignore both.
+    homography = None
+    bounds = None
+    if config.surface_calibration is not None:
+        homography = compute_homography(
+            config.surface_calibration.corners, config.surface_calibration.aspect_ratio
+        )
+        bounds = canonical_rect_dims(
+            config.surface_calibration.corners, config.surface_calibration.aspect_ratio
+        )
+
     # Patterns are static for the whole session, built once up front -- not recomputed
     # per episode.
     patterns: dict[str, list[Point]] = {
-        obj.name: build_pattern(obj.pattern, obj.count) for obj in variable_objects
+        obj.name: build_pattern(obj.pattern, obj.count, config.exclude_zones, homography, bounds)
+        for obj in variable_objects
     }
 
     logger.info("Connecting to Rerun at %s:%s ...", rerun_host, rerun_port)

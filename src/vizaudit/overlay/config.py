@@ -5,7 +5,7 @@ No Rerun or dataset imports — this module only parses and validates a config f
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -16,17 +16,45 @@ _ARC_REQUIRED = {"center", "radius", "angle_start_deg", "angle_end_deg"}
 _ARC_ALLOWED = _ARC_REQUIRED | {"shape"}
 _LINE_REQUIRED = {"start", "end"}
 _LINE_ALLOWED = _LINE_REQUIRED | {"shape"}
+_SECTOR_REQUIRED = {"center", "radius", "angle_start_deg", "angle_end_deg"}
+_SECTOR_ALLOWED = _SECTOR_REQUIRED | {"shape", "inner_radius", "seed", "distribution", "border_width"}
+_DISTRIBUTIONS = {"grid", "radial", "random"}
+_EXCLUDE_ZONE_CIRCLE_REQUIRED = {"name", "center", "radius"}
+_EXCLUDE_ZONE_CIRCLE_ALLOWED = _EXCLUDE_ZONE_CIRCLE_REQUIRED | {"shape"}
+_EXCLUDE_ZONE_POLYGON_REQUIRED = {"name", "vertices"}
+_EXCLUDE_ZONE_POLYGON_ALLOWED = _EXCLUDE_ZONE_POLYGON_REQUIRED | {"shape"}
+_SURFACE_CALIBRATION_REQUIRED = {"corners"}
+_SURFACE_CALIBRATION_ALLOWED = _SURFACE_CALIBRATION_REQUIRED | {"aspect_ratio"}
 
 
 @dataclass(frozen=True)
 class PatternConfig:
-    shape: str  # "arc" | "line"
+    shape: str  # "arc" | "line" | "sector"
     center: Point | None = None
-    radius: float | None = None
-    angle_start_deg: float | None = None
-    angle_end_deg: float | None = None
+    radius: float | None = None  # arc: radius; sector: OUTER radius
+    angle_start_deg: float | None = None  # shared by arc and sector
+    angle_end_deg: float | None = None  # shared by arc and sector
     start: Point | None = None
     end: Point | None = None
+    inner_radius: float | None = None  # sector only; default 0.0 (full pie-slice)
+    seed: int | None = None  # sector only; default 0
+    distribution: str | None = None  # sector only; "grid" | "radial" | "random"; default "grid"
+    border_width: float | None = None  # sector only; default 0.0 (no margin)
+
+
+@dataclass(frozen=True)
+class ExcludeZoneConfig:
+    name: str
+    shape: str = "circle"  # "circle" | "polygon"
+    center: Point | None = None  # circle only
+    radius: float | None = None  # circle only
+    vertices: list[Point] | None = None  # polygon only
+
+
+@dataclass(frozen=True)
+class SurfaceCalibrationConfig:
+    corners: list[Point]  # exactly 4, clockwise from top-left, pixel space
+    aspect_ratio: float | None = None
 
 
 @dataclass(frozen=True)
@@ -49,6 +77,8 @@ class OverlayConfig:
     camera_key: str
     objects: list[ObjectConfig]
     marker: MarkerConfig
+    exclude_zones: list[ExcludeZoneConfig] = field(default_factory=list)
+    surface_calibration: SurfaceCalibrationConfig | None = None
 
 
 class ConfigError(ValueError):
@@ -99,7 +129,90 @@ def _parse_pattern(data: dict, context: str) -> PatternConfig:
             start=_parse_point(data["start"], f"{context}.start"),
             end=_parse_point(data["end"], f"{context}.end"),
         )
-    raise ConfigError(f"{context}: unknown pattern shape {shape!r} (allowed: 'arc', 'line')")
+    if shape == "sector":
+        _require_keys(data, _SECTOR_REQUIRED, _SECTOR_ALLOWED, f"{context} (shape: sector)")
+        radius = data["radius"]
+        if not isinstance(radius, (int, float)) or radius < 0:
+            raise ConfigError(f"{context}: radius must be a non-negative number, got {radius!r}")
+        inner_radius = data.get("inner_radius", 0.0)
+        if not isinstance(inner_radius, (int, float)) or inner_radius < 0:
+            raise ConfigError(
+                f"{context}: inner_radius must be a non-negative number, got {inner_radius!r}"
+            )
+        if inner_radius >= radius:
+            raise ConfigError(
+                f"{context}: inner_radius ({inner_radius!r}) must be strictly less than radius ({radius!r})"
+            )
+        seed = data.get("seed", 0)
+        if not isinstance(seed, int) or isinstance(seed, bool):
+            raise ConfigError(f"{context}: seed must be an integer, got {seed!r}")
+        distribution = data.get("distribution", "grid")
+        if distribution not in _DISTRIBUTIONS:
+            raise ConfigError(
+                f"{context}: distribution must be one of {sorted(_DISTRIBUTIONS)}, got {distribution!r}"
+            )
+        border_width = data.get("border_width", 0.0)
+        if not isinstance(border_width, (int, float)) or border_width < 0:
+            raise ConfigError(
+                f"{context}: border_width must be a non-negative number, got {border_width!r}"
+            )
+        return PatternConfig(
+            shape="sector",
+            center=_parse_point(data["center"], f"{context}.center"),
+            radius=float(radius),
+            angle_start_deg=float(data["angle_start_deg"]),
+            angle_end_deg=float(data["angle_end_deg"]),
+            inner_radius=float(inner_radius),
+            seed=int(seed),
+            distribution=distribution,
+            border_width=float(border_width),
+        )
+    raise ConfigError(f"{context}: unknown pattern shape {shape!r} (allowed: 'arc', 'line', 'sector')")
+
+
+def _parse_exclude_zone(data: dict, context: str) -> ExcludeZoneConfig:
+    shape = data.get("shape", "circle")
+    if shape == "circle":
+        _require_keys(data, _EXCLUDE_ZONE_CIRCLE_REQUIRED, _EXCLUDE_ZONE_CIRCLE_ALLOWED, context)
+        name = data["name"]
+        if not isinstance(name, str) or not name:
+            raise ConfigError(f"{context}: 'name' must be a non-empty string")
+        radius = data["radius"]
+        if not isinstance(radius, (int, float)) or radius <= 0:
+            raise ConfigError(f"{context}: 'radius' must be a positive number, got {radius!r}")
+        return ExcludeZoneConfig(
+            name=name,
+            shape="circle",
+            center=_parse_point(data["center"], f"{context}.center"),
+            radius=float(radius),
+        )
+    if shape == "polygon":
+        _require_keys(data, _EXCLUDE_ZONE_POLYGON_REQUIRED, _EXCLUDE_ZONE_POLYGON_ALLOWED, context)
+        name = data["name"]
+        if not isinstance(name, str) or not name:
+            raise ConfigError(f"{context}: 'name' must be a non-empty string")
+        vertices = data["vertices"]
+        if not isinstance(vertices, list) or len(vertices) < 3:
+            raise ConfigError(f"{context}: 'vertices' must be a list of at least 3 [x, y] points")
+        parsed_vertices = [_parse_point(v, f"{context}.vertices[{i}]") for i, v in enumerate(vertices)]
+        return ExcludeZoneConfig(name=name, shape="polygon", vertices=parsed_vertices)
+    raise ConfigError(f"{context}: unknown exclude_zone shape {shape!r} (allowed: 'circle', 'polygon')")
+
+
+def _parse_surface_calibration(data: dict, context: str) -> SurfaceCalibrationConfig:
+    _require_keys(data, _SURFACE_CALIBRATION_REQUIRED, _SURFACE_CALIBRATION_ALLOWED, context)
+    corners = data["corners"]
+    if not isinstance(corners, list) or len(corners) != 4:
+        raise ConfigError(f"{context}: 'corners' must be a list of exactly 4 [x, y] points")
+    parsed_corners = [_parse_point(c, f"{context}.corners[{i}]") for i, c in enumerate(corners)]
+    aspect_ratio = data.get("aspect_ratio")
+    if aspect_ratio is not None:
+        if not isinstance(aspect_ratio, (int, float)) or aspect_ratio <= 0:
+            raise ConfigError(
+                f"{context}: 'aspect_ratio' must be a positive number, got {aspect_ratio!r}"
+            )
+        aspect_ratio = float(aspect_ratio)
+    return SurfaceCalibrationConfig(corners=parsed_corners, aspect_ratio=aspect_ratio)
 
 
 def _parse_object(data: dict, context: str) -> ObjectConfig:
@@ -162,4 +275,26 @@ def load_config(path: str | Path) -> OverlayConfig:
         raise ConfigError(f"{path}: object names must be unique, got {names}")
 
     marker = _parse_marker(raw.get("marker"))
-    return OverlayConfig(camera_key=camera_key, objects=objects, marker=marker)
+
+    raw_zones = raw.get("exclude_zones", [])
+    if not isinstance(raw_zones, list):
+        raise ConfigError(f"{path}: 'exclude_zones' must be a list")
+    exclude_zones = [_parse_exclude_zone(z, f"exclude_zones[{i}]") for i, z in enumerate(raw_zones)]
+    zone_names = [z.name for z in exclude_zones]
+    if len(zone_names) != len(set(zone_names)):
+        raise ConfigError(f"{path}: exclude_zones names must be unique, got {zone_names}")
+
+    raw_calibration = raw.get("surface_calibration")
+    surface_calibration = (
+        _parse_surface_calibration(raw_calibration, "surface_calibration")
+        if raw_calibration is not None
+        else None
+    )
+
+    return OverlayConfig(
+        camera_key=camera_key,
+        objects=objects,
+        marker=marker,
+        exclude_zones=exclude_zones,
+        surface_calibration=surface_calibration,
+    )
