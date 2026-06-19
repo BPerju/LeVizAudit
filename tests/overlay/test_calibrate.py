@@ -12,6 +12,16 @@ def test_static_html_exists_and_has_camera_access():
     assert "<canvas" in html
 
 
+def test_static_html_labels_radial_distribution_as_beta():
+    # "radial" has had many more iterative correctness fixes than "grid"/"random" (see
+    # CLAUDE.md) and isn't supported at all yet for combined (union) multi-arm sampling --
+    # the dropdown option says so explicitly rather than presenting all three as equally
+    # mature/supported.
+    html = _STATIC_HTML.read_text()
+    assert 'value="radial"' in html
+    assert "Radial (beta)" in html
+
+
 def test_write_calibration_html_copies_to_output(tmp_path):
     output_path = tmp_path / "calibration.html"
     result = write_calibration_html(output_path)

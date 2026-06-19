@@ -40,6 +40,19 @@ objects:
       seed: 42                            # fixed -> reproducible point set across runs
       distribution: grid                   # grid (default, evenly spaced) | random
       border_width: 10                      # extra margin -- no points within 10px of any boundary
+    orientation:              # optional -- also shows a target ORIENTATION as an arrow from
+                               # the target point, for tasks where rotation diversity matters
+                               # too, not just position. Cycled per-episode independently of
+                               # the position pattern above (its own `count`, possibly
+                               # different), so the two desync over a session instead of
+                               # always pairing the same position with the same rotation.
+      count: 4                  # how many distinct target angles to generate
+      method: uniform             # uniform (evenly spaced, default) | random (seeded)
+      angle_start_deg: 0
+      angle_end_deg: 360            # 0-360 = full rotation
+      seed: 7                         # "random" method only
+      arrow_length: 60                 # same space as this pattern's center/radius (canonical
+                                         # here, since surface_calibration is set above)
 
   - name: distractor_block
     count: 1

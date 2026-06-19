@@ -8,7 +8,10 @@ from vizaudit.overlay.pattern import (
     build_pattern,
     generate_arc_points,
     generate_line_points,
+    generate_rotation_angles,
     generate_sector_points,
+    generate_union_points,
+    orientation_arrow_points,
     target_for_episode,
 )
 from vizaudit.overlay.pattern import (
@@ -25,11 +28,12 @@ from vizaudit.overlay.pattern import (
     _place_in_available_intervals,
     _polygon_angle_block,
     _polygon_vertical_intervals,
+    _point_near_polygon,
     _refine_radial_local_separation,
     _relocate_if_invalid,
     _subtract_intervals,
 )
-from vizaudit.overlay.perspective import compute_homography
+from vizaudit.overlay.perspective import apply_homography, compute_homography, invert_homography
 
 
 def _nearest_neighbor_distances(points):
@@ -842,7 +846,7 @@ def test_refine_radial_local_separation_improves_a_close_pair():
     refined = _refine_radial_local_separation(
         list(placed), cx=0.0, cy=0.0, angle_start_deg=0, angle_end_deg=360,
         exclude_zones=[], border_width=0.0, homography=None, canonical_zone_polygons=None,
-        bounds=None, expected_spacing=3.0,
+        bounds=None, expected_spacing=3.0, is_valid=lambda p: True,
     )
     distances_before = _nearest_neighbor_distances(placed)
     distances_after = _nearest_neighbor_distances(refined)
@@ -857,7 +861,7 @@ def test_refine_radial_local_separation_noop_for_already_even_points():
     refined = _refine_radial_local_separation(
         list(placed), cx=0.0, cy=0.0, angle_start_deg=0, angle_end_deg=360,
         exclude_zones=[], border_width=0.0, homography=None, canonical_zone_polygons=None,
-        bounds=None, expected_spacing=10.0,
+        bounds=None, expected_spacing=10.0, is_valid=lambda p: True,
     )
     for (x1, y1), (x2, y2) in zip(placed, refined):
         assert math.hypot(x1 - x2, y1 - y2) < 1e-9
@@ -1025,3 +1029,339 @@ def test_generate_sector_points_radial_bounds_plus_zone_combined():
     assert len(points) == 60
     distances = _nearest_neighbor_distances(points)
     assert min(distances) > 0.5 * (sum(distances) / len(distances))
+
+
+def test_generate_sector_points_radial_refinement_respects_border_width_near_off_center_cut():
+    # Regression: _refine_radial_local_separation could move a point to a candidate that
+    # violated border_width near an off-center polygon cut, because it only checked the
+    # cut's APPROXIMATE inflated boundary, not the exact one.
+    zone = ExcludeZoneConfig(
+        name="r", shape="polygon", vertices=[(150, 100), (250, 100), (250, 140), (150, 140)]
+    )
+    points = generate_sector_points(
+        center=(200, 150), inner_radius=0, outer_radius=100,
+        angle_start_deg=0, angle_end_deg=360, count=40, seed=2,
+        distribution="radial", exclude_zones=[zone], border_width=10,
+    )
+    for p in points:
+        assert not _point_near_polygon(p, zone.vertices, 10)
+
+
+# ── generate_union_points: bimanual (or any multi-region) reach-circle union ──────────────
+
+
+def _circle_lens_area(r1, r2, d):
+    """Closed-form intersection (lens) area of two circles of radii r1/r2 whose centers are
+    distance d apart -- the standard two-circular-segment formula. Used as ground truth to
+    check generate_union_points doesn't double-sample the overlap, independent of the
+    implementation under test."""
+    if d >= r1 + r2:
+        return 0.0
+    if d <= abs(r1 - r2):
+        return math.pi * min(r1, r2) ** 2
+    d1 = (d * d + r1 * r1 - r2 * r2) / (2 * d)
+    d2 = d - d1
+    return (
+        r1 * r1 * math.acos(max(-1.0, min(1.0, d1 / r1))) - d1 * math.sqrt(max(0.0, r1 * r1 - d1 * d1))
+        + r2 * r2 * math.acos(max(-1.0, min(1.0, d2 / r2))) - d2 * math.sqrt(max(0.0, r2 * r2 - d2 * d2))
+    )
+
+
+@pytest.mark.parametrize("distribution", ["random", "grid"])
+def test_generate_union_points_returns_exactly_count(distribution):
+    circles = [((0.0, 0.0), 10.0), ((15.0, 0.0), 10.0)]  # overlapping
+    points = generate_union_points(circles, count=50, seed=0, distribution=distribution)
+    assert len(points) == 50
+
+
+@pytest.mark.parametrize("distribution", ["random", "grid"])
+def test_generate_union_points_every_point_inside_some_circle(distribution):
+    circles = [((0.0, 0.0), 10.0), ((25.0, 0.0), 8.0)]  # non-overlapping
+    points = generate_union_points(circles, count=80, seed=1, distribution=distribution)
+    for x, y in points:
+        assert any(math.hypot(x - cx, y - cy) <= r + 1e-6 for (cx, cy), r in circles)
+
+
+def test_generate_union_points_single_circle_grid_matches_generate_sector_points():
+    # Degenerate case: a "union" of exactly one circle's "grid" output must be byte-identical
+    # to sampling that circle directly with generate_sector_points -- the per-column chord
+    # logic is structurally the same algorithm either way (merging a list of exactly one
+    # interval is a no-op), so there's no reason for them to differ.
+    union_points = generate_union_points(
+        [((10.0, 10.0), 10.0)], count=40, seed=7, distribution="grid",
+    )
+    sector_points = generate_sector_points(
+        center=(10.0, 10.0), inner_radius=0.0, outer_radius=10.0,
+        angle_start_deg=0.0, angle_end_deg=360.0, count=40, seed=7, distribution="grid",
+    )
+    assert union_points == sector_points
+
+
+def test_generate_union_points_single_circle_random_is_valid_but_not_byte_identical():
+    # "random" is NOT expected to match generate_sector_points's output for a single circle:
+    # generate_union_points rejection-samples over the bounding BOX (x, y both uniform), while
+    # generate_sector_points samples in POLAR form (r via sqrt(uniform(r^2)), theta uniform) --
+    # both are legitimate area-uniform algorithms, but they consume the same seeded RNG in a
+    # different order/shape, so their outputs differ even for the identical circle/seed. Just
+    # check the result is still a valid, correctly-sized sample of that one circle.
+    points = generate_union_points([((10.0, 10.0), 10.0)], count=40, seed=7, distribution="random")
+    assert len(points) == 40
+    for x, y in points:
+        assert math.hypot(x - 10.0, y - 10.0) <= 10.0 + 1e-9
+
+
+def test_generate_union_points_grid_does_not_double_sample_the_overlap():
+    # The core bug this function exists to avoid: treating each arm's circle as an
+    # independent pattern would sample the overlap region at roughly DOUBLE its fair
+    # area-proportional share (once from each circle's own pattern). Two equal circles,
+    # overlapping by a known amount, let the expected overlap share be computed analytically
+    # (ground truth independent of the implementation) and compared against the actual count.
+    r, d = 10.0, 12.0  # meaningful, but not total, overlap
+    circles = [((0.0, 0.0), r), ((d, 0.0), r)]
+    lens_area = _circle_lens_area(r, r, d)
+    circle_area = math.pi * r * r
+    union_area = 2 * circle_area - lens_area
+    expected_overlap_share = lens_area / union_area
+
+    count = 200
+    points = generate_union_points(circles, count=count, seed=3, distribution="grid")
+    assert len(points) == count
+    overlap_count = sum(
+        1 for x, y in points
+        if math.hypot(x - 0.0, y - 0.0) <= r and math.hypot(x - d, y - 0.0) <= r
+    )
+    actual_overlap_share = overlap_count / count
+
+    # Double-sampling (the bug) would produce a share close to 2x the analytic expectation;
+    # correct union-aware sampling should land close to the analytic expectation itself.
+    assert actual_overlap_share < 1.5 * expected_overlap_share, (
+        f"overlap share {actual_overlap_share:.3f} looks double-sampled relative to the "
+        f"analytic expectation {expected_overlap_share:.3f} (lens_area={lens_area:.2f}, "
+        f"union_area={union_area:.2f})"
+    )
+    assert abs(actual_overlap_share - expected_overlap_share) < 0.1
+
+
+def test_generate_union_points_grid_respects_bounds_and_exclude_zones():
+    circles = [((10.0, 10.0), 8.0), ((20.0, 10.0), 8.0)]
+    zone = ExcludeZoneConfig(name="obstacle", shape="circle", center=(15.0, 10.0), radius=2.0)
+    points = generate_union_points(
+        circles, count=60, seed=0, distribution="grid", exclude_zones=[zone], bounds=(28.0, 20.0),
+    )
+    assert len(points) == 60
+    for x, y in points:
+        assert 0 <= x <= 28.0 and 0 <= y <= 20.0
+        assert math.hypot(x - 15.0, y - 10.0) > 2.0
+
+
+def test_generate_union_points_radial_raises_clear_not_yet_supported_error():
+    with pytest.raises(ValueError, match="not yet supported"):
+        generate_union_points([((0.0, 0.0), 10.0)], count=10, seed=0, distribution="radial")
+
+
+def test_generate_union_points_variable_count_mode_searches_for_closest_count():
+    circles = [((0.0, 0.0), 10.0), ((15.0, 0.0), 10.0)]
+    points = generate_union_points(
+        circles, count=60, seed=0, distribution="grid", count_mode="variable",
+    )
+    assert abs(len(points) - 60) < 15
+    for x, y in points:
+        assert any(math.hypot(x - cx, y - cy) <= r for (cx, cy), r in circles)
+
+
+def test_generate_union_points_variable_count_mode_rejects_non_grid_distribution():
+    with pytest.raises(ValueError, match="only supports distribution 'grid'"):
+        generate_union_points(
+            [((0.0, 0.0), 10.0)], count=10, seed=0, distribution="random", count_mode="variable",
+        )
+
+
+def test_generate_union_points_invalid_count_mode_raises():
+    with pytest.raises(ValueError, match="Unknown count_mode"):
+        generate_union_points([((0.0, 0.0), 10.0)], count=10, seed=0, count_mode="bogus")
+
+
+def test_generate_union_points_empty_circles_raises():
+    with pytest.raises(ValueError, match="non-empty"):
+        generate_union_points([], count=10, seed=0)
+
+
+def test_generate_union_points_border_width_too_large_for_every_circle_raises():
+    with pytest.raises(ValueError, match="effective radius"):
+        generate_union_points([((0.0, 0.0), 5.0)], count=10, seed=0, border_width=10.0)
+
+
+def test_generate_union_points_border_width_drops_only_the_too_small_circles():
+    # A border_width that eliminates the SMALLER circle but leaves the larger one valid
+    # should still succeed, sampling only from the surviving circle.
+    points = generate_union_points(
+        [((0.0, 0.0), 2.0), ((20.0, 0.0), 10.0)], count=30, seed=0, border_width=3.0,
+    )
+    assert len(points) == 30
+    for x, y in points:
+        assert math.hypot(x - 20.0, y - 0.0) <= 10.0 - 3.0 + 1e-6
+
+
+def test_build_pattern_dispatches_union_shape():
+    pattern_config = PatternConfig(
+        shape="union", circles=[((0.0, 0.0), 10.0), ((15.0, 0.0), 10.0)], seed=0,
+        distribution="grid", border_width=0.0,
+    )
+    points = build_pattern(pattern_config, count=25)
+    assert len(points) == 25
+
+
+@pytest.mark.parametrize("distribution", ["grid", "radial"])
+def test_generate_sector_points_variable_count_mode_returns_only_valid_points(distribution):
+    points = generate_sector_points(
+        (0, 0), 0, 10, 0, 360, count=30, seed=1, distribution=distribution, count_mode="variable",
+    )
+    assert len(points) > 0
+    for x, y in points:
+        assert math.hypot(x, y) <= 10 + 1e-6
+
+
+def test_generate_sector_points_variable_count_mode_searches_for_closest_count():
+    # A tiny inner circle relative to a huge bounding area: a single-shot resolution (density
+    # == target) would land far short of 400 -- the density search should get much closer.
+    points = generate_sector_points(
+        (0, 0), 0, 2, 0, 360, count=400, seed=1, distribution="grid", count_mode="variable",
+    )
+    assert abs(len(points) - 400) < 20
+
+
+def test_generate_sector_points_variable_count_mode_rejects_random():
+    with pytest.raises(ValueError, match="count_mode"):
+        generate_sector_points((0, 0), 0, 10, 0, 360, count=10, seed=1, distribution="random", count_mode="variable")
+
+
+def test_generate_sector_points_invalid_count_mode_raises():
+    with pytest.raises(ValueError, match="count_mode"):
+        generate_sector_points((0, 0), 0, 10, 0, 360, count=10, seed=1, count_mode="bogus")
+
+
+@pytest.mark.parametrize("method", ["uniform", "random"])
+def test_generate_rotation_angles_returns_exactly_count(method):
+    angles = generate_rotation_angles(7, method=method, seed=1)
+    assert len(angles) == 7
+
+
+def test_generate_rotation_angles_uniform_starts_at_user_angle_start():
+    angles = generate_rotation_angles(4, method="uniform")
+    assert angles == pytest.approx([0.0, 90.0, 180.0, 270.0])
+
+
+def test_generate_rotation_angles_start_end_are_relative_to_initial_angle():
+    angles = generate_rotation_angles(4, method="uniform", angle_start_deg=-45, angle_end_deg=45, initial_angle_deg=90)
+    assert angles == pytest.approx([45.0, 75.0, 105.0, 135.0])
+
+
+def test_generate_rotation_angles_uniform_spans_full_range_regardless_of_count():
+    # The achieved spread shouldn't shrink/grow with count -- it should always cover the
+    # literal [start, end] range exactly, for any non-wraparound span.
+    for count in (2, 3, 5, 10):
+        angles = generate_rotation_angles(count, method="uniform", angle_start_deg=0, angle_end_deg=90)
+        assert angles[0] == pytest.approx(0.0)
+        assert angles[-1] == pytest.approx(90.0)
+
+
+def test_generate_rotation_angles_random_relative_to_initial_angle_stays_in_range():
+    angles = generate_rotation_angles(20, method="random", angle_start_deg=-30, angle_end_deg=30, seed=1, initial_angle_deg=180)
+    assert all(150.0 <= a <= 210.0 for a in angles)
+
+
+def test_generate_rotation_angles_uniform_does_not_duplicate_the_wraparound_endpoint():
+    # 0 and 360 are the same physical angle for a full rotation -- starting AT 0 is correct
+    # (the user's chosen start), but 360 (the same point, redundantly) must not also appear.
+    angles = generate_rotation_angles(6, method="uniform")
+    assert 360.0 not in angles
+
+
+def test_generate_rotation_angles_uniform_respects_partial_range():
+    angles = generate_rotation_angles(3, method="uniform", angle_start_deg=0.0, angle_end_deg=90.0)
+    for a in angles:
+        assert 0.0 <= a <= 90.0
+
+
+def test_generate_rotation_angles_random_within_range_and_deterministic():
+    angles_a = generate_rotation_angles(10, method="random", angle_start_deg=10.0, angle_end_deg=50.0, seed=3)
+    angles_b = generate_rotation_angles(10, method="random", angle_start_deg=10.0, angle_end_deg=50.0, seed=3)
+    assert angles_a == angles_b
+    for a in angles_a:
+        assert 10.0 <= a <= 50.0
+
+
+def test_generate_rotation_angles_different_seeds_differ():
+    angles_a = generate_rotation_angles(10, method="random", seed=1)
+    angles_b = generate_rotation_angles(10, method="random", seed=2)
+    assert angles_a != angles_b
+
+
+def test_generate_rotation_angles_invalid_count_raises():
+    with pytest.raises(ValueError, match="count"):
+        generate_rotation_angles(0)
+
+
+def test_generate_rotation_angles_invalid_method_raises():
+    with pytest.raises(ValueError, match="method"):
+        generate_rotation_angles(4, method="spiral")
+
+
+def test_target_for_episode_generalizes_to_floats():
+    angles = [10.0, 20.0, 30.0]
+    assert target_for_episode(angles, 0) == 10.0
+    assert target_for_episode(angles, 4) == 20.0  # wraps: 4 % 3 == 1
+
+
+def test_orientation_arrow_points_tail_is_always_the_given_position():
+    position = (100.0, 50.0)
+    tail, _ = orientation_arrow_points(position, angle_deg=37.0, length=20.0)
+    assert tail == position
+
+
+def test_orientation_arrow_points_no_homography_rotates_in_pixel_space_directly():
+    position = (100.0, 50.0)
+    # angle 0 points along +x (no homography == canonical space == pixel space).
+    _, tip = orientation_arrow_points(position, angle_deg=0.0, length=10.0)
+    assert tip == pytest.approx((110.0, 50.0))
+    # angle 90 rotates toward +y (image y grows downward) -- same convention as
+    # generate_arc_points.
+    _, tip90 = orientation_arrow_points(position, angle_deg=90.0, length=10.0)
+    assert tip90 == pytest.approx((100.0, 60.0))
+
+
+def test_orientation_arrow_points_identity_homography_matches_no_homography_case():
+    # Corners that exactly match a canonical square produce an (approximately) identity
+    # homography, so projecting through it should reproduce the no-homography result.
+    corners = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]
+    homography = compute_homography(corners)
+    position = (40.0, 60.0)
+    tail_h, tip_h = orientation_arrow_points(position, angle_deg=30.0, length=15.0, homography=homography)
+    tail_plain, tip_plain = orientation_arrow_points(position, angle_deg=30.0, length=15.0)
+    assert tail_h == pytest.approx(tail_plain)
+    assert tip_h == pytest.approx(tip_plain, abs=1e-6)
+
+
+def test_orientation_arrow_points_homography_rotates_in_canonical_space_not_pixel_space():
+    # A genuinely tilted/non-square set of corners makes canonical and pixel space disagree
+    # about angles -- verify the tip is computed by rotating in CANONICAL space (recovered
+    # via the inverse homography) and then forward-mapped, by recomputing that independently.
+    corners = [(50.0, 20.0), (300.0, 10.0), (320.0, 200.0), (30.0, 210.0)]
+    homography = compute_homography(corners)
+    position = (150.0, 100.0)
+    angle_deg, length = 65.0, 25.0
+
+    _, tip = orientation_arrow_points(position, angle_deg, length, homography=homography)
+
+    inverse = invert_homography(homography)
+    cx, cy = apply_homography(inverse, position)
+    theta = math.radians(angle_deg)
+    expected_tip_canonical = (cx + length * math.cos(theta), cy + length * math.sin(theta))
+    expected_tip = apply_homography(homography, expected_tip_canonical)
+    assert tip == pytest.approx(expected_tip)
+
+    # And it must NOT equal the naive (wrong) pixel-space rotation, confirming the function
+    # is actually doing the canonical-space round trip rather than ignoring the homography.
+    px, py = position
+    naive_tip = (px + length * math.cos(theta), py + length * math.sin(theta))
+    assert tip != pytest.approx(naive_tip, abs=1e-6)

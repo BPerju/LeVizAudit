@@ -56,6 +56,57 @@ def test_load_config_defaults_marker_when_omitted(tmp_path):
     assert config.marker.color_rgba == (255, 64, 64, 255)
 
 
+def test_object_without_marker_override_inherits_the_global_marker(tmp_path):
+    config = load_config(write_config(tmp_path, VALID))
+    cube = config.objects[0]
+    assert cube.marker == config.marker
+
+
+def test_object_marker_override_only_changes_specified_fields(tmp_path):
+    # A bimanual setup's two objects typically only need to differ in color_rgba -- radius_px
+    # and label should keep tracking the top-level default unless an object overrides those
+    # too, so an operator doesn't have to repeat the whole marker block per object.
+    data = {
+        **VALID,
+        "objects": [
+            {**VALID["objects"][0], "marker": {"color_rgba": [0, 0, 255, 255]}},
+            VALID["objects"][1],
+        ],
+    }
+    config = load_config(write_config(tmp_path, data))
+    cube = config.objects[0]
+    assert cube.marker.color_rgba == (0, 0, 255, 255)
+    assert cube.marker.radius_px == config.marker.radius_px
+    assert cube.marker.label == config.marker.label
+    # The second (variable: false) object never had a marker override -- still inherits the
+    # global default, same as before this feature existed.
+    assert config.objects[1].marker == config.marker
+
+
+def test_object_marker_override_with_no_top_level_marker_falls_back_to_hardcoded_default(tmp_path):
+    data = {k: v for k, v in VALID.items() if k != "marker"}
+    data["objects"] = [
+        {**VALID["objects"][0], "marker": {"radius_px": 6}},
+        VALID["objects"][1],
+    ]
+    config = load_config(write_config(tmp_path, data))
+    cube = config.objects[0]
+    assert cube.marker.radius_px == 6.0
+    assert cube.marker.color_rgba == (255, 64, 64, 255)  # MarkerConfig()'s hardcoded default
+
+
+def test_object_marker_unknown_field_raises(tmp_path):
+    data = {
+        **VALID,
+        "objects": [
+            {**VALID["objects"][0], "marker": {"colour_rgba": [0, 0, 255, 255]}},  # typo'd
+            VALID["objects"][1],
+        ],
+    }
+    with pytest.raises(ConfigError):
+        load_config(write_config(tmp_path, data))
+
+
 def test_variable_object_missing_pattern_raises(tmp_path):
     data = {
         "camera_key": "observation.images.top",
@@ -298,6 +349,57 @@ def test_load_config_with_sector_distribution_and_border_width(tmp_path):
     pattern = config.objects[0].pattern
     assert pattern.distribution == "random"
     assert pattern.border_width == 5.0
+    assert pattern.count_mode == "fixed"
+
+
+def test_sector_count_mode_variable_with_grid(tmp_path):
+    data = dict(VALID)
+    data["objects"] = [dict(VALID["objects"][0], pattern={
+        "shape": "sector", "center": [0, 0], "radius": 50,
+        "angle_start_deg": 0, "angle_end_deg": 90, "distribution": "grid", "count_mode": "variable",
+    }), VALID["objects"][1]]
+    config = load_config(write_config(tmp_path, data))
+    assert config.objects[0].pattern.count_mode == "variable"
+
+
+def test_sector_count_mode_variable_with_random_raises(tmp_path):
+    data = dict(VALID)
+    data["objects"] = [dict(VALID["objects"][0], pattern={
+        "shape": "sector", "center": [0, 0], "radius": 50,
+        "angle_start_deg": 0, "angle_end_deg": 90, "distribution": "random", "count_mode": "variable",
+    }), VALID["objects"][1]]
+    with pytest.raises(ConfigError, match="count_mode"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_sector_invalid_count_mode_raises(tmp_path):
+    data = dict(VALID)
+    data["objects"] = [dict(VALID["objects"][0], pattern={
+        "shape": "sector", "center": [0, 0], "radius": 50,
+        "angle_start_deg": 0, "angle_end_deg": 90, "count_mode": "bogus",
+    }), VALID["objects"][1]]
+    with pytest.raises(ConfigError, match="count_mode"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_union_count_mode_variable_with_grid(tmp_path):
+    data = dict(VALID)
+    data["objects"] = [dict(VALID["objects"][0], pattern={
+        "shape": "union", "circles": [{"center": [0, 0], "radius": 10}],
+        "distribution": "grid", "count_mode": "variable",
+    }), VALID["objects"][1]]
+    config = load_config(write_config(tmp_path, data))
+    assert config.objects[0].pattern.count_mode == "variable"
+
+
+def test_union_count_mode_variable_with_random_raises(tmp_path):
+    data = dict(VALID)
+    data["objects"] = [dict(VALID["objects"][0], pattern={
+        "shape": "union", "circles": [{"center": [0, 0], "radius": 10}],
+        "distribution": "random", "count_mode": "variable",
+    }), VALID["objects"][1]]
+    with pytest.raises(ConfigError, match="count_mode"):
+        load_config(write_config(tmp_path, data))
 
 
 def test_sector_distribution_defaults_to_grid(tmp_path):
@@ -387,4 +489,78 @@ def test_surface_calibration_unknown_field_raises(tmp_path):
         "bogus": 1,
     }
     with pytest.raises(ConfigError):
+        load_config(write_config(tmp_path, data))
+
+
+def _with_orientation(orientation: dict) -> dict:
+    data = dict(VALID)
+    data["objects"] = [dict(VALID["objects"][0], orientation=orientation), VALID["objects"][1]]
+    return data
+
+
+def test_load_config_with_orientation(tmp_path):
+    data = _with_orientation({"count": 4, "method": "random", "angle_start_deg": 0, "angle_end_deg": 90, "seed": 5, "arrow_length": 25})
+    config = load_config(write_config(tmp_path, data))
+    orientation = config.objects[0].orientation
+    assert orientation.count == 4
+    assert orientation.method == "random"
+    assert orientation.angle_start_deg == 0.0
+    assert orientation.angle_end_deg == 90.0
+    assert orientation.seed == 5
+    assert orientation.arrow_length == 25.0
+
+
+def test_orientation_defaults_when_only_count_given(tmp_path):
+    data = _with_orientation({"count": 3})
+    config = load_config(write_config(tmp_path, data))
+    orientation = config.objects[0].orientation
+    assert orientation.method == "uniform"
+    assert orientation.angle_start_deg == 0.0
+    assert orientation.angle_end_deg == 360.0
+    assert orientation.seed == 0
+    assert orientation.arrow_length == 40.0
+
+
+def test_orientation_omitted_defaults_to_none(tmp_path):
+    config = load_config(write_config(tmp_path, VALID))
+    assert config.objects[0].orientation is None
+
+
+def test_orientation_missing_count_raises(tmp_path):
+    data = _with_orientation({"method": "uniform"})
+    with pytest.raises(ConfigError, match="count"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_orientation_zero_count_raises(tmp_path):
+    data = _with_orientation({"count": 0})
+    with pytest.raises(ConfigError):
+        load_config(write_config(tmp_path, data))
+
+
+def test_orientation_invalid_method_raises(tmp_path):
+    data = _with_orientation({"count": 2, "method": "spiral"})
+    with pytest.raises(ConfigError, match="method"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_orientation_non_positive_arrow_length_raises(tmp_path):
+    data = _with_orientation({"count": 2, "arrow_length": 0})
+    with pytest.raises(ConfigError, match="arrow_length"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_orientation_unknown_field_raises(tmp_path):
+    data = _with_orientation({"count": 2, "bogus": 1})
+    with pytest.raises(ConfigError):
+        load_config(write_config(tmp_path, data))
+
+
+def test_orientation_on_variable_false_object_raises(tmp_path):
+    data = dict(VALID)
+    data["objects"] = [
+        VALID["objects"][0],
+        dict(VALID["objects"][1], orientation={"count": 2}),
+    ]
+    with pytest.raises(ConfigError, match="orientation"):
         load_config(write_config(tmp_path, data))

@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Callable
+from typing import Callable, TypeVar
 
 from vizaudit.overlay.config import ExcludeZoneConfig, PatternConfig
 from vizaudit.overlay.perspective import Homography, apply_homography, invert_homography
 
 Point = tuple[float, float]
+T = TypeVar("T")
 
 _GOLDEN_RATIO_CONJUGATE = (3 - math.sqrt(5)) / 2  # 1 - 1/phi, exact closed form
 _ZONE_BOUNDARY_SEGMENTS = 32  # circle-zone -> polygon approximation, for canonical-space checks
@@ -778,6 +779,7 @@ def _refine_radial_local_separation(
     canonical_zone_polygons: list[list[Point]] | None,
     bounds: tuple[float, float] | None,
     expected_spacing: float,
+    is_valid: Callable[[Point], bool],
     passes: int = 3,
     min_acceptable_ratio: float = 0.75,
     num_candidates: int = 24,
@@ -840,6 +842,12 @@ def _refine_radial_local_separation(
             for theta in _candidate_thetas_in_intervals(avail, num_candidates):
                 cand_x = cx + r * math.cos(math.radians(theta))
                 cand_y = cy + r * math.sin(math.radians(theta))
+                # `avail` is approximate (a polygon zone's border is buffered by pushing
+                # vertices outward from its centroid, not a true Minkowski offset) -- the
+                # exact check is what catches an under-buffered edge a candidate from `avail`
+                # alone could otherwise still violate.
+                if not is_valid((cand_x, cand_y)):
+                    continue
                 score = min(
                     math.hypot(cand_x - placed[j][0], cand_y - placed[j][1]) for j in range(n) if j != i
                 )
@@ -851,6 +859,26 @@ def _refine_radial_local_separation(
         if not improved_any:
             break
     return placed
+
+
+def _search_variable_density(make_points: Callable[[int], list[Point]], target_count: int, max_iters: int = 8) -> list[Point]:
+    """Re-tries ``make_points(density)`` at increasing/decreasing density until its survivor
+    count is as close to ``target_count`` as achievable, instead of accepting whatever a
+    single density (``density == target_count``) happens to produce. Keeps the best (closest
+    to target) result seen across iterations."""
+    density = target_count
+    best: list[Point] | None = None
+    for _ in range(max_iters):
+        pts = make_points(max(1, density))
+        if best is None or abs(len(pts) - target_count) < abs(len(best) - target_count):
+            best = pts
+        if len(pts) >= target_count:
+            break
+        if len(pts) == 0:
+            density *= 2
+        else:
+            density = max(density + 1, round(density * target_count / len(pts)))
+    return best or []
 
 
 def generate_sector_points(
@@ -866,6 +894,7 @@ def generate_sector_points(
     homography: Homography | None = None,
     border_width: float = 0.0,
     bounds: tuple[float, float] | None = None,
+    count_mode: str = "fixed",
 ) -> list[Point]:
     """Points filling a pie-slice/annular-sector (NOT just its boundary).
 
@@ -972,6 +1001,8 @@ def generate_sector_points(
         raise ValueError(
             f"Unknown distribution: {distribution!r} (allowed: 'random', 'grid', 'radial')"
         )
+    if count_mode not in ("fixed", "variable"):
+        raise ValueError(f"Unknown count_mode: {count_mode!r} (allowed: 'fixed', 'variable')")
     exclude_zones = exclude_zones or []
     cx, cy = center
     effective_inner = inner_radius + border_width
@@ -1019,6 +1050,59 @@ def generate_sector_points(
             )
         pixel = candidate
         return not _point_in_any_zone(pixel, exclude_zones, border_width=border_width)
+
+    if count_mode == "variable":
+        # No relocation/CDF/refinement at all -- generate IDEAL grid/radial positions (same
+        # closed forms as "fixed" mode) and just drop whichever aren't valid, instead of
+        # moving them to force an exact final count. `count` is the TARGET final count, not a
+        # fixed resolution: `_search_variable_density` re-tries at a higher/lower density
+        # until the survivor count is as close to `count` as it can get, since a naive
+        # one-shot resolution can land far short of `count` whenever a lot of the candidate
+        # grid/spiral falls outside the valid area (a small circle in a big bounding box, an
+        # annulus, a restrictive cut, etc.).
+        if distribution == "random":
+            raise ValueError("count_mode='variable' only supports distribution 'grid' or 'radial'")
+
+        def make_grid(density: int) -> list[Point]:
+            x_min, x_max = cx - effective_outer, cx + effective_outer
+            y_min, y_max = cy - effective_outer, cy + effective_outer
+            if bounds is not None:
+                bw, bh = bounds
+                x_min, x_max = max(x_min, border_width), min(x_max, bw - border_width)
+                y_min, y_max = max(y_min, border_width), min(y_max, bh - border_width)
+            if x_max <= x_min or y_max <= y_min:
+                raise ValueError("count_mode='variable': no area available for the given bounds/border_width")
+            aspect = (x_max - x_min) / (y_max - y_min)
+            cols = max(1, round(math.sqrt(density * aspect)))
+            rows = max(1, round(density / cols))
+            step_x, step_y = (x_max - x_min) / cols, (y_max - y_min) / rows
+            points = []
+            for i in range(cols):
+                for j in range(rows):
+                    p = (x_min + (i + 0.5) * step_x, y_min + (j + 0.5) * step_y)
+                    if is_valid(p):
+                        points.append(p)
+            return points
+
+        def make_radial(density: int) -> list[Point]:
+            rng = random.Random(seed)
+            angle_offset_deg = rng.uniform(0, 360)
+            angle_span = angle_end_deg - angle_start_deg
+            golden_step_deg = angle_span * _GOLDEN_RATIO_CONJUGATE
+            points = []
+            for i in range(density):
+                t = (i + 0.5) / density
+                r = math.sqrt(effective_inner**2 + (effective_outer**2 - effective_inner**2) * t)
+                theta_deg = angle_start_deg + (angle_offset_deg + i * golden_step_deg) % angle_span
+                p = (cx + r * math.cos(math.radians(theta_deg)), cy + r * math.sin(math.radians(theta_deg)))
+                if is_valid(p):
+                    points.append(p)
+            return points
+
+        points = _search_variable_density(make_grid if distribution == "grid" else make_radial, count)
+        if not points:
+            raise ValueError("count_mode='variable' produced zero valid points -- the shape/bounds/exclude_zones are likely too restrictive, or count too low")
+        return [apply_homography(homography, p) if homography is not None else p for p in points]
 
     if distribution == "random":
         rng = random.Random(seed)
@@ -1270,8 +1354,269 @@ def generate_sector_points(
     if radial_cdf is not None:
         placed = _refine_radial_local_separation(
             placed, cx, cy, angle_start_deg, angle_end_deg, exclude_zones, border_width,
-            homography, canonical_zone_polygons, bounds, expected_spacing,
+            homography, canonical_zone_polygons, bounds, expected_spacing, is_valid,
         )
+    return [apply_homography(homography, p) if homography is not None else p for p in placed]
+
+
+def generate_union_points(
+    circles: list[tuple[Point, float]],
+    count: int,
+    seed: int,
+    distribution: str = "random",
+    exclude_zones: list[ExcludeZoneConfig] | None = None,
+    homography: Homography | None = None,
+    border_width: float = 0.0,
+    bounds: tuple[float, float] | None = None,
+    count_mode: str = "fixed",
+) -> list[Point]:
+    """Points filling the UNION of N full disks (``circles``, each ``(center, radius)``) --
+    built for a bimanual (or any multi-region) setup where two arms' reach circles overlap,
+    and treating each circle as an independently-sampled region would sample the overlap at
+    roughly DOUBLE the density of the non-overlapping parts (each circle's own pattern adds
+    its own points there, unaware the other circle already covers it). Scoped to full disks
+    only (no ``inner_radius``/angle restriction per circle) -- this is exactly what the
+    calibration tool's fitted reach-circles always are, so there's no need for the extra
+    generality `generate_sector_points` carries for a single restricted pie-slice.
+
+    ``circles``/``bounds`` are in canonical space when ``homography`` is given (mirroring
+    `generate_sector_points`'s convention), pixel space otherwise. ``exclude_zones`` are
+    always pixel-space facts about the image, checked after any homography mapping, exactly
+    as in `generate_sector_points`.
+
+    ``"random"``: rejection-sampled uniformly over the union's bounding box (NOT "pick a
+    circle weighted by area, then sample within it" -- that approach sounds right but isn't:
+    a point in the overlap is reachable by sampling from EITHER circle, so it would get
+    accepted roughly twice as often as a non-overlapping point of the same area, silently
+    re-introducing the exact double-density problem this function exists to avoid).
+    Bounding-box rejection has no such bias -- standard, correct area-uniform sampling for an
+    arbitrary region, just less efficient than a tighter envelope when circles are far apart
+    relative to their radii (same ``count * 200`` attempt cap as every other distribution
+    here; if that's ever a real problem for a genuinely sparse arm layout, revisit then).
+
+    ``"grid"``: a direct generalization of `generate_sector_points`'s full-disk fast path --
+    each lattice column's valid y-range is the UNION of every circle's chord at that x
+    (`_merge_intervals`, the same interval algebra already used there for combining
+    exclude_zone subtractions), not the chord of just one circle. Merging is exactly what
+    prevents overlap double-counting: a column straddling two circles' chords gets ONE merged
+    range covering both, with `count` allocated to it proportionally to that merged range's
+    own length (`_allocate_shares`), not to each circle's chord length separately (which would
+    double-count the overlapping portion). `exclude_zones` subtraction and `bounds` clipping
+    apply per-column exactly as in the single-circle case, just (where a column has multiple
+    disjoint merged sub-ranges, e.g. two circles not yet touching at that x) applied to each
+    piece independently.
+
+    ``"radial"`` is NOT YET SUPPORTED here (raises clearly) -- the Fermat/Vogel spiral is
+    inherently single-center, and correctly generalizing its area-CDF machinery to an
+    arbitrary union of differently-centered circles needs its own derivation (reusing
+    `_circle_zone_angle_block`'s closed form to compute, at a given radius from a chosen
+    origin, the angular extent INSIDE each union member instead of inside an exclude zone, then
+    merging those as an inclusion constraint rather than subtracting them as an exclusion --
+    plausible, but deliberately deferred to its own pass rather than guessed at here).
+
+    Each circle degrades to exactly `generate_sector_points`'s own output when ``circles`` has
+    only one entry -- verified by a regression test asserting byte-identical points between
+    the two functions for the same single circle/seed/distribution.
+
+    Relocation (`_relocate_if_invalid`) needs a single ``center``/``effective_outer`` to ray-
+    search from, which doesn't exist for a union -- resolved by delegating each invalid point
+    to whichever circle's center it's closest to (by signed distance to that circle's own
+    boundary), then clamping/searching using THAT circle's own geometry. This is a per-point,
+    not a per-pattern, choice: two different points needing relocation can delegate to two
+    different circles.
+    """
+    if count < 1:
+        raise ValueError(f"count must be >= 1, got {count}")
+    if not circles:
+        raise ValueError("circles must be non-empty")
+    if distribution not in ("random", "grid", "radial"):
+        raise ValueError(
+            f"Unknown distribution: {distribution!r} (allowed: 'random', 'grid', 'radial')"
+        )
+    if distribution == "radial":
+        raise ValueError(
+            "distribution='radial' is not yet supported for a union of circles (only "
+            "'random' and 'grid' are) -- the Fermat/Vogel spiral is inherently single-center; "
+            "use 'grid' (the default for sector patterns) or 'random' for a union pattern"
+        )
+    if count_mode not in ("fixed", "variable"):
+        raise ValueError(f"Unknown count_mode: {count_mode!r} (allowed: 'fixed', 'variable')")
+    if count_mode == "variable" and distribution != "grid":
+        raise ValueError("count_mode='variable' only supports distribution 'grid' for a union pattern")
+    exclude_zones = exclude_zones or []
+    effective_circles: list[tuple[float, float, float]] = []
+    for (cx, cy), radius in circles:
+        eff_r = radius - border_width
+        if eff_r > 0:
+            effective_circles.append((cx, cy, eff_r))
+    if not effective_circles:
+        raise ValueError(
+            f"border_width ({border_width}) leaves no circle with positive effective radius"
+        )
+
+    canonical_zone_polygons: list[list[Point]] | None = None
+    if homography is not None and exclude_zones:
+        inverse_homography = invert_homography(homography)
+        canonical_zone_polygons = [
+            _zone_to_canonical_polygon(zone, inverse_homography) for zone in exclude_zones
+        ]
+
+    def is_valid(candidate: Point) -> bool:
+        px, py = candidate
+        if not any(
+            (px - cx) ** 2 + (py - cy) ** 2 <= eff_r ** 2 for cx, cy, eff_r in effective_circles
+        ):
+            return False
+        if bounds is not None:
+            bw, bh = bounds
+            if px < border_width or px > bw - border_width:
+                return False
+            if py < border_width or py > bh - border_width:
+                return False
+        if homography is not None:
+            if canonical_zone_polygons is None:
+                return True
+            return not any(
+                _point_near_polygon(candidate, poly, border_width) for poly in canonical_zone_polygons
+            )
+        return not _point_in_any_zone(candidate, exclude_zones, border_width=border_width)
+
+    x_min = min(cx - r for cx, cy, r in effective_circles)
+    x_max = max(cx + r for cx, cy, r in effective_circles)
+    y_min = min(cy - r for cx, cy, r in effective_circles)
+    y_max = max(cy + r for cx, cy, r in effective_circles)
+    if bounds is not None:
+        bw, bh = bounds
+        x_min, x_max = max(x_min, border_width), min(x_max, bw - border_width)
+        y_min, y_max = max(y_min, border_width), min(y_max, bh - border_width)
+    if x_max <= x_min or y_max <= y_min:
+        raise ValueError(
+            f"Could not place {count} union point(s) -- bounds/border_width leave no area "
+            f"at all for the given circles"
+        )
+    # Based on total circle area (ignoring overlap -- fine for a search-scale estimate, not a
+    # correctness-critical value), NOT the bounding box's diagonal. A bbox-based estimate is a
+    # poor proxy here specifically: two very differently-sized circles (or circles separated
+    # by empty space) share one wide bbox, so a bbox-derived spacing systematically
+    # overestimates how loosely packed the SMALLER circle's own points actually are once
+    # `_allocate_shares` gives it its proportionally smaller share of `count` -- found as a
+    # real test failure: `_occupancy_guard`'s `min_separation` (half of this value) ended up
+    # tighter than the smaller circle's true point-to-point spacing, so legitimate grid
+    # points were rejected as "too close" and the relocation fallback exhausted its 200
+    # attempts trying to find room that didn't exist within that circle's own area.
+    total_circle_area = sum(math.pi * r * r for _, _, r in effective_circles)
+    expected_spacing = math.sqrt(total_circle_area / count) if total_circle_area > 0 else 1.0
+
+    if count_mode == "variable":
+        # Same idea as generate_sector_points' variable mode: generate IDEAL grid positions at
+        # a given density and drop whichever fall outside the union/bounds/exclude_zones,
+        # instead of relocating to force an exact count. `count` is a TARGET, not a fixed
+        # resolution -- `_search_variable_density` retries at higher/lower density until the
+        # survivor count is as close to `count` as achievable.
+        def make_grid(density: int) -> list[Point]:
+            aspect = (x_max - x_min) / (y_max - y_min)
+            cols = max(1, round(math.sqrt(density * aspect)))
+            rows = max(1, round(density / cols))
+            step_x, step_y = (x_max - x_min) / cols, (y_max - y_min) / rows
+            points = []
+            for i in range(cols):
+                for j in range(rows):
+                    p = (x_min + (i + 0.5) * step_x, y_min + (j + 0.5) * step_y)
+                    if is_valid(p):
+                        points.append(p)
+            return points
+
+        points = _search_variable_density(make_grid, count)
+        if not points:
+            raise ValueError(
+                "count_mode='variable' produced zero valid points -- the circles/bounds/"
+                "exclude_zones are likely too restrictive, or count too low"
+            )
+        return [apply_homography(homography, p) if homography is not None else p for p in points]
+
+    def nearest_circle(point: Point) -> tuple[float, float, float]:
+        px, py = point
+        return min(effective_circles, key=lambda c: math.hypot(px - c[0], py - c[1]) - c[2])
+
+    def relocate_union_point(
+        candidate: Point, valid_fn: Callable[[Point], bool], rng: random.Random, label: str, index: int
+    ) -> Point:
+        cx, cy, eff_r = nearest_circle(candidate)
+
+        def clamp(p: Point) -> Point:
+            return _clamp_to_region(p, cx, cy, 0.0, eff_r, 0.0, 360.0, bounds, border_width)
+
+        return _relocate_if_invalid(candidate, valid_fn, clamp, rng, expected_spacing, label, index, (cx, cy), eff_r)
+
+    if distribution == "random":
+        rng = random.Random(seed)
+        points: list[Point] = []
+        attempts = 0
+        max_attempts = count * 200
+        while len(points) < count:
+            attempts += 1
+            if attempts > max_attempts:
+                raise ValueError(
+                    f"Could not sample {count} union point(s) after {max_attempts} attempts; "
+                    f"exclude_zones/border_width/bounds are likely too restrictive, or the "
+                    f"circles are too sparse relative to their union's bounding box"
+                )
+            candidate = (rng.uniform(x_min, x_max), rng.uniform(y_min, y_max))
+            if not is_valid(candidate):
+                continue
+            points.append(apply_homography(homography, candidate) if homography is not None else candidate)
+        return points
+
+    # distribution == "grid"
+    jitter_rng = random.Random(0)  # fixed, NOT `seed` -- mirrors generate_sector_points
+    guarded_is_valid, mark_placed = _occupancy_guard(is_valid, 0.5 * expected_spacing)
+
+    aspect = (x_max - x_min) / (y_max - y_min)
+    cols = max(1, round(math.sqrt(count * aspect)))
+    step_x = (x_max - x_min) / cols
+
+    col_ranges: list[tuple[float, float, float]] = []
+    for i in range(cols):
+        x = x_min + (i + 0.5) * step_x
+        raw_chords = []
+        for cx, cy, eff_r in effective_circles:
+            dx = x - cx
+            if abs(dx) > eff_r:
+                continue
+            half_chord = math.sqrt(eff_r * eff_r - dx * dx)
+            lo, hi = max(cy - half_chord, y_min), min(cy + half_chord, y_max)
+            if hi > lo:
+                raw_chords.append((lo, hi))
+        merged_chords = _merge_intervals(raw_chords)
+        if not merged_chords:
+            continue
+        if exclude_zones:
+            excluded = _excluded_y_intervals_at_x(x, exclude_zones, border_width, homography, canonical_zone_polygons)
+            for lo, hi in merged_chords:
+                col_ranges.extend(
+                    (x, sub_lo, sub_hi) for sub_lo, sub_hi in _subtract_intervals(lo, hi, excluded) if sub_hi > sub_lo
+                )
+        else:
+            col_ranges.extend((x, lo, hi) for lo, hi in merged_chords)
+
+    if not col_ranges:
+        raise ValueError(
+            f"Could not place {count} union grid point(s) -- exclude_zones/border_width/"
+            f"bounds are likely too restrictive for the available union area"
+        )
+    shares = _allocate_shares([hi - lo for _, lo, hi in col_ranges], count)
+    ideal = []
+    for (x, y_lo, y_hi), share in zip(col_ranges, shares):
+        if share <= 0:
+            continue
+        step_y = (y_hi - y_lo) / share
+        ideal.extend((x, y_lo + (k + 0.5) * step_y) for k in range(share))
+
+    placed = []
+    for i, p in enumerate(ideal):
+        point = relocate_union_point(p, guarded_is_valid, jitter_rng, "union grid", i)
+        mark_placed(point)
+        placed.append(point)
     return [apply_homography(homography, p) if homography is not None else p for p in placed]
 
 
@@ -1316,13 +1661,120 @@ def build_pattern(
             homography=homography,
             border_width=pattern_config.border_width or 0.0,
             bounds=bounds,
+            count_mode=pattern_config.count_mode or "fixed",
+        )
+    if pattern_config.shape == "union":
+        return generate_union_points(
+            circles=pattern_config.circles,
+            count=count,
+            seed=pattern_config.seed,
+            distribution=pattern_config.distribution or "random",
+            exclude_zones=exclude_zones,
+            homography=homography,
+            border_width=pattern_config.border_width or 0.0,
+            bounds=bounds,
+            count_mode=pattern_config.count_mode or "fixed",
         )
     raise ValueError(f"Unknown pattern shape: {pattern_config.shape!r}")
 
 
-def target_for_episode(points: list[Point], episode_index: int) -> Point:
-    """Target point for ``episode_index``, wrapping if the session runs longer than
-    the configured pattern length."""
+def target_for_episode(points: list[T], episode_index: int) -> T:
+    """Target value for ``episode_index``, wrapping if the session runs longer than the
+    configured pattern length. Generic over the element type so this same modulo-cycling
+    logic serves both position points (``Point``) and rotation angles (``float``) -- they
+    are independent sequences that can have different lengths and therefore desync over a
+    long-enough session, which only adds coverage diversity, never removes it."""
     if not points:
         raise ValueError("points must be non-empty")
     return points[episode_index % len(points)]
+
+
+def generate_rotation_angles(
+    count: int,
+    method: str = "uniform",
+    angle_start_deg: float = 0.0,
+    angle_end_deg: float = 360.0,
+    seed: int = 0,
+    initial_angle_deg: float = 0.0,
+) -> list[float]:
+    """``count`` target orientation angles (degrees), in whatever space the paired position
+    pattern already produces its points in (pixel space, or canonical/rectified space when a
+    homography is active -- see ``orientation_arrow_points``, which is what actually projects
+    an angle from one space to the other for display). Cycled per-episode the same way
+    position points are, via ``target_for_episode``, with its OWN independent length: a
+    different ``count`` than the position pattern's own ``count`` is intentional, not a
+    mismatch to reconcile -- e.g. lengths 5 and 4 only repeat the exact same
+    position/rotation pairing every 20 episodes, so decoupling the two sequences only adds
+    coverage diversity over a session, never removes it.
+
+    ``"uniform"``: ``count`` angles evenly spaced across ``[angle_start_deg, angle_end_deg)``,
+    each placed at the center of its own equal sub-slice
+    (``angle_start_deg + (i + 0.5) * span / count``) rather than at both inclusive endpoints
+    the way ``generate_arc_points`` does for a deliberately partial arc. This matters for the
+    common full-rotation default (``0`` to ``360``): 0 and 360 are the same physical angle, so
+    an endpoint-inclusive scheme would duplicate it. Mirrors the midpoint convention
+    ``generate_sector_points``'s ``"radial"`` distribution already uses for its own
+    evenly-spaced parameter ``t``.
+
+    ``"random"``: ``count`` independent ``random.Random(seed).uniform(angle_start_deg,
+    angle_end_deg)`` draws -- deterministic given ``seed``, like every other random
+    distribution in this module.
+    """
+    if count < 1:
+        raise ValueError(f"count must be >= 1, got {count}")
+    if method not in ("uniform", "random"):
+        raise ValueError(f"Unknown rotation method: {method!r} (allowed: 'uniform', 'random')")
+    # angle_start_deg/angle_end_deg are RELATIVE to initial_angle_deg, not absolute -- e.g.
+    # initial_angle_deg=90, start=-45, end=45 spreads +-45 degrees around direction 90,
+    # without the user having to compute absolute angles by hand. Negative values are fine.
+    start = initial_angle_deg + angle_start_deg
+    end = initial_angle_deg + angle_end_deg
+    span = end - start
+    if method == "uniform":
+        if count == 1:
+            return [start]
+        # Full wrap (start/end are the same physical angle): divide by count so the last
+        # point doesn't duplicate the first. Otherwise divide by count-1 so the angles always
+        # cover the full [start, end] range regardless of count -- dividing by count alone
+        # left a gap that shrank toward (but never reached) `end` as count grew, making the
+        # spread look like it depended on count instead of being directly set by start/end.
+        divisor = count if span % 360 == 0 else count - 1
+        return [start + i * span / divisor for i in range(count)]
+    rng = random.Random(seed)
+    return [rng.uniform(start, end) for _ in range(count)]
+
+
+def orientation_arrow_points(
+    position: Point,
+    angle_deg: float,
+    length: float,
+    homography: Homography | None = None,
+) -> tuple[Point, Point]:
+    """The ``(tail, tip)`` pixel-space points of an arrow showing a target orientation of
+    ``angle_deg`` at ``position`` (already pixel space -- the output of
+    ``target_for_episode``/``build_pattern``), with the rotation itself applied in
+    CANONICAL space when a homography is active, not pixel space.
+
+    This is the one subtlety: a homography does not preserve angles (it maps lines to lines,
+    but not the angles between them), so rotating a vector directly in pixel space would not
+    show what a real object at ``angle_deg`` in the actual workspace would look like under a
+    tilted camera -- the same reason ``sector``'s area-uniform sampling already has to happen
+    in canonical space, not pixel space. Since ``position`` only exists in pixel space by the
+    time an episode's target is selected (``build_pattern`` already applied the forward
+    homography internally), this recovers its canonical-space coordinates via the inverse
+    homography, applies the rotation there, and forward-maps the result back -- rather than
+    threading a second, canonical-space copy of every pattern through ``session.py`` just for
+    this. Exact up to floating point, since ``apply_homography``/``invert_homography`` are
+    exact inverses of one another.
+
+    With no homography (the common, uncalibrated case), canonical space and pixel space are
+    the same thing, so the rotation is applied directly with no conversion -- consistent with
+    ``generate_arc_points``'s angle convention (0 along +x, increasing toward +y).
+    """
+    theta = math.radians(angle_deg)
+    if homography is None:
+        px, py = position
+        return position, (px + length * math.cos(theta), py + length * math.sin(theta))
+    cx, cy = apply_homography(invert_homography(homography), position)
+    tip_canonical = (cx + length * math.cos(theta), cy + length * math.sin(theta))
+    return position, apply_homography(homography, tip_canonical)

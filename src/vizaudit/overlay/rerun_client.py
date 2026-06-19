@@ -47,12 +47,20 @@ def log_target(
     point: tuple[float, float],
     object_name: str,
     marker: MarkerConfig,
+    orientation_tip: tuple[float, float] | None = None,
 ) -> None:
     """Logs a target marker as a child entity of the live camera image entity, so Rerun's
     Spatial2D view composites it directly on top of the feed.
 
     Re-logging to the same path (one fixed path per object) replaces the prior marker in
     the viewer's current-time view, so no `rr.Clear` is needed here.
+
+    ``orientation_tip``, if given, draws an arrow from ``point`` to it as a separate child
+    entity -- the already-projected orientation guide (see
+    ``pattern.orientation_arrow_points``, which does the homography-aware projection; this
+    function only logs the two points it's handed, with no perspective math of its own).
+    Whether an object has an orientation arrow at all is fixed for the whole session (set by
+    its config, not toggled per episode), so there's no need to ever clear a stale one here.
     """
     path = f"{camera_key}/target/{object_name}"
     rr.log(
@@ -64,3 +72,12 @@ def log_target(
             labels=[object_name] if marker.label else None,
         ),
     )
+    if orientation_tip is not None:
+        rr.log(
+            f"{path}/orientation",
+            rr.Arrows2D(
+                origins=[point],
+                vectors=[(orientation_tip[0] - point[0], orientation_tip[1] - point[1])],
+                colors=[marker.color_rgba],
+            ),
+        )

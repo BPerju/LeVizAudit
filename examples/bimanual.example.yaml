@@ -1,0 +1,70 @@
+# vizaudit-overlay pattern config for a bimanual setup -- two arms sharing one camera frame.
+# There's no separate "arms:" concept in the schema: a bimanual rig is just >1 `objects[]`
+# entries, each with its own pattern region and (new) marker color override, so the two
+# simultaneous target markers are visually distinguishable. `vizaudit-calibrate` has a
+# matching "Arms" tab in its toolbar for calibrating both objects' reach circles side by side
+# in one session -- see CLAUDE.md for why no deeper schema change was needed.
+#
+# This example's two reach circles (below) are clear of each other, so each gets its own
+# independent `shape: sector` pattern -- exactly what `vizaudit-calibrate`'s "Independent"
+# toggle (ON) exports. If your two arms' reach circles actually OVERLAP in the middle of the
+# shared workspace, sampling them independently like this double-samples that overlap;
+# `vizaudit-calibrate`'s "Independent" toggle OFF (the default) instead exports a single
+# `shape: union` pattern -- `circles: [{center, radius}, ...]` -- that samples the union of
+# every circle as one shared area, for ONE shared object rather than one object per arm.
+
+camera_key: observation.images.top
+
+# One shared homography -- both arms sit in the SAME camera frame, so there's only ever one
+# surface_calibration regardless of how many arms/objects you add.
+surface_calibration:
+  corners: [[40, 40], [600, 40], [600, 440], [40, 440]]
+
+objects:
+  - name: left_cube
+    count: 20
+    variable: true
+    pattern:
+      shape: sector
+      center: [180, 240]      # left arm's own reach-circle center, fit via vizaudit-calibrate
+      radius: 140
+      angle_start_deg: 0
+      angle_end_deg: 360
+      seed: 0
+      distribution: grid
+      border_width: 10
+    marker:
+      color_rgba: [239, 68, 68, 255]   # red -- only the field that needs to differ from the
+                                         # top-level default below; radius_px/label inherit it
+
+  - name: right_block
+    count: 20
+    variable: true
+    pattern:
+      shape: sector
+      center: [460, 240]      # right arm's own reach-circle center -- a SEPARATE fit, even
+                                # though it shares the same surface_calibration above
+      radius: 140
+      angle_start_deg: 0
+      angle_end_deg: 360
+      seed: 1                  # a different seed so the two sweeps don't look identical
+      distribution: grid
+      border_width: 10
+    marker:
+      color_rgba: [59, 130, 246, 255]  # blue
+
+marker:
+  radius_px: 10
+  color_rgba: [255, 64, 64, 255]   # fallback for any object that doesn't override color_rgba
+  label: true
+
+exclude_zones:
+  # Each arm's own base is an obstacle for BOTH arms' patterns -- exclude_zones are scene-level
+  # (shared by every object), which is exactly right here: neither arm's target should ever
+  # land inside the OTHER arm's base footprint either.
+  - name: left_arm_base
+    center: [60, 240]
+    radius: 35
+  - name: right_arm_base
+    center: [580, 240]
+    radius: 35

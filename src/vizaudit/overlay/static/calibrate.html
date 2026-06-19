@@ -16,9 +16,7 @@
     --text-faint: #5b6274;
     --accent: #38bdf8;
     --accent-soft: rgba(56,189,248,0.18);
-    --result: #34d399;
     --cut: #f87171;
-    --marker: #f5f5f5;
     --radius: 6px;
   }
   * { box-sizing: border-box; }
@@ -40,17 +38,34 @@
     border-radius: var(--radius);
     border: 1px solid var(--border-subtle);
     background: rgba(255,255,255,0.02);
-    padding: 14px;
+    padding: 20px;
     margin-bottom: 16px;
   }
 
-  .toolbar { display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-end; }
   .toolbar-group { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-  .toolbar-label {
-    font-size: 0.72rem; color: var(--text-faint); text-transform: uppercase;
-    letter-spacing: 0.05em; width: 100%; margin-bottom: 2px;
+  .toolbar-group-inner { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+  /* A thin separator between functional sub-clusters of buttons that share one toolbar-group
+     (the "Edit" group accreted many distinct tools over time -- geometry editing, point
+     add/remove, selection, cut drawing -- with nothing visually distinguishing them beyond
+     being adjacent). Same idiom as Figma/Photoshop's segmented toolbars. */
+  .toolbar-divider { width: 1px; height: 20px; background: var(--border-strong); margin: 0 2px; }
+  /* A labeled subsection within a card -- e.g. "Camera"/"Arms"/"Workspace edit tools" inside
+     one panel -- giving each cluster of controls its own breathing room and a border between
+     them, instead of every row in a card running directly into the next (reported directly
+     as "cramped"). The label is deliberately quieter (text-faint, smaller) than the card's
+     own <h2> title, so the visual hierarchy stays card > subsection, not two equal headings. */
+  .subsection-label {
+    font-size: 0.68rem; font-weight: 600; color: var(--text-faint);
+    text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px;
   }
-  .toolbar-group-inner { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .subsection + .subsection { border-top: 1px solid var(--border-subtle); margin-top: 16px; padding-top: 16px; }
+  /* The Setup card's 3 subsections (Camera/Arms/Workspace edit tools) sit side by side as
+     columns, not stacked rows -- requested directly. Overrides the stacked-subsection rule
+     above with a vertical rule between columns instead of a horizontal one above each;
+     wraps to stacked rows on a narrow viewport, same as every other flex-wrap group here. */
+  .setup-columns { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
+  .setup-columns > .subsection { flex: 1 1 220px; border-top: none; margin-top: 0; padding-top: 0; }
+  .setup-columns > .subsection + .subsection { border-left: 1px solid var(--border-subtle); padding-left: 24px; }
 
   button, select, input[type="number"] {
     background: var(--surface-1);
@@ -73,8 +88,18 @@
   label { font-size: 0.82rem; color: var(--text-muted); display: flex; align-items: center; gap: 5px; }
   input[type="checkbox"] { accent-color: var(--accent); }
 
-  .views { display: flex; flex-wrap: wrap; gap: 16px; }
+  .views { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
   .view-panel { flex: 1 1 380px; min-width: 320px; }
+  .view-header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .view-header h2 { margin: 0; }
+  .card-header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .card-header h2 { margin: 0; }
+  /* Lives in the camera view's own header row (right-aligned via margin-left:auto on its
+     wrapper), right above the canvas it edits -- not a page-corner overlay, so it can't drift
+     away from "the actual edit space" or collide with the cards/other view's own header
+     controls. Collapsed to a single toggle button by default. */
+  .floating-toolbar { display: flex; align-items: center; gap: 6px; }
+  #floatingToolbarTools { display: flex; align-items: center; gap: 6px; }
   .video-wrap { position: relative; width: 100%; line-height: 0; }
   video, #cameraCanvas {
     width: 100%;
@@ -104,7 +129,7 @@
      one system reliably looks offset on another. Replaced with a plain vector wedge drawn
      with explicit coordinates, so the tip is a known point (2, 2) -- not a guess about
      glyph metrics -- and the hotspot is set to that exact point. */
-  #cameraCanvas.cut-cursor {
+  #cameraCanvas.cut-cursor, #orthoCanvas.cut-cursor {
     cursor: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22"><polygon points="2,2 20,8 8,20" fill="white" stroke="black" stroke-width="1.5" stroke-linejoin="round"/></svg>') 2 2, crosshair;
   }
   #cameraCanvas.edit-cursor, #orthoCanvas.edit-cursor { cursor: grab; }
@@ -124,102 +149,155 @@
   .legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 0.78rem; color: var(--text-muted); margin-top: 8px; }
   .legend span { display: inline-flex; align-items: center; gap: 5px; }
   .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  /* Arm chips: deliberately NOT using the shared button.active rule (that's for which TOOL
+     is selected, a different concept from which ARM is active) -- each chip's border/text
+     color is set inline to that arm's own color when active, so the chip itself doubles as
+     a legend for the color used everywhere else that arm's geometry is drawn. */
+  button.arm-chip { display: inline-flex; align-items: center; gap: 6px; }
+  button.arm-chip .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  button.arm-chip.active { background: rgba(255,255,255,0.06); }
 </style>
 </head>
 <body>
 <h1>VizAudit calibration</h1>
 <p class="subtitle">
-  Connects directly to a camera on this machine -- no dataset, no recording session, no
-  Rerun. <strong>Camera view</strong> (left): drag the 4 corners onto the real workspace
-  surface, mark extreme-reach points while moving the arm, or pick an Edit tool to mark
-  regions points shouldn't spawn in. <strong>Orthographic view</strong> (right): the same
-  surface undistorted, where the marked points get fit to a circle, and where cuts can also
-  be edited directly -- drag either view's handles to fine-tune, and watch the other view
-  update to match. Lock the corners (the padlock icon) once they're aligned, to avoid
-  nudging them by accident while marking points or drawing cuts. While drawing a polygon
-  cut: double-click, or the checkmark button, closes it; <kbd>Esc</kbd> cancels it, or click
-  the active tool icon again to stop. Set "Steps" and a distribution, and the live preview
-  always shows exactly that many points, confined to the circle, the workspace, and outside
-  every cut, in both views.
+  Marks a robot's reachable workspace on a live camera feed and configures how target points
+  are sampled within it, for guided data-collection.<br>
+  <strong>How to:</strong> in Workspace setup -- 1) drag the 4 corners onto the work surface;
+  2) "Mark reach points" and click 3+ spots at the edges of where the arm can physically
+  reach; 3) "Fit circle". Then tune Pattern/Rotation below and copy the YAML below.
 </p>
 
-<div class="panel toolbar">
-  <div class="toolbar-group">
-    <span class="toolbar-label">Camera</span>
-    <div class="toolbar-group-inner">
-      <select id="deviceSelect"></select>
-      <button id="startBtn">Start camera</button>
+<div class="panel">
+  <h2>Setup</h2>
+  <div class="setup-columns">
+    <div class="subsection">
+      <div class="subsection-label">Camera</div>
+      <div class="toolbar-group-inner">
+        <select id="deviceSelect"></select>
+        <button id="startBtn">Start camera</button>
+      </div>
+    </div>
+    <div class="subsection">
+      <div class="subsection-label">Arms</div>
+      <div class="toolbar-group-inner" id="armChips"></div>
+      <div class="toolbar-group-inner" style="margin-top: 9px;">
+        <input type="color" id="armColorInput" title="Active arm's color" value="#34d399">
+        <input type="text" id="armNameInput" placeholder="Arm name" style="width: 96px;">
+        <button id="addArmBtn" class="icon-btn" title="Add another arm">+</button>
+        <button id="removeArmBtn" class="icon-btn danger" title="Remove the active arm">&#10005;</button>
+        <label title="When two arms' reach circles overlap, sample the UNION as one shared area (the overlap isn't double-density) instead of each circle independently. Off by default. Forced on, and disabled, with only one arm.">
+          <input type="checkbox" id="independentToggle"> Independent
+        </label>
+      </div>
+    </div>
+    <div class="subsection">
+      <div class="subsection-label">Workspace edit tools</div>
+      <div class="toolbar-group-inner">
+        <button id="toolCorners" class="icon-btn active" title="Edit: corners, edges, the reach circle &amp; reach points">
+          <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+            <rect x="2" y="2" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6"/>
+            <circle cx="2" cy="2" r="1.6" fill="currentColor"/><circle cx="14" cy="2" r="1.6" fill="currentColor"/>
+            <circle cx="14" cy="14" r="1.6" fill="currentColor"/><circle cx="2" cy="14" r="1.6" fill="currentColor"/>
+            <rect x="7" y="1" width="2" height="2" fill="currentColor"/><rect x="7" y="13" width="2" height="2" fill="currentColor"/>
+            <rect x="1" y="7" width="2" height="2" fill="currentColor"/><rect x="13" y="7" width="2" height="2" fill="currentColor"/>
+          </svg>
+        </button>
+        <button id="lockCornersBtn" class="icon-btn" title="Lock corners/edges">&#x1F513;</button>
+        <button id="resetCornersBtn">Reset corners</button>
+        <button id="toolExtreme" title="Mark reach points">Mark reach points</button>
+        <button id="fitCircleBtn" disabled title="Fit a circle to the marked reach points">Fit circle</button>
+        <button id="lockCircleBtn" class="icon-btn" title="Lock the fitted reach circle">&#x1F513;</button>
+        <button id="clearExtremeBtn">Clear points</button>
+      </div>
     </div>
   </div>
-  <div class="toolbar-group">
-    <span class="toolbar-label">Reach circle</span>
-    <div class="toolbar-group-inner">
-      <button id="toolExtreme" title="Mark extreme points">Mark extreme points</button>
-      <button id="fitCircleBtn" disabled>Fit from points</button>
-      <button id="clearExtremeBtn">Clear points</button>
+</div>
+<div class="panel">
+  <div class="subsection">
+    <div class="card-header">
+      <h2 id="patternPreviewLabel" style="margin: 0;">Pattern</h2>
+      <button id="lockPatternBtn" class="icon-btn" title="Lock pattern: also blocks moving/adding/removing sample points">&#x1F513;</button>
     </div>
-  </div>
-  <div class="toolbar-group">
-    <span class="toolbar-label">Edit</span>
-    <div class="toolbar-group-inner">
-      <button id="toolCorners" class="icon-btn active" title="Drag corners / circle">
-        <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
-          <rect x="2" y="2" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6"/>
-          <circle cx="2" cy="2" r="1.8" fill="currentColor"/>
-          <circle cx="14" cy="2" r="1.8" fill="currentColor"/>
-          <circle cx="14" cy="14" r="1.8" fill="currentColor"/>
-          <circle cx="2" cy="14" r="1.8" fill="currentColor"/>
-        </svg>
-      </button>
-      <button id="lockCornersBtn" class="icon-btn" title="Lock corners">&#x1F513;</button>
-      <button id="resetCornersBtn">Reset corners</button>
-      <button id="toolRect" class="icon-btn" title="Rectangle cut">&#9645;</button>
-      <button id="toolCircle" class="icon-btn" title="Circle cut">&#9711;</button>
-      <button id="toolPolygon" class="icon-btn" title="Polygon cut">&#11040;</button>
-      <button id="toolEditCuts" class="icon-btn" title="Edit cuts">&#9998;</button>
-      <button id="finishCutBtn" class="icon-btn" title="Finish polygon" disabled>&#10003;</button>
-      <button id="clearCutsBtn" class="danger">Clear all cuts</button>
-    </div>
-  </div>
-  <div class="toolbar-group">
-    <span class="toolbar-label">Display</span>
-    <div class="toolbar-group-inner">
-      <label><input type="checkbox" id="gridToggle" checked> Grid</label>
-    </div>
-  </div>
-  <div class="toolbar-group">
-    <span class="toolbar-label">Pattern preview</span>
     <div class="toolbar-group-inner">
       <label>Steps <input type="number" id="stepsInput" value="20" min="1"></label>
+      <span class="note" id="actualCountLabel"></span>
       <label>Seed <input type="number" id="seedInput" value="0"></label>
       <label>Distribution
         <select id="distributionSelect">
           <option value="grid" selected>Grid</option>
-          <option value="radial">Radial</option>
+          <option value="radial" id="distributionRadialOption">Radial (beta)</option>
           <option value="random">Random</option>
         </select>
       </label>
       <label>Border width <input type="number" id="borderWidthInput" value="0" min="0"></label>
+      <label>Count mode
+        <select id="countModeSelect">
+          <option value="fixed" selected>Fixed</option>
+          <option value="variable" id="countModeVariableOption">Variable</option>
+        </select>
+      </label>
+    </div>
+  </div>
+  <div class="subsection">
+    <h2 id="orientationPreviewLabel" style="margin: 0 0 10px;">Rotation</h2>
+    <div class="toolbar-group-inner">
+      <label title="A real config option (orientation:), not just a local preview -- Rerun won't show direction arrows during recording unless this is enabled too."><input type="checkbox" id="orientationToggle"> Enable</label>
+    </div>
+    <div id="orientationDetailFields" class="toolbar-group-inner" style="display: none; margin-top: 9px;">
+      <label>Count <input type="number" id="orientationCountInput" value="1" min="1"></label>
+      <label>Method
+        <select id="orientationMethodSelect">
+          <option value="uniform" selected>Uniform</option>
+          <option value="random">Random</option>
+        </select>
+      </label>
+      <label>Initial&deg; <input type="number" id="orientationInitialAngleInput" value="0"></label>
+      <label>Start&deg; <input type="number" id="orientationAngleStartInput" value="0"></label>
+      <label>End&deg; <input type="number" id="orientationAngleEndInput" value="360"></label>
+      <label>Seed <input type="number" id="orientationSeedInput" value="0"></label>
+      <label>Arrow len <input type="number" id="orientationArrowLengthInput" value="40" min="1"></label>
+      <button id="resetOrientationBtn" class="danger" title="Selected points: clear their override, reverting to this default. Nothing selected: clear every point's override.">Reset to default</button>
     </div>
   </div>
 </div>
 
 <div class="views">
   <div class="panel view-panel">
-    <h2>Camera view</h2>
+    <div class="view-header">
+      <h2>Camera view</h2>
+      <div class="floating-toolbar" style="margin-left: auto;">
+        <button id="undoBtn" class="icon-btn" title="Undo (Ctrl+Z)" disabled>&#8634;</button>
+        <button id="redoBtn" class="icon-btn" title="Redo (Ctrl+Shift+Z)" disabled>&#8635;</button>
+        <span class="toolbar-divider"></span>
+        <button id="toolbarToggleBtn" class="icon-btn" title="Show/hide editing tools">&#9776;</button>
+        <div id="floatingToolbarTools" style="display: none;">
+          <button id="toolSelect" class="icon-btn" title="Drag a box to select sample points (then drag any of them to move the whole selection, or press Delete/Backspace to remove them), or drag/click one point directly; click a cut's body to select it (Delete/Backspace removes it) or drag its handle to reshape it; click empty space to deselect">&#11034;</button>
+          <button id="toolAddRemovePoint" class="icon-btn" title="Click empty space to add a sample point; click an existing one to remove it">&#10010;</button>
+          <span class="toolbar-divider"></span>
+          <button id="toolRect" class="icon-btn" title="Rectangle cut">&#9645;</button>
+          <button id="toolCircle" class="icon-btn" title="Circle cut">&#9711;</button>
+          <button id="toolPolygon" class="icon-btn" title="Polygon cut (double-click or Esc to finish)">&#11040;</button>
+          <span class="toolbar-divider"></span>
+          <button id="clearCutsBtn" class="icon-btn danger" title="Clear all cuts">&#10005;</button>
+        </div>
+      </div>
+    </div>
     <div class="video-wrap">
       <video id="video" autoplay playsinline muted></video>
       <canvas id="cameraCanvas"></canvas>
     </div>
   </div>
   <div class="panel view-panel">
-    <h2>Orthographic view</h2>
+    <div class="view-header">
+      <h2>Orthographic view</h2>
+      <label style="margin-left: auto;"><input type="checkbox" id="gridToggle" checked> Grid</label>
+    </div>
     <canvas id="orthoCanvas"></canvas>
     <div class="legend">
       <span><i class="dot" style="background:var(--accent)"></i> surface / grid</span>
-      <span><i class="dot" style="background:var(--marker)"></i> extreme-reach points</span>
-      <span><i class="dot" style="background:var(--result)"></i> fitted circle / samples</span>
       <span><i class="dot" style="background:var(--cut)"></i> cuts (no points spawn here)</span>
+      <span id="armColorLegend">extreme-reach points / fitted circle / samples are colored per arm -- see the "Arms" chips above</span>
     </div>
   </div>
 </div>
@@ -249,23 +327,52 @@ const cameraCanvas = document.getElementById("cameraCanvas");
 const orthoCanvas = document.getElementById("orthoCanvas");
 const deviceSelect = document.getElementById("deviceSelect");
 const startBtn = document.getElementById("startBtn");
+const armChips = document.getElementById("armChips");
+const armColorInput = document.getElementById("armColorInput");
+const armNameInput = document.getElementById("armNameInput");
+const addArmBtn = document.getElementById("addArmBtn");
+const removeArmBtn = document.getElementById("removeArmBtn");
+const independentToggle = document.getElementById("independentToggle");
+const patternPreviewLabel = document.getElementById("patternPreviewLabel");
 const toolExtreme = document.getElementById("toolExtreme");
 const toolCorners = document.getElementById("toolCorners");
+const toolSelect = document.getElementById("toolSelect");
+const toolAddRemovePoint = document.getElementById("toolAddRemovePoint");
 const lockCornersBtn = document.getElementById("lockCornersBtn");
 const resetCornersBtn = document.getElementById("resetCornersBtn");
 const fitCircleBtn = document.getElementById("fitCircleBtn");
+const lockCircleBtn = document.getElementById("lockCircleBtn");
+const lockPatternBtn = document.getElementById("lockPatternBtn");
 const clearExtremeBtn = document.getElementById("clearExtremeBtn");
 const toolRect = document.getElementById("toolRect");
 const toolCircle = document.getElementById("toolCircle");
 const toolPolygon = document.getElementById("toolPolygon");
-const toolEditCuts = document.getElementById("toolEditCuts");
-const finishCutBtn = document.getElementById("finishCutBtn");
 const clearCutsBtn = document.getElementById("clearCutsBtn");
+const floatingToolbarTools = document.getElementById("floatingToolbarTools");
+const toolbarToggleBtn = document.getElementById("toolbarToggleBtn");
+const undoBtn = document.getElementById("undoBtn");
+const redoBtn = document.getElementById("redoBtn");
 const gridToggle = document.getElementById("gridToggle");
 const stepsInput = document.getElementById("stepsInput");
 const seedInput = document.getElementById("seedInput");
 const distributionSelect = document.getElementById("distributionSelect");
+const distributionRadialOption = document.getElementById("distributionRadialOption");
 const borderWidthInput = document.getElementById("borderWidthInput");
+const countModeSelect = document.getElementById("countModeSelect");
+const actualCountLabel = document.getElementById("actualCountLabel");
+const countModeVariableOption = document.getElementById("countModeVariableOption");
+const orientationPreviewLabel = document.getElementById("orientationPreviewLabel");
+const orientationToggle = document.getElementById("orientationToggle");
+const orientationCountInput = document.getElementById("orientationCountInput");
+const orientationMethodSelect = document.getElementById("orientationMethodSelect");
+const orientationInitialAngleInput = document.getElementById("orientationInitialAngleInput");
+const orientationAngleStartInput = document.getElementById("orientationAngleStartInput");
+const orientationAngleEndInput = document.getElementById("orientationAngleEndInput");
+const orientationSeedInput = document.getElementById("orientationSeedInput");
+const orientationArrowLengthInput = document.getElementById("orientationArrowLengthInput");
+const resetOrientationBtn = document.getElementById("resetOrientationBtn");
+const orientationDetailFields = document.getElementById("orientationDetailFields");
+const armColorLegend = document.getElementById("armColorLegend");
 const yamlOut = document.getElementById("yamlOut");
 const saveConfigBtn = document.getElementById("saveConfigBtn");
 const saveStatus = document.getElementById("saveStatus");
@@ -323,14 +430,133 @@ startCamera().catch(function (err) {
 
 // ── State (source of truth; everything else is derived in renderAll()) ───
 // One mutually-exclusive radio-button state for every interaction mode -- "corners" |
-// "extreme" | "rectangle" | "circle" | "polygon" | "editCuts". All six are plain icon/text
-// buttons in the toolbar (see setTool()); there is no "none" value because "corners" already
-// serves as the neutral default to click back to.
+// "extreme" | "select" | "addRemovePoint" | "rectangle" | "circle" | "polygon".
+//
+// "corners" is Workspace setup's own tool: corners, edges, the active arm's fitted reach
+// circle, and reach points -- everything involved in calibrating the workspace/reach, and
+// ONLY reachable through this tool (requested explicitly: "reach circles and points should
+// be editable from the setup tab edit tool only"). The default tool, since it's the first
+// thing a new session needs.
+//
+// "select" (floating toolbar) merges what used to be THREE separate tools -- cuts-only
+// "edit", "samples" (drag one point), and an orientation-only box-select -- into one, since
+// none of their hit-tests actually collide (cuts vs. sample points are different geometry
+// entirely): click/drag a cut's handle to reshape it, click its body (no handle nearby) to
+// select it for Delete/Backspace; drag a box over empty space to select sample points (the
+// Rotation panel then edits just the selection, and Delete/Backspace removes them); drag any
+// single sample point to move it, or -- if MULTIPLE points are selected -- drag any one of
+// them to move the whole selection together. One gesture set, not three tools for what's
+// fundamentally "operate on this view's editable things."
 let tool = "corners";
-let cornersLocked = false; // independent of `tool` -- suppresses corner-drag only
-let cameraCorners = []; // 4 [x,y] points, camera/video pixel space
-let extremePointsCamera = []; // clicked on the live video, camera pixel space
-let fittedCircle = null; // {center:[x,y], radius} in CANONICAL space -- sticky, manual-editable
+let selectedCutIndex = -1; // which cutShapesCanonical entry is selected (via the "select"
+                            // tool clicking a cut's body) for Delete/Backspace -- -1 = none.
+let cornersLocked = false; // independent of `tool` -- suppresses corner/edge-drag only, in
+                            // EVERY tool ("the grid" only -- circle/cuts/extreme/samples are
+                            // never affected by this flag, requested explicitly).
+let circleLocked = false; // suppresses dragging the ACTIVE arm's fitted reach circle once
+                           // it's been generated -- cut-shape circles are a different thing
+                           // entirely and stay editable regardless of this flag.
+let patternLocked = false; // disables the Pattern card's inputs so they can't be bumped by
+                            // accident once a pattern's been dialed in.
+let cameraCorners = []; // 4 [x,y] points, camera/video pixel space -- shared by every arm,
+                         // since a bimanual setup's two arms still sit in the SAME camera
+                         // frame, with one homography for the whole tool (see the "Arms"
+                         // section below for what IS per-arm).
+
+// ── Arms (bimanual support) ──────────────────────────────────────────────────────────────
+// One "arm" = one independently-calibrated reach circle: its own extreme-reach points, fitted
+// circle, sample-point overrides, and pattern-preview settings (steps/seed/distribution/
+// border width) -- everything that's naturally tied to a SPECIFIC physical arm's own reach,
+// as opposed to cameraCorners/cutShapesCanonical above, which describe the shared camera
+// frame and its obstacles and stay global regardless of arm count. A single-arm setup is just
+// `arms.length === 1` -- nothing else in the tool changes shape for that common case, and the
+// very first arm keeps the tool's original default name/color so an existing single-arm
+// workflow looks identical to before this feature existed.
+//
+// `extremePointsCamera`/`fittedCircle`/`sampleOverrides` below stay as plain top-level
+// variables holding the ACTIVE arm's live, in-progress state -- every existing function in
+// this file (sampleSectorPoints, the edit/sample hit-testers, the drag handlers, etc.) already
+// reads/mutates them directly, and rewriting all of those to thread an explicit "current arm"
+// parameter through would be a much bigger, riskier change for the same result. Instead,
+// `syncActiveArmFromGlobals()`/`loadActiveArmIntoGlobals()` copy between these live globals
+// and `arms[activeArmIndex]` at the points that matter (switching arms, snapshotting for
+// undo/redo, rendering) -- so only a handful of call sites need to know "arms" exist at all.
+const ARM_PALETTE = ["#34d399", "#f59e0b", "#a78bfa", "#fb7185", "#60a5fa", "#facc15", "#2dd4bf", "#f472b6"];
+
+function makeArm(name, color) {
+  return {
+    name: name,
+    color: color,
+    extremePointsCamera: [],
+    fittedCircle: null,
+    sampleOverrides: {},
+    orientationOverrides: {}, // per-point full orientation-config snapshots, keyed by sample
+                                // index -- set/cleared via the box-select tool
+    extraSamplePoints: [], // manually added points (canonical), appended after generation
+    removedSampleIndices: [], // generated-point indices manually removed
+    steps: 20,
+    seed: 0,
+    distribution: "grid",
+    borderWidth: 0,
+    countMode: "fixed",
+    // Orientation guide arrow -- mirrors config.py's OrientationConfig defaults exactly
+    // (count required there; defaulted to 1 here purely as a UI starting value, same role
+    // every other default in this object plays). See generateRotationAngles/
+    // orientationTipCanonical below for what these drive.
+    orientationEnabled: false,
+    orientationCount: 1,
+    orientationMethod: "uniform",
+    orientationAngleStart: 0,
+    orientationAngleEnd: 360,
+    orientationSeed: 0,
+    orientationArrowLength: 40,
+    orientationInitialAngle: 0,
+  };
+}
+
+let arms = [makeArm("Arm 1", ARM_PALETTE[0])];
+let activeArmIndex = 0;
+
+// Independent (off by default) controls how MULTIPLE arms' circles combine for sampling --
+// not whether each arm's own circle/extreme-points are independently calibrated, which they
+// always are (you still pick the active arm via the chips and mark/fit its own points either
+// way). OFF (default, "combined"): every arm's fitted circle is sampled as one shared UNION
+// region (generate_union_points/sampleUnionPoints) -- the point of this whole toggle: two
+// arms' reach circles in a real bimanual rig typically OVERLAP in the middle of the shared
+// workspace, and sampling each circle's pattern independently would sample that overlap at
+// roughly DOUBLE the density of the non-overlapping parts (each circle's own pattern adds
+// points there, unaware the other circle already covers it) -- see CLAUDE.md. ON:
+// today's original per-arm behavior, each arm's own independent pattern -- appropriate when
+// arms work in genuinely separate, non-overlapping zones and you want N independent patterns,
+// not one shared one. With only 1 arm, the two modes sample identically (a "union" of one
+// circle IS that circle) but render DIFFERENTLY -- combined mode draws every sample dot in a
+// neutral color since no single arm owns the result, which looks wrong once there's only one
+// arm to begin with (reported directly) -- so `independent` is forced true whenever
+// `arms.length === 1` (see updateIndependentAvailability). `independentUserPreference` is
+// the actual last value the user chose via the checkbox, kept separate so a forced `true`
+// while at 1 arm doesn't get mistaken for the user's real preference and leak forward once a
+// 2nd arm is added back -- adding a 2nd arm restores whatever combined/independent choice
+// was in effect before, rather than always landing on "independent" just because it
+// happened to be the effective value at 1 arm.
+let independent = false;
+let independentUserPreference = false;
+
+// The steps/seed/distribution/borderWidth/sampleOverrides an arm's own fields (in `arms[i]`)
+// hold are only actually USED when `independent` is true. When false, this single shared
+// object is used instead -- the "Pattern preview" fields apply to the combined pattern as a
+// whole, not to whichever arm happens to be active. `extremePointsCamera`/`fittedCircle`
+// stay per-arm regardless of `independent`, since calibrating EACH arm's own circle is always
+// a per-arm action.
+let combinedSettings = {
+  steps: 20, seed: 0, distribution: "grid", borderWidth: 0, sampleOverrides: {}, countMode: "fixed",
+  orientationOverrides: {}, extraSamplePoints: [], removedSampleIndices: [],
+  orientationEnabled: false, orientationCount: 1, orientationMethod: "uniform",
+  orientationAngleStart: 0, orientationAngleEnd: 360, orientationSeed: 0, orientationArrowLength: 40,
+  orientationInitialAngle: 0,
+};
+
+let extremePointsCamera = arms[0].extremePointsCamera; // pixel space; added via "extreme", repositioned via "corners"
+let fittedCircle = arms[0].fittedCircle; // {center:[x,y], radius} in CANONICAL space -- sticky, manual-editable
 
 // Cut shapes are stored in CANONICAL space (exactly like fittedCircle), not pixel space --
 // this is what makes them "follow the surface" when corners are twisted: their rendered
@@ -347,12 +573,302 @@ let fittedCircle = null; // {center:[x,y], radius} in CANONICAL space -- sticky,
 // type: "circle" {center, radius} | "rectangle" {corners: [4 pts]} | "polygon" {vertices}
 let cutShapesCanonical = [];
 
-let draggingCornerIndex = null;
-let circleDragMode = null; // "center" | "radius" | null -- fittedCircle, either view
+// Manual per-index overrides for the generated sample-point preview, in CANONICAL space --
+// applied on top of sampleSectorPoints()'s output in renderAll(), keyed by array index. Lets
+// an operator nudge one generated point by hand (the "Move sample points" tool) without
+// touching the circle/cuts/distribution that produced the rest. Cleared whenever steps/seed/
+// distribution change (the index<->point correspondence is only meaningful for a fixed
+// algorithm+count; a different count or distribution is a conceptually different point set,
+// so a stale override would silently misapply to an unrelated point), but NOT on border-width
+// changes, which -- like a circle/corner edit -- are treated as continuous fine-tuning that a
+// manual override should survive. Per-arm, same as fittedCircle.
+let sampleOverrides = arms[0].sampleOverrides;
+let orientationOverrides = arms[0].orientationOverrides;
+let extraSamplePoints = arms[0].extraSamplePoints;
+let removedSampleIndices = arms[0].removedSampleIndices;
+// Which sample-point indices the box-select tool currently has selected -- an "inspector
+// panel" pattern (Figma/Blender-style): the orientation toolbar fields always edit whatever
+// this selection contains, falling back to the shared default settings when empty, instead
+// of always writing to the default while a separate stamp action wrote a frozen snapshot at
+// drag time. The earlier "stamp on drag" design had edits to the toolbar AFTER selecting
+// silently affect only the UNSELECTED points (since selected ones already had a frozen
+// snapshot) -- exactly backwards from what a user expects when they select something and
+// then change a setting. Transient UI state, not undo-tracked (like `tool`/`activeArmIndex`)
+// and not per-arm -- cleared whenever the active point set changes meaning (arm/independent
+// switch, or steps/seed/distribution/countMode edits, same triggers that already clear
+// orientationOverrides).
+let orientationSelectedIndices = [];
+let sampleOrigins = []; // recomputed each renderAll: per final samplePointsCanonical index,
+                          // {kind:"base",baseIndex} | {kind:"extra",extraIndex} -- lets the
+                          // add/remove tool know what a clicked point actually is.
+
+// activeDrag describes whatever's being dragged across a mousedown/mousemove/mouseup gesture,
+// for BOTH canvases uniformly: {kind: "corner"|"edge"|"extreme"|"shape"|"sample", index?, handle?}.
+// "shape" covers both the fitted circle and any cut -- circleHandles()/getCutHandles() already
+// return the identical {point, onDrag} shape, so one drag path handles both without caring
+// which it is.
+let activeDrag = null;
+// Cut-drawing and extreme-point-marking ("rectangle"/"circle"/"polygon"/"extreme" tools) work
+// identically starting from EITHER canvas -- cutAnchor/cutPreview/polyDraft are already
+// canonical, so the camera view forward-maps them through the homography to draw/hit-test,
+// while the orthographic view uses them directly with no conversion at all. A single drag
+// gesture (mousedown..mouseup) stays on whichever canvas it started on, same as any native
+// browser drag.
 let cutAnchor = null, cutPreview = null, cutDragging = false; // rectangle/circle cut creation (canonical)
 let polyDraft = []; // in-progress cut polygon vertices (canonical)
-let lastMousePos = null; // raw pixel mouse pos, for the polygon-draft rubber-band line
-let editDragTarget = null; // a handle {onDrag(canonicalPoint)} from getCutHandles(), while dragging a cut
+let polyHoverCanonical = null; // current pointer pos in canonical space, for the polygon-draft rubber-band line
+
+// Copies the live globals into arms[activeArmIndex] (always, for extremePointsCamera/
+// fittedCircle) and into whichever settings target is currently live for steps/seed/
+// distribution/borderWidth/sampleOverrides -- arms[activeArmIndex] itself when `independent`,
+// or the single shared `combinedSettings` otherwise. Called before anything reads `arms`/
+// `combinedSettings` directly (switching away, snapshotting for undo, rendering/exporting),
+// so neither is ever more than one editing gesture stale. Cheap reference copies, not deep
+// clones -- in-place mutations (e.g. dragging fittedCircle.center) stay visible through
+// arms[activeArmIndex] automatically between syncs, since both names point at the same
+// object until the next loadActiveArmIntoGlobals() swaps the globals to a different target.
+// With exactly 1 arm, "Independent" must be a no-op (a union of 1 circle IS that circle) --
+// but `arm` and `combinedSettings` are still two separate objects, so without this they'd
+// silently drift apart (whichever wasn't the live target kept stale/default values), making
+// toggling "Independent" appear to change the config for no reason.
+const SETTINGS_FIELDS = [
+  "sampleOverrides", "orientationOverrides", "extraSamplePoints", "removedSampleIndices",
+  "steps", "seed", "distribution", "borderWidth",
+  "countMode", "orientationEnabled", "orientationCount", "orientationMethod",
+  "orientationAngleStart", "orientationAngleEnd", "orientationSeed", "orientationArrowLength",
+  "orientationInitialAngle",
+];
+
+// The single source of truth for "what do the 8 orientation fields currently show" --
+// shared by the default-settings write path, the per-point override write path, and (in
+// the other direction) populateOrientationInputsFrom's caller.
+function captureOrientationInputsAsConfig() {
+  return {
+    orientationEnabled: orientationToggle.checked,
+    orientationCount: Math.max(1, parseInt(orientationCountInput.value) || 1),
+    orientationMethod: orientationMethodSelect.value,
+    orientationAngleStart: parseFloat(orientationAngleStartInput.value) || 0,
+    orientationAngleEnd: parseFloat(orientationAngleEndInput.value) || 0,
+    orientationSeed: parseInt(orientationSeedInput.value) || 0,
+    orientationArrowLength: Math.max(0.01, parseFloat(orientationArrowLengthInput.value) || 40),
+    orientationInitialAngle: parseFloat(orientationInitialAngleInput.value) || 0,
+  };
+}
+
+function populateOrientationInputsFrom(cfg) {
+  orientationToggle.checked = !!cfg.orientationEnabled;
+  orientationCountInput.value = String(cfg.orientationCount || 1);
+  orientationMethodSelect.value = cfg.orientationMethod || "uniform";
+  orientationAngleStartInput.value = String(cfg.orientationAngleStart || 0);
+  orientationAngleEndInput.value = String(cfg.orientationAngleEnd === undefined ? 360 : cfg.orientationAngleEnd);
+  orientationSeedInput.value = String(cfg.orientationSeed || 0);
+  orientationArrowLengthInput.value = String(cfg.orientationArrowLength || 40);
+  orientationInitialAngleInput.value = String(cfg.orientationInitialAngle || 0);
+}
+
+function currentDefaultOrientationSettings() {
+  return independent ? arms[activeArmIndex] : combinedSettings;
+}
+
+function syncActiveArmFromGlobals() {
+  const arm = arms[activeArmIndex];
+  arm.extremePointsCamera = extremePointsCamera;
+  arm.fittedCircle = fittedCircle;
+  const settings = independent ? arm : combinedSettings;
+  settings.sampleOverrides = sampleOverrides;
+  settings.orientationOverrides = orientationOverrides;
+  settings.extraSamplePoints = extraSamplePoints;
+  settings.removedSampleIndices = removedSampleIndices;
+  settings.steps = Math.max(1, parseInt(stepsInput.value) || 1);
+  settings.seed = parseInt(seedInput.value) || 0;
+  settings.distribution = distributionSelect.value;
+  settings.borderWidth = Math.max(0, parseFloat(borderWidthInput.value) || 0);
+  settings.countMode = countModeSelect.value;
+  // The orientation panel is a selection-bound inspector: with points selected (box-select
+  // tool), these fields edit ONLY those points' own override snapshot; the shared default
+  // is left untouched so unselected points can't be affected by mistake (see
+  // orientationSelectedIndices' own comment for the bug this replaced). With no selection,
+  // they edit the default exactly as before.
+  if (orientationSelectedIndices.length > 0) {
+    const cfg = captureOrientationInputsAsConfig();
+    orientationSelectedIndices.forEach(function (idx) { orientationOverrides[idx] = cfg; });
+  } else {
+    Object.assign(settings, captureOrientationInputsAsConfig());
+  }
+  if (arms.length === 1) {
+    const other = settings === arm ? combinedSettings : arm;
+    SETTINGS_FIELDS.forEach(function (f) { other[f] = settings[f]; });
+  }
+}
+
+// The inverse: loads arms[activeArmIndex]'s circle, plus whichever settings target is now
+// live, back into the live globals AND the pattern-preview form fields, so every existing
+// tool/handler that reads those globals/fields transparently operates on the right thing.
+function loadActiveArmIntoGlobals() {
+  const arm = arms[activeArmIndex];
+  extremePointsCamera = arm.extremePointsCamera;
+  fittedCircle = arm.fittedCircle;
+  const settings = independent ? arm : combinedSettings;
+  sampleOverrides = settings.sampleOverrides;
+  orientationOverrides = settings.orientationOverrides || {};
+  extraSamplePoints = settings.extraSamplePoints || [];
+  removedSampleIndices = settings.removedSampleIndices || [];
+  orientationSelectedIndices = []; // the active point set is changing entirely; a stale
+                                     // selection's indices would no longer mean anything
+  stepsInput.value = String(settings.steps);
+  seedInput.value = String(settings.seed);
+  distributionSelect.value = settings.distribution;
+  borderWidthInput.value = String(settings.borderWidth);
+  countModeSelect.value = settings.countMode || "fixed";
+  populateOrientationInputsFrom(settings);
+  fitCircleBtn.disabled = extremePointsCamera.length < 3 || circleLocked;
+  armNameInput.value = arm.name;
+  armColorInput.value = arm.color;
+  patternPreviewLabel.textContent = "Pattern" + (arms.length > 1 ? " (" + (independent ? "active arm" : "combined") + ")" : "");
+  orientationPreviewLabel.textContent = "Rotation" + (arms.length > 1 ? " (" + (independent ? "active arm" : "combined") + ")" : "");
+}
+
+function setIndependent(value) {
+  independentUserPreference = value; // only ever reached via the checkbox, i.e. arms.length > 1
+  if (value === independent) return;
+  syncActiveArmFromGlobals(); // write back using the OLD `independent`
+  independent = value;
+  loadActiveArmIntoGlobals(); // read forward using the NEW `independent`
+  renderAll();
+}
+
+function renderArmChips() {
+  armChips.innerHTML = "";
+  arms.forEach(function (arm, i) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "arm-chip" + (i === activeArmIndex ? " active" : "");
+    chip.title = "Switch to " + arm.name;
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    dot.style.background = arm.color;
+    chip.appendChild(dot);
+    chip.appendChild(document.createTextNode(arm.name));
+    if (i === activeArmIndex) { chip.style.borderColor = arm.color; chip.style.color = arm.color; }
+    chip.addEventListener("click", function () { switchArm(i); });
+    armChips.appendChild(chip);
+  });
+  removeArmBtn.disabled = arms.length <= 1;
+}
+
+function switchArm(newIndex) {
+  if (newIndex === activeArmIndex) return;
+  syncActiveArmFromGlobals();
+  activeArmIndex = newIndex;
+  loadActiveArmIntoGlobals();
+  // Not undo-tracked -- this only changes WHICH arm subsequent edits apply to, not any
+  // geometry itself (syncActiveArmFromGlobals() above already preserved whatever was live).
+  resetCutDraftState();
+  activeDrag = null;
+  renderArmChips();
+  renderAll();
+}
+
+function addArm() {
+  recordUndo();
+  const color = ARM_PALETTE[arms.length % ARM_PALETTE.length];
+  arms.push(makeArm("Arm " + (arms.length + 1), color));
+  switchArm(arms.length - 1);
+}
+
+function removeArm() {
+  if (arms.length <= 1) return; // always keep at least one arm
+  recordUndo();
+  arms.splice(activeArmIndex, 1);
+  activeArmIndex = Math.min(activeArmIndex, arms.length - 1);
+  loadActiveArmIntoGlobals();
+  resetCutDraftState();
+  activeDrag = null;
+  renderArmChips();
+  renderAll();
+}
+
+addArmBtn.addEventListener("click", addArm);
+removeArmBtn.addEventListener("click", removeArm);
+armNameInput.addEventListener("input", function () {
+  arms[activeArmIndex].name = armNameInput.value || arms[activeArmIndex].name;
+  renderArmChips();
+  renderAll();
+});
+armColorInput.addEventListener("input", function () {
+  arms[activeArmIndex].color = armColorInput.value;
+  renderArmChips();
+  renderAll();
+});
+independentToggle.addEventListener("change", function () { setIndependent(independentToggle.checked); });
+
+// ── Undo/redo ───────────────────────────────────────────────────────────────
+// Scoped to GEOMETRY only (cameraCorners, cutShapesCanonical, and every arm's own
+// extremePointsCamera/fittedCircle/sampleOverrides, plus the arms list itself -- add/remove/
+// reorder) -- not to form fields like steps/seed/distribution/border width, an arm's name/
+// color, cornersLocked, the active tool, or which arm is active, all of which are plain UI
+// state an operator can already "undo" just by re-entering the old value or switching back.
+// One snapshot is pushed right before each discrete mutation (a drag's first mousedown, or a
+// button click that changes geometry), so an entire drag gesture undoes as a single step
+// rather than one step per mousemove.
+let undoStack = [], redoStack = [];
+const UNDO_LIMIT = 50;
+
+function snapshotState() {
+  syncActiveArmFromGlobals(); // arms[activeArmIndex]/combinedSettings must be fresh first
+  return JSON.parse(JSON.stringify({
+    cameraCorners: cameraCorners,
+    cutShapesCanonical: cutShapesCanonical,
+    arms: arms,
+    activeArmIndex: activeArmIndex,
+    combinedSettings: combinedSettings,
+  }));
+}
+
+function restoreState(s) {
+  cameraCorners = s.cameraCorners;
+  cutShapesCanonical = s.cutShapesCanonical;
+  arms = s.arms;
+  activeArmIndex = s.activeArmIndex;
+  combinedSettings = s.combinedSettings;
+  loadActiveArmIntoGlobals();
+  renderArmChips();
+}
+
+function updateUndoRedoUI() {
+  undoBtn.disabled = undoStack.length === 0;
+  redoBtn.disabled = redoStack.length === 0;
+}
+
+function recordUndo() {
+  undoStack.push(snapshotState());
+  if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+  redoStack = [];
+  updateUndoRedoUI();
+}
+
+function undo() {
+  if (undoStack.length === 0) return;
+  redoStack.push(snapshotState());
+  restoreState(undoStack.pop());
+  activeDrag = null;
+  resetCutDraftState();
+  updateUndoRedoUI();
+  renderAll();
+}
+
+function redo() {
+  if (redoStack.length === 0) return;
+  undoStack.push(snapshotState());
+  restoreState(redoStack.pop());
+  activeDrag = null;
+  resetCutDraftState();
+  updateUndoRedoUI();
+  renderAll();
+}
+
+undoBtn.addEventListener("click", undo);
+redoBtn.addEventListener("click", redo);
 
 function activeInteraction() {
   return tool;
@@ -493,6 +1009,24 @@ function pointToSegmentDistance(point, a, b) {
   return Math.hypot(px - projX, py - projY);
 }
 
+function quadCentroid(corners) {
+  return [corners.reduce(function (s, c) { return s + c[0]; }, 0) / corners.length,
+    corners.reduce(function (s, c) { return s + c[1]; }, 0) / corners.length];
+}
+
+function scaleHandlePosition(corners) {
+  // Offset toward corner index 1 ("top right" in the default, unedited ordering) but inset
+  // 40% of the way back toward the centroid -- stays inside the quad (so it never goes out
+  // of bounds) without sitting on top of that corner's own drag handle. Placing it exactly AT
+  // the centroid (the original design) made scaling DOWN impossible: distance-from-centroid
+  // can never go below zero, so a scale anchored to that distance could only ever grow
+  // (reported directly: "i cant scale it down since the point is in the centre, only up").
+  // Offset from a real, non-zero rest distance instead, so dragging toward the centroid
+  // shrinks and dragging away grows.
+  const centroid = quadCentroid(corners);
+  return [centroid[0] + 0.6 * (corners[1][0] - centroid[0]), centroid[1] + 0.6 * (corners[1][1] - centroid[1])];
+}
+
 function pointNearPolygon(point, vertices, borderWidth) {
   // True if inside, or within borderWidth of any edge -- the polygon "buffered" outward.
   if (pointInPolygon(point, vertices)) return true;
@@ -508,7 +1042,36 @@ function cutShapeVertices(shape) {
   return shape.type === "rectangle" ? shape.corners : shape.type === "polygon" ? shape.vertices : null;
 }
 
+// A cut dragged into (near-)zero area -- a misclick, e.g. a rectangle/circle drag that never
+// really moved -- has no real interior, so point-in-polygon/point-in-circle can never match
+// it; it could then never be selected (and therefore never deleted) by clicking its body
+// (reported directly: "if i accidentally made a cut so small that it looks like a
+// point...I cannot delete it"). Falls back to a generous click radius around its centroid
+// whenever its own bounding box is smaller than that radius.
+function cutShapeIsDegenerate(shape) {
+  const vertices = shape.type === "circle"
+    ? [[shape.center[0] - shape.radius, shape.center[1]], [shape.center[0] + shape.radius, shape.center[1]]]
+    : cutShapeVertices(shape);
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  vertices.forEach(function (v) {
+    minX = Math.min(minX, v[0]); maxX = Math.max(maxX, v[0]);
+    minY = Math.min(minY, v[1]); maxY = Math.max(maxY, v[1]);
+  });
+  return Math.max(maxX - minX, maxY - minY) < 6;
+}
+
+function cutShapeCentroid(shape) {
+  if (shape.type === "circle") return shape.center;
+  const vertices = cutShapeVertices(shape);
+  const sum = vertices.reduce(function (acc, v) { return [acc[0] + v[0], acc[1] + v[1]]; }, [0, 0]);
+  return [sum[0] / vertices.length, sum[1] / vertices.length];
+}
+
 function pointInCutShape(point, shape) {
+  if (cutShapeIsDegenerate(shape)) {
+    const c = cutShapeCentroid(shape);
+    return Math.hypot(point[0] - c[0], point[1] - c[1]) < 10;
+  }
   if (shape.type === "circle") {
     return Math.hypot(point[0] - shape.center[0], point[1] - shape.center[1]) <= shape.radius;
   }
@@ -568,6 +1131,160 @@ function pixelHandlesForShape(shape, H) {
 
 function toCanonical(pixelPoint) { return applyHomography(inverseHomography, pixelPoint); }
 function toPixel(canonicalPoint) { return applyHomography(homography, canonicalPoint); }
+
+// ── Hit-testing -- shared by both canvases ───────────────────────────────────────────────
+// Cuts only -- the circle/corners/reach points are only ever reachable through Workspace
+// setup's "corners" tool, never from here.
+function getAllCutHandles() {
+  let handles = [];
+  cutShapesCanonical.forEach(function (shape) {
+    // A degenerate (near-zero-area) shape's handles all sit virtually on top of each other,
+    // so a handle hit-test always wins over the body-click-select test below (it's checked
+    // first) -- the shape could be dragged but never selected/deleted. Skipping handles for
+    // a degenerate shape lets the click fall through to body-select instead, which (via
+    // pointInCutShape's own degenerate fallback) can actually select it.
+    if (cutShapeIsDegenerate(shape)) return;
+    handles = handles.concat(getCutHandles(shape));
+  });
+  return handles;
+}
+
+// Part of the "select" tool: drag a cut's handle to reshape it, or click its body (no handle
+// nearby) to SELECT it for Delete/Backspace -- selection is done by the caller (mousedown
+// handler) using pointInCutShape, since "select a shape" isn't a draggable handle.
+function findCameraEditTarget(p) {
+  if (!homography) return null;
+  let bestHandle = null, bestDist = 15;
+  getAllCutHandles().forEach(function (h) {
+    const hp = toPixel(h.point);
+    const d = Math.hypot(hp[0] - p[0], hp[1] - p[1]);
+    if (d < bestDist) { bestDist = d; bestHandle = h; }
+  });
+  return bestHandle ? { kind: "shape", handle: bestHandle } : null;
+}
+
+function findOrthoEditTarget(cp) {
+  const threshold = 10 / orthoScale;
+  let bestHandle = null, bestDist = threshold;
+  getAllCutHandles().forEach(function (h) {
+    const d = Math.hypot(h.point[0] - cp[0], h.point[1] - cp[1]);
+    if (d < bestDist) { bestDist = d; bestHandle = h; }
+  });
+  return bestHandle ? { kind: "shape", handle: bestHandle } : null;
+}
+
+// Workspace setup's "corners" tool: corners, edge midpoints (dragging one translates both its
+// corners together, so a whole side slides/scales rather than only ever pulling one vertex --
+// requested explicitly), the active arm's fitted reach circle, and reach points -- everything
+// involved in calibrating the workspace, and ONLY reachable through this tool. Corners/edges
+// are camera-only (the orthographic rectangle's corners aren't independently draggable, fixed
+// at [0,0]..canonicalSize by construction); circle/reach-points work on both views, so there's
+// a separate ortho variant below without the corner/edge cases.
+function findCameraCornersTarget(p) {
+  if (!cornersLocked) {
+    let bestIdx = -1, bestDist = 20;
+    cameraCorners.forEach(function (c, i) {
+      const d = Math.hypot(c[0] - p[0], c[1] - p[1]);
+      if (d < bestDist) { bestDist = d; bestIdx = i; }
+    });
+    if (bestIdx >= 0) return { kind: "corner", index: bestIdx };
+    // Hit-test the whole segment, not just its midpoint -- a midpoint-only test made long
+    // edges (typically top/bottom, in a landscape frame) practically ungrabbable anywhere
+    // except their exact center, while short edges (typically left/right) were grabbable
+    // almost anywhere, reading as "only side edges can scale" (reported directly).
+    let bestEdge = -1;
+    bestDist = 15;
+    for (let i = 0; i < 4; i++) {
+      const a = cameraCorners[i], b = cameraCorners[(i + 1) % 4];
+      const d = pointToSegmentDistance(p, a, b);
+      if (d < bestDist) { bestDist = d; bestEdge = i; }
+    }
+    if (bestEdge >= 0) {
+      // Locked in at hit-test time, not recomputed every mousemove: an edge that runs mostly
+      // vertically is a left/right SIDE, so dragging it should only change x (width), never
+      // drift the side up/down; an edge that runs mostly horizontally is a top/bottom edge,
+      // so dragging it should only change y (height) -- reported directly ("when i drag the
+      // side edges they shouldnt move on the y axis same as top and bottom shouldnt move on
+      // x"). Deciding once at grab-time (rather than re-deciding from the live, already-
+      // constrained corners on every move) avoids the classification flapping near 45 degrees.
+      const a = cameraCorners[bestEdge], b = cameraCorners[(bestEdge + 1) % 4];
+      const isVertical = Math.abs(a[1] - b[1]) > Math.abs(a[0] - b[0]);
+      return { kind: "edge", index: bestEdge, isVertical: isVertical };
+    }
+  }
+  if (homography && fittedCircle && !circleLocked) {
+    let bestHandle = null, bestDist = 15;
+    circleHandles(fittedCircle).forEach(function (h) {
+      const hp = toPixel(h.point);
+      const d = Math.hypot(hp[0] - p[0], hp[1] - p[1]);
+      if (d < bestDist) { bestDist = d; bestHandle = h; }
+    });
+    // Checked before the centroid scale-handle below: a circle centered in the workspace (a
+    // common case) puts its own center handle exactly on the quad's centroid too, and editing
+    // THAT specific circle is the more useful action to win the click.
+    if (bestHandle) return { kind: "shape", handle: bestHandle };
+  }
+  if (!cornersLocked) {
+    // A handle OFFSET from the quad's centroid (see scaleHandlePosition) scales all 4
+    // corners together, uniformly, about the centroid -- "just grab the middle and scale it
+    // up" (requested directly), as opposed to dragging one corner/edge at a time. Anchored to
+    // the handle's own fixed rest distance from the centroid (`restDist`), not to wherever it
+    // was actually clicked, so the gesture starts at exactly scale=1 regardless of where
+    // within the hit radius the grab landed. Capturing fresh `corners`/`centroid`/`baseDist`
+    // here (the CURRENT, already-edited geometry, not some original) is what makes repeated
+    // scale gestures accumulate instead of resetting -- "keep the state memorized."
+    const centroid = quadCentroid(cameraCorners);
+    const handlePos = scaleHandlePosition(cameraCorners);
+    if (Math.hypot(handlePos[0] - p[0], handlePos[1] - p[1]) < 20) {
+      return { kind: "scaleAll", corners: cameraCorners.map(function (c) { return c.slice(); }), centroid: centroid,
+        restDist: Math.hypot(handlePos[0] - centroid[0], handlePos[1] - centroid[1]),
+        baseDist: cameraCorners.reduce(function (s, c) { return s + Math.hypot(c[0] - centroid[0], c[1] - centroid[1]); }, 0) / 4 };
+    }
+  }
+  let bestIdx = -1, bestDist = 15;
+  extremePointsCamera.forEach(function (pt, i) {
+    const d = Math.hypot(pt[0] - p[0], pt[1] - p[1]);
+    if (d < bestDist) { bestDist = d; bestIdx = i; }
+  });
+  return bestIdx >= 0 ? { kind: "extreme", index: bestIdx } : null;
+}
+
+function findOrthoCornersTarget(cp) {
+  const threshold = 10 / orthoScale;
+  if (fittedCircle && !circleLocked) {
+    let bestHandle = null, bestDist = threshold;
+    circleHandles(fittedCircle).forEach(function (h) {
+      const d = Math.hypot(h.point[0] - cp[0], h.point[1] - cp[1]);
+      if (d < bestDist) { bestDist = d; bestHandle = h; }
+    });
+    if (bestHandle) return { kind: "shape", handle: bestHandle };
+  }
+  let bestIdx = -1, bestDist2 = threshold;
+  extremePointsCanonical.forEach(function (pt, i) {
+    const d = Math.hypot(pt[0] - cp[0], pt[1] - cp[1]);
+    if (d < bestDist2) { bestDist2 = d; bestIdx = i; }
+  });
+  return bestIdx >= 0 ? { kind: "extreme", index: bestIdx } : null;
+}
+
+function findCameraSampleTarget(p) {
+  let bestIdx = -1, bestDist = 10;
+  samplePointsCamera.forEach(function (pt, i) {
+    const d = Math.hypot(pt[0] - p[0], pt[1] - p[1]);
+    if (d < bestDist) { bestDist = d; bestIdx = i; }
+  });
+  return bestIdx >= 0 ? { kind: "sample", index: bestIdx } : null;
+}
+
+function findOrthoSampleTarget(cp) {
+  const threshold = 10 / orthoScale;
+  let bestIdx = -1, bestDist = threshold;
+  samplePointsCanonical.forEach(function (pt, i) {
+    const d = Math.hypot(pt[0] - cp[0], pt[1] - cp[1]);
+    if (d < bestDist) { bestDist = d; bestIdx = i; }
+  });
+  return bestIdx >= 0 ? { kind: "sample", index: bestIdx } : null;
+}
 
 // isValidCandidate operates entirely in canonical space -- this mirrors pattern.py's
 // generate_sector_points: border_width applies uniformly to the circle, the workspace
@@ -926,6 +1643,11 @@ function refineRadialLocalSeparation(placed, cx, cy, borderWidth, expectedSpacin
       let bestTheta = null, bestScore = bestD;
       for (const theta of candidateThetasInIntervals(avail, numCandidates)) {
         const cx2 = cx + r * Math.cos(theta * Math.PI / 180), cy2 = cy + r * Math.sin(theta * Math.PI / 180);
+        // `avail` buffers a cut by pushing its vertices outward from the centroid -- an
+        // approximation, not a true offset -- so re-check the EXACT validity here too,
+        // the same fix as pattern.py's: a real, reported bug let this pick a candidate
+        // that still violated border_width near an off-center cut.
+        if (!isValidCandidate([cx2, cy2])) continue;
         const score = Math.min(...placed.filter((_, j) => j !== i).map((q) => Math.hypot(cx2 - q[0], cy2 - q[1])));
         if (score > bestScore) { bestScore = score; bestTheta = theta; }
       }
@@ -974,6 +1696,75 @@ function invertRadialCdf(cdf, targetFraction) {
     }
   }
   return radii[radii.length - 1];
+}
+
+function variableGridPoints(density) {
+  const cx = fittedCircle.center[0], cy = fittedCircle.center[1];
+  let xMin = cx - fittedCircle.radius, xMax = cx + fittedCircle.radius;
+  let yMin = cy - fittedCircle.radius, yMax = cy + fittedCircle.radius;
+  if (canonicalSize) {
+    xMin = Math.max(xMin, 0); xMax = Math.min(xMax, canonicalSize[0]);
+    yMin = Math.max(yMin, 0); yMax = Math.min(yMax, canonicalSize[1]);
+  }
+  const aspect = (xMax - xMin) / (yMax - yMin);
+  const cols = Math.max(1, Math.round(Math.sqrt(density * aspect)));
+  const rows = Math.max(1, Math.round(density / cols));
+  const stepX = (xMax - xMin) / cols, stepY = (yMax - yMin) / rows;
+  const points = [];
+  for (let i = 0; i < cols; i++) {
+    for (let j = 0; j < rows; j++) {
+      const p = [xMin + (i + 0.5) * stepX, yMin + (j + 0.5) * stepY];
+      if (isValidCandidate(p)) points.push(p);
+    }
+  }
+  return points;
+}
+
+function variableRadialPoints(density, seed) {
+  const cx = fittedCircle.center[0], cy = fittedCircle.center[1];
+  const rng = mulberry32(seed || 0);
+  const angleOffset = rng() * 360;
+  const points = [];
+  for (let i = 0; i < density; i++) {
+    const t = (i + 0.5) / density;
+    const r = Math.sqrt(t) * fittedCircle.radius;
+    const theta = (angleOffset + i * GOLDEN_ANGLE_DEG) * Math.PI / 180;
+    const p = [cx + r * Math.cos(theta), cy + r * Math.sin(theta)];
+    if (isValidCandidate(p)) points.push(p);
+  }
+  return points;
+}
+
+// Mirrors pattern.py's _search_variable_density: `count` is the TARGET final count, not a
+// fixed resolution -- re-tries at higher/lower density until the survivor count is as close
+// to `count` as achievable (a single-shot resolution can land far short whenever a lot of the
+// candidate grid/spiral falls outside the valid area).
+function searchVariableDensity(makePoints, targetCount) {
+  let density = targetCount;
+  let best = null;
+  for (let iter = 0; iter < 8; iter++) {
+    const pts = makePoints(Math.max(1, density));
+    if (best === null || Math.abs(pts.length - targetCount) < Math.abs(best.length - targetCount)) best = pts;
+    if (pts.length >= targetCount) break;
+    density = pts.length === 0 ? density * 2 : Math.max(density + 1, Math.round(density * targetCount / pts.length));
+  }
+  return best || [];
+}
+
+function sampleSectorPointsVariable(count, seed, distribution) {
+  // Mirrors pattern.py's count_mode="variable": generate IDEAL grid/radial positions and
+  // drop whichever aren't valid, instead of relocating to force an exact final count.
+  if (!fittedCircle) return [];
+  let points;
+  if (distribution === "grid") {
+    points = searchVariableDensity(variableGridPoints, count);
+  } else if (distribution === "radial") {
+    points = searchVariableDensity(function (d) { return variableRadialPoints(d, seed); }, count);
+  } else {
+    throw new Error("count_mode='variable' only supports distribution 'grid' or 'radial'");
+  }
+  if (points.length === 0) throw new Error("count_mode='variable' produced zero valid points");
+  return points;
 }
 
 function sampleSectorPoints(count, seed, distribution) {
@@ -1130,11 +1921,288 @@ function sampleSectorPoints(count, seed, distribution) {
   return placed;
 }
 
+function sampleUnionPoints(circles, count, seed, distribution, countMode) {
+  // Mirrors pattern.py's generate_union_points -- "combined" (Independent: off) sampling
+  // across the UNION of every arm's own fitted circle, so an overlap between two arms'
+  // circles doesn't get sampled at roughly double the density of the non-overlapping parts.
+  // `circles`: [{center:[cx,cy], radius:r}, ...] in CANONICAL space. Always returns
+  // CANONICAL-space points, same as sampleSectorPoints.
+  const borderWidth = Math.max(0, parseFloat(borderWidthInput.value) || 0);
+  const effectiveCircles = circles
+    .map(function (c) { return { cx: c.center[0], cy: c.center[1], r: c.radius - borderWidth }; })
+    .filter(function (c) { return c.r > 0; });
+  if (effectiveCircles.length === 0) {
+    throw new Error("border width leaves no circle with positive effective radius");
+  }
+  if (distribution === "radial") {
+    throw new Error(
+      "distribution 'radial' is not yet supported for combined (union) sampling -- the " +
+      "Fermat/Vogel spiral is inherently single-center; use 'grid' or 'random' for now"
+    );
+  }
+
+  function isValidUnion(candidate) {
+    const px = candidate[0], py = candidate[1];
+    const insideAny = effectiveCircles.some(function (c) {
+      return (px - c.cx) * (px - c.cx) + (py - c.cy) * (py - c.cy) <= c.r * c.r;
+    });
+    if (!insideAny) return false;
+    if (canonicalSize) {
+      if (px < borderWidth || px > canonicalSize[0] - borderWidth) return false;
+      if (py < borderWidth || py > canonicalSize[1] - borderWidth) return false;
+    }
+    for (let i = 0; i < cutPolygonsCanonical.length; i++) {
+      if (pointNearPolygon(candidate, cutPolygonsCanonical[i], borderWidth)) return false;
+    }
+    return true;
+  }
+
+  let xMin = Math.min.apply(null, effectiveCircles.map(function (c) { return c.cx - c.r; }));
+  let xMax = Math.max.apply(null, effectiveCircles.map(function (c) { return c.cx + c.r; }));
+  let yMin = Math.min.apply(null, effectiveCircles.map(function (c) { return c.cy - c.r; }));
+  let yMax = Math.max.apply(null, effectiveCircles.map(function (c) { return c.cy + c.r; }));
+  if (canonicalSize) {
+    xMin = Math.max(xMin, borderWidth); xMax = Math.min(xMax, canonicalSize[0] - borderWidth);
+    yMin = Math.max(yMin, borderWidth); yMax = Math.min(yMax, canonicalSize[1] - borderWidth);
+  }
+  if (xMax <= xMin || yMax <= yMin) {
+    throw new Error("Could not place " + count + " union point(s) -- bounds/border width leave no area");
+  }
+  // Based on total circle area (ignoring overlap -- fine as a search-scale estimate, not a
+  // correctness-critical value), NOT the bounding box's diagonal -- see pattern.py's
+  // generate_union_points for why a bbox-based estimate is the wrong proxy here (a smaller
+  // circle sharing a wide bbox with a bigger one gets an overestimated expected spacing,
+  // which made occupancyGuard's minSeparation too tight relative to that circle's true
+  // point-to-point spacing -- a real test failure, not a hypothetical).
+  const totalCircleArea = effectiveCircles.reduce(function (a, c) { return a + Math.PI * c.r * c.r; }, 0);
+  const expectedSpacing = totalCircleArea > 0 ? Math.sqrt(totalCircleArea / count) : 1;
+
+  if (countMode === "variable") {
+    if (distribution !== "grid") {
+      throw new Error("count_mode='variable' only supports distribution 'grid' for a union pattern");
+    }
+    const makeGrid = function (density) {
+      const aspect = (xMax - xMin) / (yMax - yMin);
+      const cols = Math.max(1, Math.round(Math.sqrt(density * aspect)));
+      const rows = Math.max(1, Math.round(density / cols));
+      const stepX = (xMax - xMin) / cols, stepY = (yMax - yMin) / rows;
+      const points = [];
+      for (let i = 0; i < cols; i++) {
+        for (let j = 0; j < rows; j++) {
+          const p = [xMin + (i + 0.5) * stepX, yMin + (j + 0.5) * stepY];
+          if (isValidUnion(p)) points.push(p);
+        }
+      }
+      return points;
+    };
+    const points = searchVariableDensity(makeGrid, count);
+    if (points.length === 0) throw new Error("count_mode='variable' produced zero valid points");
+    return points;
+  }
+
+  function nearestCircle(point) {
+    const px = point[0], py = point[1];
+    let best = effectiveCircles[0], bestScore = Math.hypot(px - best.cx, py - best.cy) - best.r;
+    for (let i = 1; i < effectiveCircles.length; i++) {
+      const c = effectiveCircles[i];
+      const score = Math.hypot(px - c.cx, py - c.cy) - c.r;
+      if (score < bestScore) { bestScore = score; best = c; }
+    }
+    return best;
+  }
+
+  if (distribution === "random") {
+    const rng = mulberry32(seed);
+    const points = [];
+    const maxAttempts = count * 200;
+    let attempts = 0;
+    while (points.length < count) {
+      attempts++;
+      if (attempts > maxAttempts) throw new Error("Could not sample " + count + " union point(s)");
+      const candidate = [xMin + rng() * (xMax - xMin), yMin + rng() * (yMax - yMin)];
+      if (!isValidUnion(candidate)) continue;
+      points.push(candidate);
+    }
+    return points;
+  }
+
+  // distribution === "grid"
+  const jitterRng = mulberry32(0);
+  const guard = occupancyGuard(isValidUnion, 0.5 * expectedSpacing);
+  const aspect = (xMax - xMin) / (yMax - yMin);
+  const cols = Math.max(1, Math.round(Math.sqrt(count * aspect)));
+  const stepX = (xMax - xMin) / cols;
+  const colRanges = [];
+  for (let i = 0; i < cols; i++) {
+    const x = xMin + (i + 0.5) * stepX;
+    const rawChords = [];
+    effectiveCircles.forEach(function (c) {
+      const dx = x - c.cx;
+      if (Math.abs(dx) > c.r) return;
+      const halfChord = Math.sqrt(c.r * c.r - dx * dx);
+      const lo = Math.max(c.cy - halfChord, yMin), hi = Math.min(c.cy + halfChord, yMax);
+      if (hi > lo) rawChords.push([lo, hi]);
+    });
+    const mergedChords = mergeIntervals(rawChords);
+    if (mergedChords.length === 0) continue;
+    if (cutPolygonsCanonical.length > 0) {
+      const excluded = excludedYIntervalsAtX(x, borderWidth);
+      mergedChords.forEach(function (chord) {
+        subtractIntervals(chord[0], chord[1], excluded).forEach(function (sub) {
+          if (sub[1] > sub[0]) colRanges.push([x, sub[0], sub[1]]);
+        });
+      });
+    } else {
+      mergedChords.forEach(function (chord) { colRanges.push([x, chord[0], chord[1]]); });
+    }
+  }
+  if (colRanges.length === 0) throw new Error("Could not place " + count + " union grid point(s)");
+  const shares = allocateShares(colRanges.map(function (c) { return c[2] - c[1]; }), count);
+  const ideal = [];
+  colRanges.forEach(function (col, idx) {
+    const share = shares[idx];
+    if (share <= 0) return;
+    const x = col[0], yLo = col[1], yHi = col[2];
+    const stepY = (yHi - yLo) / share;
+    for (let k = 0; k < share; k++) ideal.push([x, yLo + (k + 0.5) * stepY]);
+  });
+
+  return ideal.map(function (p, i) {
+    const nearest = nearestCircle(p);
+    const clamp = function (pt) { return clampToRegion(pt, nearest.cx, nearest.cy, nearest.r, canonicalSize, borderWidth); };
+    const point = relocateIfInvalid(p, guard.isValid, clamp, jitterRng, expectedSpacing, "union grid", i, nearest.cx, nearest.cy, nearest.r);
+    guard.markPlaced(point);
+    return point;
+  });
+}
+
+// Dispatches combined-mode sampling to whichever of sampleSectorPoints/sampleUnionPoints is
+// actually correct for the current circle count -- NOT just "call sampleUnionPoints whenever
+// independent is off." With exactly one circle (the common case: a single-arm session, which
+// defaults to combined mode), routing through sampleUnionPoints unconditionally was a real
+// bug, not just a missing feature: that function rejects distribution "radial" outright
+// regardless of circle count, so a brand-new single-arm session selecting "Radial" got a
+// preview error for no real reason -- the union machinery doesn't even apply when there's
+// nothing to union. Mirrors updateExportText's existing "exactly 1 circle -> shape: sector"
+// special case, so the live preview and the exported config always agree. Temporarily
+// repoints the module-level `fittedCircle` (which sampleSectorPoints/isValidCandidate read
+// directly) at the one circle being sampled, then restores it in a `finally` -- restoration
+// must happen even if sampleSectorPoints throws, since `fittedCircle` is relied on elsewhere
+// to mean "the ACTIVE arm's circle," not whichever circle happened to be the lone entry here
+// (the lone circle in a 1-circle union isn't necessarily the active arm's own -- e.g. the
+// active arm might still be uncalibrated while a different, inactive arm already has one).
+function sampleCombinedPoints(circles, count, seed, distribution, countMode) {
+  if (circles.length === 0) return [];
+  if (circles.length === 1) {
+    const savedFittedCircle = fittedCircle;
+    fittedCircle = circles[0];
+    try {
+      return countMode === "variable"
+        ? sampleSectorPointsVariable(count, seed, distribution)
+        : sampleSectorPoints(count, seed, distribution);
+    } finally {
+      fittedCircle = savedFittedCircle;
+    }
+  }
+  return sampleUnionPoints(circles, count, seed, distribution, countMode);
+}
+
+// Mirrors pattern.py's generate_rotation_angles exactly: `count` target angles, "uniform"
+// placed at the center of each of `count` equal sub-slices (NOT both inclusive endpoints --
+// that would duplicate the 0/360 wraparound point for the common full-rotation case),
+// "random" via `count` independent seeded draws.
+function generateRotationAngles(count, method, angleStart, angleEnd, seed, initialAngle) {
+  // angleStart/angleEnd are RELATIVE to initialAngle -- see pattern.py's docstring.
+  const start = (initialAngle || 0) + angleStart;
+  const end = (initialAngle || 0) + angleEnd;
+  const span = end - start;
+  if (method === "random") {
+    const rng = mulberry32(seed);
+    const angles = [];
+    for (let i = 0; i < count; i++) angles.push(start + rng() * span);
+    return angles;
+  }
+  if (count === 1) return [start];
+  const divisor = span % 360 === 0 ? count : count - 1;
+  const angles = [];
+  for (let i = 0; i < count; i++) angles.push(start + i * span / divisor);
+  return angles;
+}
+
+// Mirrors pattern.py's orientation_arrow_points -- but simpler here, since this tool already
+// keeps sample points in CANONICAL space directly (samplePointsCanonical), unlike the Python
+// overlay's session.py, which only has the final PIXEL-space point and has to recover
+// canonical coordinates via invert_homography first. Rotating in canonical space (not pixel
+// space) is what matters -- a homography doesn't preserve angles, so this is what makes the
+// arrow forward-mapped through it foreshorten/skew correctly to match how a real rotated
+// object would look under a tilted camera.
+function orientationTipCanonical(positionCanonical, angleDeg, length) {
+  const theta = angleDeg * Math.PI / 180;
+  return [positionCanonical[0] + length * Math.cos(theta), positionCanonical[1] + length * Math.sin(theta)];
+}
+
+// Keeps the "Radial" distribution option enabled/disabled in sync with whether it's actually
+// usable right now, and falls back to "grid" if a selection that just became invalid was
+// already active -- e.g. the operator had "Radial" selected with one arm, then added/fitted a
+// second arm while in combined mode. Independent mode always samples exactly one (the
+// active) circle at a time, so radial is always available there regardless of arm count.
+function updateDistributionAvailability() {
+  const combinedCircleCount = arms.filter(function (a) { return a.fittedCircle; }).length;
+  const radialUnavailable = !independent && combinedCircleCount > 1;
+  distributionRadialOption.disabled = radialUnavailable;
+  distributionRadialOption.title = radialUnavailable
+    ? "Not available when combining 2+ arms (Independent: off) -- use Grid or Random, or turn Independent on"
+    : "";
+  if (radialUnavailable && distributionSelect.value === "radial") {
+    distributionSelect.value = "grid";
+    sampleOverrides = {};
+  }
+}
+
+// "Variable" count mode (mirrors pattern.py's count_mode='variable' restriction): never
+// available for "random" (rejection sampling already only returns valid points, nothing to
+// "search density" for). "radial" is fine for a single circle (independent mode, or exactly
+// one combined circle) but updateDistributionAvailability() already disables "radial"
+// outright once 2+ circles are being combined (Independent: off) -- so by the time this
+// runs, "radial" + 2+ combined circles can't actually be selected, and "grid" + 2+ combined
+// circles IS supported (sampleUnionPoints accepts count_mode='variable' for distribution
+// 'grid'). That leaves "random" as the only real restriction left to enforce here.
+// With exactly 1 arm, "combined" and "independent" produce an identical pattern (a union of
+// 1 circle IS that circle -- SETTINGS_FIELDS already mirrors arm/combinedSettings whenever
+// arms.length === 1, so there's nothing to lose by forcing this) -- but they render
+// DIFFERENTLY: combined mode draws every sample dot in a neutral color since "no single arm
+// owns it," which looks wrong (and was reported directly) for the overwhelmingly common
+// single-arm case, where every point obviously does belong to that one arm. Forcing
+// `independent = true` whenever there's only one arm makes sample dots (including ones added
+// via the "+" tool, since color is computed uniformly for the whole set, not per-point --
+// see sampleColor below) always show in that arm's own color. The checkbox is disabled in
+// this case since toggling it cannot change anything.
+function updateIndependentAvailability() {
+  independent = arms.length === 1 ? true : independentUserPreference;
+  independentToggle.checked = independent;
+  independentToggle.disabled = arms.length === 1;
+}
+
+function updateCountModeAvailability() {
+  const variableUnavailable = distributionSelect.value === "random";
+  countModeVariableOption.disabled = variableUnavailable;
+  if (variableUnavailable && countModeSelect.value === "variable") {
+    countModeSelect.value = "fixed";
+    sampleOverrides = {};
+  }
+}
+
 // ── Derived state, recomputed every render ─────────────────────────────────
 let homography = null, inverseHomography = null, canonicalSize = null, extremePointsCanonical = [];
 let samplePointsCanonical = [], samplePointsCamera = [], cutPolygonsCanonical = [];
+let orientationTipsCanonical = [], orientationTipsCamera = [];
 let orthoScale = 1;
 let lastCanonicalSize = null; // for rescaleCanonicalShapes() -- see below
+// One entry per INACTIVE arm (null for the active one, which renders from the live globals
+// instead): { arm, extremePointsCanonical }. Full detail (sample-point preview, edit handles)
+// stays active-arm-only -- see renderCameraView/renderOrthoView -- so this only needs enough
+// to draw a light "here's roughly where this arm's circle/extreme points are" outline.
+let otherArmsRenderData = [];
 
 function rescaleCanonicalShapes(scaleX, scaleY) {
   // canonicalSize is RE-DERIVED from the corners' own pixel distances every render
@@ -1146,10 +2214,53 @@ function rescaleCanonicalShapes(scaleX, scaleY) {
   // anchored to the workspace the way the grid lines already do. Applied every render, so
   // it also tracks smoothly frame-by-frame during a live corner drag.
   const avgScale = Math.sqrt(scaleX * scaleY);
-  if (fittedCircle) {
-    fittedCircle.center = [fittedCircle.center[0] * scaleX, fittedCircle.center[1] * scaleY];
-    fittedCircle.radius *= avgScale;
+  // Every arm's reach circle needs this, not just the active one -- a corner edit affects the
+  // shared homography all arms are interpreted through, regardless of which is currently
+  // selected. The active arm's `fittedCircle` IS the live global (mutated directly here, same
+  // as before bimanual support); every other arm's is rescaled via its own stored copy in
+  // `arms[i]`. `fittedCircle` is purely per-arm (not a SETTINGS_FIELDS entry, never mirrored
+  // into `combinedSettings`), so there's no aliasing concern here the way there is below.
+  arms.forEach(function (arm, i) {
+    const circle = i === activeArmIndex ? fittedCircle : arm.fittedCircle;
+    if (circle) {
+      circle.center = [circle.center[0] * scaleX, circle.center[1] * scaleY];
+      circle.radius *= avgScale;
+    }
+  });
+  // sampleOverrides/extraSamplePoints are SETTINGS_FIELDS entries shared by name across
+  // combinedSettings and every arm's own settings -- but the ACTUAL array/object a given name
+  // points to can be the literal SAME reference as the live global: always when
+  // arms.length === 1 (syncActiveArmFromGlobals explicitly mirrors them together), or
+  // whenever the currently-live settings object (combinedSettings if `!independent`, else
+  // arms[activeArmIndex]) is one of them. A previous version iterated
+  // `[combinedSettings].concat(arms)` unconditionally, which scaled an aliased array/object
+  // once PER ALIAS -- e.g. with 1 arm, both `combinedSettings.extraSamplePoints` and
+  // `arms[0].extraSamplePoints` ARE the live `extraSamplePoints` array, so it got scaled
+  // twice, compounding to scale^2 ("when i scale the workspace the points do not scale
+  // proportionally," reported directly -- they were actually scaling by scale^2, not failing
+  // to scale at all). Deduplicating by reference identity fixes every arrangement (1 arm, 2+
+  // arms independent, 2+ arms combined) uniformly, with no need to reason case-by-case about
+  // which objects currently alias which.
+  const seenArrays = [], seenOverrideObjects = [];
+  function rescaleArrayOnce(arr) {
+    if (!arr || seenArrays.indexOf(arr) !== -1) return;
+    seenArrays.push(arr);
+    for (let i = 0; i < arr.length; i++) arr[i] = [arr[i][0] * scaleX, arr[i][1] * scaleY];
   }
+  function rescaleOverridesOnce(obj) {
+    if (!obj || seenOverrideObjects.indexOf(obj) !== -1) return;
+    seenOverrideObjects.push(obj);
+    Object.keys(obj).forEach(function (key) {
+      const p = obj[key];
+      obj[key] = [p[0] * scaleX, p[1] * scaleY];
+    });
+  }
+  rescaleArrayOnce(extraSamplePoints);
+  rescaleOverridesOnce(sampleOverrides);
+  [combinedSettings].concat(arms).forEach(function (s) {
+    rescaleArrayOnce(s.extraSamplePoints);
+    rescaleOverridesOnce(s.sampleOverrides);
+  });
   cutShapesCanonical.forEach(function (shape) {
     if (shape.type === "circle") {
       shape.center = [shape.center[0] * scaleX, shape.center[1] * scaleY];
@@ -1162,6 +2273,10 @@ function rescaleCanonicalShapes(scaleX, scaleY) {
 }
 
 function renderAll() {
+  updateIndependentAvailability(); // before syncActiveArmFromGlobals -- see its own comment
+  syncActiveArmFromGlobals(); // keep arms[activeArmIndex] fresh for export/other-arm rendering
+  orientationDetailFields.style.display = orientationToggle.checked ? "" : "none";
+  armColorLegend.style.display = arms.length > 1 ? "" : "none";
   homography = (cameraCorners.length === 4) ? computeHomography(cameraCorners) : null;
   inverseHomography = homography ? invertMatrix3(homography) : null;
   canonicalSize = homography ? canonicalRectDims(cameraCorners) : null;
@@ -1174,19 +2289,102 @@ function renderAll() {
     ? extremePointsCamera.map(function (p) { return toCanonical(p); })
     : [];
   cutPolygonsCanonical = cutShapesCanonical.map(cutShapeBoundary);
+  // Self-healing, every render, exactly like the generator's own "base" points already are --
+  // previously this only ran from a handful of specific call sites (a cut being created, a
+  // cut/circle handle drag ending, a sample drag ending), and a real report ("add points
+  // manually AND THEN add the cuts, the cuts dont affect them") suggests at least one real
+  // path was still missed. Running it unconditionally here removes the whole "did I hook
+  // every mutation path" category of bug -- ANY change that leads to a render also revalidates
+  // extraSamplePoints/sampleOverrides against the now-current cuts/circle/bounds.
+  revalidateManualPoints();
+  otherArmsRenderData = arms.map(function (arm, i) {
+    if (i === activeArmIndex) return null;
+    return {
+      arm: arm,
+      extremePointsCanonical: inverseHomography ? arm.extremePointsCamera.map(function (p) { return toCanonical(p); }) : [],
+    };
+  });
+  updateCountModeAvailability();
+  updateDistributionAvailability(); // before reading distributionSelect.value below, so a
+                                     // just-invalidated "radial" selection's fallback to
+                                     // "grid" takes effect within this same render pass
   samplePointsCanonical = [];
   let sampleError = null;
-  if (fittedCircle) {
-    try {
-      const steps = Math.max(1, parseInt(stepsInput.value) || 1);
-      const seed = parseInt(seedInput.value) || 0;
-      // isValidCandidate reads cutPolygonsCanonical/canonicalSize/fittedCircle as
-      // module-level state, already up to date above.
-      samplePointsCanonical = sampleSectorPoints(steps, seed, distributionSelect.value);
-    } catch (e) { sampleError = e.message; }
+  // Independent: each arm samples its OWN circle independently (today's original behavior).
+  // Combined (default): every arm's fitted circle is sampled together as their UNION, so an
+  // overlap between two arms' circles isn't double-density -- see the `independent` state
+  // comment above and CLAUDE.md. Either way, manual per-point overrides (the "Move sample
+  // points" tool) win over whatever the algorithm computed for that index, applied after
+  // generation so overriding one point can't perturb the others' computed positions.
+  if (independent) {
+    if (fittedCircle) {
+      try {
+        const steps = Math.max(1, parseInt(stepsInput.value) || 1);
+        const seed = parseInt(seedInput.value) || 0;
+        samplePointsCanonical = countModeSelect.value === "variable"
+          ? sampleSectorPointsVariable(steps, seed, distributionSelect.value)
+          : sampleSectorPoints(steps, seed, distributionSelect.value);
+        Object.keys(sampleOverrides).forEach(function (key) {
+          const idx = parseInt(key, 10);
+          if (idx >= 0 && idx < samplePointsCanonical.length) samplePointsCanonical[idx] = sampleOverrides[idx];
+        });
+      } catch (e) { sampleError = e.message; }
+    }
+  } else {
+    const circlesForUnion = arms.filter(function (a) { return a.fittedCircle; }).map(function (a) { return a.fittedCircle; });
+    if (circlesForUnion.length > 0) {
+      try {
+        const steps = Math.max(1, parseInt(stepsInput.value) || 1);
+        const seed = parseInt(seedInput.value) || 0;
+        samplePointsCanonical = sampleCombinedPoints(circlesForUnion, steps, seed, distributionSelect.value, countModeSelect.value);
+        Object.keys(sampleOverrides).forEach(function (key) {
+          const idx = parseInt(key, 10);
+          if (idx >= 0 && idx < samplePointsCanonical.length) samplePointsCanonical[idx] = sampleOverrides[idx];
+        });
+      } catch (e) { sampleError = e.message; }
+    }
   }
+  // Manual add/remove (the "+" tool): drop removed generated indices, then append any
+  // manually-added extra points -- sampleOrigins records what each final index actually IS,
+  // so a later click on it knows whether to un-remove a base point or delete an extra one.
+  sampleOrigins = [];
+  samplePointsCanonical = samplePointsCanonical
+    .map(function (p, i) { return { p: p, origin: { kind: "base", baseIndex: i } }; })
+    .filter(function (e) { return removedSampleIndices.indexOf(e.origin.baseIndex) === -1; })
+    .concat(extraSamplePoints.map(function (p, i) { return { p: p, origin: { kind: "extra", extraIndex: i } }; }))
+    .map(function (e) { sampleOrigins.push(e.origin); return e.p; });
   samplePointsCamera = homography
     ? samplePointsCanonical.map(function (p) { return toPixel(p); })
+    : [];
+  actualCountLabel.textContent = countModeSelect.value === "variable"
+    ? "(" + samplePointsCanonical.length + " actual)"
+    : "";
+
+  // Orientation guide arrows -- one per sample point, cycling through its own independently-
+  // sized rotation list via index % length (mirrors target_for_episode/generate_rotation_
+  // angles in pattern.py: position count and rotation count are deliberately decoupled, see
+  // CLAUDE.md). Uses whichever settings object is actually live right now (the active arm's
+  // own, in independent mode; the shared combinedSettings otherwise) -- already freshly
+  // synced by syncActiveArmFromGlobals() at the top of this function.
+  const orientationSettings = independent ? arms[activeArmIndex] : combinedSettings;
+  const overrides = orientationSettings.orientationOverrides || {};
+  orientationPreviewLabel.textContent = "Rotation" + (arms.length > 1 ? " (" + (independent ? "active arm" : "combined") + ")" : "");
+  // A point's own override (full config, set via the box-select tool) wins over the global
+  // settings; with no override it falls back to the global enabled/count/method/etc.
+  function anglesForPoint(cfg, idx) {
+    return generateRotationAngles(
+      cfg.orientationCount, cfg.orientationMethod, cfg.orientationAngleStart,
+      cfg.orientationAngleEnd, cfg.orientationMethod === "random" ? cfg.orientationSeed + idx : cfg.orientationSeed,
+      cfg.orientationInitialAngle,
+    );
+  }
+  orientationTipsCanonical = samplePointsCanonical.map(function (p, i) {
+    const cfg = overrides[i] || orientationSettings;
+    if (!cfg.orientationEnabled) return [];
+    return anglesForPoint(cfg, i).map(function (a) { return orientationTipCanonical(p, a, cfg.orientationArrowLength); });
+  });
+  orientationTipsCamera = homography
+    ? orientationTipsCanonical.map(function (tips) { return tips.map(function (p) { return toPixel(p); }); })
     : [];
 
   renderCameraView();
@@ -1211,9 +2409,31 @@ function drawPolygon(ctx, vertices, fillStyle, strokeStyle, lineWidth, dash) {
   }
 }
 
-function renderCutShapeCamera(ctx, shape, H) {
+function drawArrow(ctx, tail, tip, color, lineWidth) {
+  // A line plus a small "V" arrowhead at the tip -- pure 2D drawing, no perspective math of
+  // its own (the caller already projected tail/tip into whichever space this canvas draws
+  // in: pixel for the camera view, orthoScale-scaled canonical for the orthographic view).
+  const width = lineWidth || 2;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.beginPath();
+  ctx.moveTo(tail[0], tail[1]);
+  ctx.lineTo(tip[0], tip[1]);
+  ctx.stroke();
+  const angle = Math.atan2(tip[1] - tail[1], tip[0] - tail[0]);
+  const headLen = Math.max(6, width * 4);
+  const headAngle = Math.PI / 7;
+  ctx.beginPath();
+  ctx.moveTo(tip[0], tip[1]);
+  ctx.lineTo(tip[0] - headLen * Math.cos(angle - headAngle), tip[1] - headLen * Math.sin(angle - headAngle));
+  ctx.moveTo(tip[0], tip[1]);
+  ctx.lineTo(tip[0] - headLen * Math.cos(angle + headAngle), tip[1] - headLen * Math.sin(angle + headAngle));
+  ctx.stroke();
+}
+
+function renderCutShapeCamera(ctx, shape, H, selected) {
   const boundary = cutShapeBoundary(shape).map(function (p) { return applyHomography(H, p); });
-  drawPolygon(ctx, boundary, "rgba(248,113,113,0.2)", "#f87171", 2, [6, 4]);
+  drawPolygon(ctx, boundary, selected ? "rgba(248,113,113,0.35)" : "rgba(248,113,113,0.2)", "#f87171", selected ? 3 : 2, [6, 4]);
   pixelHandlesForShape(shape, H).forEach(function (h) {
     ctx.beginPath(); ctx.arc(h.pixelPoint[0], h.pixelPoint[1], 4, 0, 2 * Math.PI);
     ctx.fillStyle = "#f87171"; ctx.fill();
@@ -1255,17 +2475,29 @@ function renderCameraView() {
       ctx.lineWidth = 2;
       ctx.stroke();
     });
+
+    if (interaction === "corners" && !cornersLocked) {
+      const c = scaleHandlePosition(cameraCorners);
+      ctx.save();
+      ctx.translate(c[0], c[1]);
+      ctx.rotate(Math.PI / 4);
+      ctx.fillStyle = "#34d399";
+      ctx.fillRect(-6, -6, 12, 12);
+      ctx.strokeStyle = "#0a0e17";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(-6, -6, 12, 12);
+      ctx.restore();
+    }
   }
 
   if (homography) {
-    cutShapesCanonical.forEach(function (shape) { renderCutShapeCamera(ctx, shape, homography); });
+    cutShapesCanonical.forEach(function (shape, i) { renderCutShapeCamera(ctx, shape, homography, i === selectedCutIndex); });
   }
 
   // In-progress cut draft preview -- built in canonical space, then forward-mapped, exactly
   // like a committed cut shape would be.
   if (interaction === "polygon" && polyDraft.length > 0 && homography) {
-    const lastCanonical = (lastMousePos && inverseHomography) ? toCanonical(lastMousePos) : null;
-    const previewCanonical = lastCanonical ? polyDraft.concat([lastCanonical]) : polyDraft;
+    const previewCanonical = polyHoverCanonical ? polyDraft.concat([polyHoverCanonical]) : polyDraft;
     const previewPixel = previewCanonical.map(function (cp) { return toPixel(cp); });
     drawPolygon(ctx, previewPixel, null, "#f87171", 2, [3, 3]);
     polyDraft.forEach(function (v) {
@@ -1284,17 +2516,40 @@ function renderCameraView() {
     if (draftShape) {
       const boundary = cutShapeBoundary(draftShape).map(function (cp) { return toPixel(cp); });
       drawPolygon(ctx, boundary, "rgba(248,113,113,0.15)", "#f87171", 2, [3, 3]);
+    } else if (interaction === "select") {
+      const boundary = rectangleVertices(cutAnchor, cutPreview).map(function (cp) { return toPixel(cp); });
+      drawPolygon(ctx, boundary, "rgba(255,255,255,0.08)", "#e7ebf3", 2, [3, 3]);
     }
   }
 
+  const activeColor = arms[activeArmIndex].color;
+  // Combined mode (Independent: off, the default) samples every arm together as one shared
+  // union region -- there's no single "owning" arm for the result, so every arm's own
+  // geometry renders at FULL strength (not dimmed) and the sample dots get a neutral color
+  // instead of the active arm's, so they don't look like they belong to just one arm.
+  const otherArmAlpha = independent ? 0.55 : 1;
+  const otherCircleAlpha = independent ? 0.4 : 1;
+  const sampleColor = independent ? activeColor : "#f5f5f5";
   extremePointsCamera.forEach(function (p) {
     ctx.beginPath();
     ctx.arc(p[0], p[1], 5, 0, 2 * Math.PI);
-    ctx.fillStyle = "#f5f5f5";
+    ctx.fillStyle = activeColor;
     ctx.fill();
   });
+  // Other arms' extreme points -- dimmed in "Independent" mode (so the active arm's own
+  // markers read as "the one you're editing right now"), full-strength in combined mode
+  // (every arm equally contributes to the one shared pattern).
+  otherArmsRenderData.forEach(function (entry) {
+    if (!entry) return;
+    ctx.globalAlpha = otherArmAlpha;
+    entry.arm.extremePointsCamera.forEach(function (p) {
+      ctx.beginPath(); ctx.arc(p[0], p[1], 4, 0, 2 * Math.PI);
+      ctx.fillStyle = entry.arm.color; ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+  });
 
-  if (homography && fittedCircle && cameraCorners.length === 4) {
+  if (homography && cameraCorners.length === 4) {
     // Clip to the workspace quad: the valid sampling region is the INTERSECTION of the
     // fitted circle and the workspace, not the circle alone, so the circle should visually
     // stop at the quad's edge instead of appearing to expand past it.
@@ -1305,38 +2560,84 @@ function renderCameraView() {
     ctx.closePath();
     ctx.clip();
 
-    ctx.strokeStyle = "#34d399";
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    const segs = 64;
-    for (let i = 0; i <= segs; i++) {
-      const theta = 2 * Math.PI * i / segs;
-      const cp = [
-        fittedCircle.center[0] + fittedCircle.radius * Math.cos(theta),
-        fittedCircle.center[1] + fittedCircle.radius * Math.sin(theta),
-      ];
-      const pp = toPixel(cp);
-      if (i === 0) ctx.moveTo(pp[0], pp[1]); else ctx.lineTo(pp[0], pp[1]);
-    }
-    ctx.stroke();
-
-    samplePointsCamera.forEach(function (p) {
+    // Other arms' reach circle -- outline only (no sample-point preview, no edit handles;
+    // those stay active-arm-only, see the comment on otherArmsRenderData), dimmed so the
+    // active arm's own circle still reads as "the one you're editing right now."
+    otherArmsRenderData.forEach(function (entry) {
+      if (!entry || !entry.arm.fittedCircle) return;
+      const circle = entry.arm.fittedCircle;
+      ctx.globalAlpha = otherCircleAlpha;
+      ctx.strokeStyle = entry.arm.color;
+      ctx.lineWidth = 2;
       ctx.beginPath();
-      ctx.arc(p[0], p[1], 3, 0, 2 * Math.PI);
-      ctx.fillStyle = "#34d399";
-      ctx.fill();
+      const segs = 64;
+      for (let i = 0; i <= segs; i++) {
+        const theta = 2 * Math.PI * i / segs;
+        const cp = [circle.center[0] + circle.radius * Math.cos(theta), circle.center[1] + circle.radius * Math.sin(theta)];
+        const pp = toPixel(cp);
+        if (i === 0) ctx.moveTo(pp[0], pp[1]); else ctx.lineTo(pp[0], pp[1]);
+      }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
     });
 
-    if (interaction === "corners") {
-      // The fitted circle is now editable on the camera view too (forward-mapped handles),
-      // not just the orthographic view -- shown only in "corners" mode, the same mode that
-      // also drags the 4 surface corners, since both edit the workspace/circle structure.
-      circleHandles(fittedCircle).forEach(function (h) {
-        const hp = toPixel(h.point);
-        ctx.beginPath(); ctx.arc(hp[0], hp[1], 4, 0, 2 * Math.PI);
-        ctx.fillStyle = "#34d399"; ctx.fill();
-      });
+    if (fittedCircle) {
+      ctx.strokeStyle = activeColor;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      const segs = 64;
+      for (let i = 0; i <= segs; i++) {
+        const theta = 2 * Math.PI * i / segs;
+        const cp = [
+          fittedCircle.center[0] + fittedCircle.radius * Math.cos(theta),
+          fittedCircle.center[1] + fittedCircle.radius * Math.sin(theta),
+        ];
+        const pp = toPixel(cp);
+        if (i === 0) ctx.moveTo(pp[0], pp[1]); else ctx.lineTo(pp[0], pp[1]);
+      }
+      ctx.stroke();
+
+      if (interaction === "corners") {
+        // The fitted circle is editable on the camera view too (forward-mapped handles), not
+        // just the orthographic view -- shown only while Workspace setup's "corners" tool is
+        // active, the ONLY tool that's allowed to touch it.
+        circleHandles(fittedCircle).forEach(function (h) {
+          const hp = toPixel(h.point);
+          ctx.beginPath(); ctx.arc(hp[0], hp[1], 4, 0, 2 * Math.PI);
+          ctx.fillStyle = activeColor; ctx.fill();
+        });
+      }
     }
+
+    // Sample dots/arrows are NOT gated on the ACTIVE arm having its own circle -- in combined
+    // mode they belong to the union of every arm's circle, so they must still show even if the
+    // active arm (e.g. a just-added, not-yet-fitted one) has none. This was a real, reported
+    // bug: adding a second arm before fitting it made combined-mode sampling appear "broken"
+    // (nothing drawn), even though the union itself was valid.
+    const sampleRadius = interaction === "select" ? 5 : 3;
+    samplePointsCamera.forEach(function (p, i) {
+      (orientationTipsCamera[i] || []).forEach(function (tip) { drawArrow(ctx, p, tip, sampleColor, 2); });
+    });
+    samplePointsCamera.forEach(function (p, i) {
+      ctx.beginPath();
+      ctx.arc(p[0], p[1], sampleRadius, 0, 2 * Math.PI);
+      ctx.fillStyle = sampleColor;
+      ctx.fill();
+      if (orientationOverrides[i]) {
+        ctx.beginPath();
+        ctx.arc(p[0], p[1], sampleRadius + 4, 0, 2 * Math.PI);
+        ctx.strokeStyle = "#facc15";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+      if (orientationSelectedIndices.indexOf(i) !== -1) {
+        ctx.beginPath();
+        ctx.arc(p[0], p[1], sampleRadius + 7, 0, 2 * Math.PI);
+        ctx.strokeStyle = "#38bdf8";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+    });
 
     ctx.restore();
   }
@@ -1382,9 +2683,10 @@ function renderOrthoView() {
     }
   }
 
-  cutPolygonsCanonical.forEach(function (poly) {
+  cutPolygonsCanonical.forEach(function (poly, i) {
     const scaled = poly.map(function (p) { return [p[0] * orthoScale, p[1] * orthoScale]; });
-    drawPolygon(ctx, scaled, "rgba(248,113,113,0.2)", "#f87171", 2, [6, 4]);
+    const selected = i === selectedCutIndex;
+    drawPolygon(ctx, scaled, selected ? "rgba(248,113,113,0.35)" : "rgba(248,113,113,0.2)", "#f87171", selected ? 3 : 2, [6, 4]);
   });
   cutShapesCanonical.forEach(function (shape) {
     getCutHandles(shape).forEach(function (h) {
@@ -1393,33 +2695,127 @@ function renderOrthoView() {
     });
   });
 
+  const activeColorOrtho = arms[activeArmIndex].color;
+  const otherArmAlphaOrtho = independent ? 0.55 : 1;
+  const sampleColorOrtho = independent ? activeColorOrtho : "#f5f5f5";
   extremePointsCanonical.forEach(function (p) {
     ctx.beginPath();
     ctx.arc(p[0] * orthoScale, p[1] * orthoScale, 5, 0, 2 * Math.PI);
-    ctx.fillStyle = "#f5f5f5";
+    ctx.fillStyle = activeColorOrtho;
     ctx.fill();
+  });
+  otherArmsRenderData.forEach(function (entry) {
+    if (!entry) return;
+    ctx.globalAlpha = otherArmAlphaOrtho;
+    entry.extremePointsCanonical.forEach(function (p) {
+      ctx.beginPath(); ctx.arc(p[0] * orthoScale, p[1] * orthoScale, 4, 0, 2 * Math.PI);
+      ctx.fillStyle = entry.arm.color; ctx.fill();
+    });
+    if (entry.arm.fittedCircle) {
+      const circle = entry.arm.fittedCircle;
+      ctx.beginPath();
+      ctx.arc(circle.center[0] * orthoScale, circle.center[1] * orthoScale, circle.radius * orthoScale, 0, 2 * Math.PI);
+      ctx.strokeStyle = entry.arm.color;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
   });
 
   if (fittedCircle) {
     ctx.beginPath();
     ctx.arc(fittedCircle.center[0] * orthoScale, fittedCircle.center[1] * orthoScale, fittedCircle.radius * orthoScale, 0, 2 * Math.PI);
-    ctx.strokeStyle = "#34d399";
+    ctx.strokeStyle = activeColorOrtho;
     ctx.lineWidth = 2;
     ctx.stroke();
-    circleHandles(fittedCircle).forEach(function (h) {
-      ctx.beginPath();
-      ctx.arc(h.point[0] * orthoScale, h.point[1] * orthoScale, 4, 0, 2 * Math.PI);
-      ctx.fillStyle = "#34d399";
-      ctx.fill();
-    });
+    if (tool === "corners") {
+      circleHandles(fittedCircle).forEach(function (h) {
+        ctx.beginPath();
+        ctx.arc(h.point[0] * orthoScale, h.point[1] * orthoScale, 4, 0, 2 * Math.PI);
+        ctx.fillStyle = activeColorOrtho;
+        ctx.fill();
+      });
+    }
   }
 
-  samplePointsCanonical.forEach(function (p) {
-    ctx.beginPath();
-    ctx.arc(p[0] * orthoScale, p[1] * orthoScale, 3, 0, 2 * Math.PI);
-    ctx.fillStyle = "#34d399";
-    ctx.fill();
+  const orthoSampleRadius = tool === "select" ? 5 : 3;
+  samplePointsCanonical.forEach(function (p, i) {
+    const tailScaled = [p[0] * orthoScale, p[1] * orthoScale];
+    (orientationTipsCanonical[i] || []).forEach(function (tip) {
+      drawArrow(ctx, tailScaled, [tip[0] * orthoScale, tip[1] * orthoScale], sampleColorOrtho, 2);
+    });
   });
+  samplePointsCanonical.forEach(function (p, i) {
+    ctx.beginPath();
+    ctx.arc(p[0] * orthoScale, p[1] * orthoScale, orthoSampleRadius, 0, 2 * Math.PI);
+    ctx.fillStyle = sampleColorOrtho;
+    ctx.fill();
+    if (orientationOverrides[i]) {
+      ctx.beginPath();
+      ctx.arc(p[0] * orthoScale, p[1] * orthoScale, orthoSampleRadius + 4, 0, 2 * Math.PI);
+      ctx.strokeStyle = "#facc15";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+    if (orientationSelectedIndices.indexOf(i) !== -1) {
+      ctx.beginPath();
+      ctx.arc(p[0] * orthoScale, p[1] * orthoScale, orthoSampleRadius + 7, 0, 2 * Math.PI);
+      ctx.strokeStyle = "#38bdf8";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  });
+
+  // In-progress cut draft preview -- same draft state as the camera view's, just scaled
+  // directly by orthoScale instead of forward-mapped through the homography.
+  const interaction = activeInteraction();
+  if (interaction === "polygon" && polyDraft.length > 0) {
+    const previewCanonical = polyHoverCanonical ? polyDraft.concat([polyHoverCanonical]) : polyDraft;
+    const previewScaled = previewCanonical.map(function (cp) { return [cp[0] * orthoScale, cp[1] * orthoScale]; });
+    drawPolygon(ctx, previewScaled, null, "#f87171", 2, [3, 3]);
+    polyDraft.forEach(function (v) {
+      ctx.beginPath(); ctx.arc(v[0] * orthoScale, v[1] * orthoScale, 4, 0, 2 * Math.PI);
+      ctx.fillStyle = "#f87171"; ctx.fill();
+    });
+  }
+  if (cutDragging && cutAnchor && cutPreview) {
+    let draftShape = null;
+    if (interaction === "rectangle") {
+      draftShape = { type: "rectangle", corners: rectangleVertices(cutAnchor, cutPreview) };
+    } else if (interaction === "circle") {
+      draftShape = { type: "circle", center: cutAnchor, radius: Math.hypot(cutPreview[0] - cutAnchor[0], cutPreview[1] - cutAnchor[1]) };
+    }
+    if (draftShape) {
+      const boundary = cutShapeBoundary(draftShape).map(function (cp) { return [cp[0] * orthoScale, cp[1] * orthoScale]; });
+      drawPolygon(ctx, boundary, "rgba(248,113,113,0.15)", "#f87171", 2, [3, 3]);
+    } else if (interaction === "select") {
+      const boundary = rectangleVertices(cutAnchor, cutPreview).map(function (cp) { return [cp[0] * orthoScale, cp[1] * orthoScale]; });
+      drawPolygon(ctx, boundary, "rgba(255,255,255,0.08)", "#e7ebf3", 2, [3, 3]);
+    }
+  }
+}
+
+function hexToRgbaArrayString(hex) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return "[" + r + ", " + g + ", " + b + ", 255]";
+}
+
+function orientationExportBlock(settings) {
+  // Mirrors config.py's OrientationConfig field-for-field. Only emitted when enabled -- an
+  // object without this block is unaffected (no arrow), exactly today's pre-orientation
+  // export for every config that doesn't opt in.
+  if (!settings.orientationEnabled) return "";
+  let block = "orientation:\n";
+  block += "  count: " + settings.orientationCount + "\n";
+  block += "  method: " + settings.orientationMethod + "\n";
+  block += "  angle_start_deg: " + settings.orientationAngleStart + "\n";
+  block += "  angle_end_deg: " + settings.orientationAngleEnd + "\n";
+  block += "  seed: " + settings.orientationSeed + "\n";
+  block += "  arrow_length: " + settings.orientationArrowLength + "\n";
+  block += "  initial_angle_deg: " + settings.orientationInitialAngle + "\n";
+  return block;
 }
 
 function updateExportText(sampleError) {
@@ -1427,22 +2823,79 @@ function updateExportText(sampleError) {
     .map(function (c) { return "[" + Math.round(c[0]) + ", " + Math.round(c[1]) + "]"; })
     .join(", ");
   let body = "surface_calibration:\n  corners: [" + cornersStr + "]\n";
-  if (fittedCircle) {
-    const steps = Math.max(1, parseInt(stepsInput.value) || 1);
-    const seed = parseInt(seedInput.value) || 0;
-    const borderWidth = Math.max(0, parseFloat(borderWidthInput.value) || 0);
-    body += "\n# paste into the relevant object's pattern:\n";
-    body += "pattern:\n";
-    body += "  shape: sector\n";
-    body += "  center: [" + fittedCircle.center[0].toFixed(1) + ", " + fittedCircle.center[1].toFixed(1) + "]\n";
-    body += "  radius: " + fittedCircle.radius.toFixed(1) + "\n";
-    body += "  inner_radius: 0\n";
-    body += "  angle_start_deg: 0\n";
-    body += "  angle_end_deg: 360\n";
-    body += "  seed: " + seed + "\n";
-    body += "  distribution: " + distributionSelect.value + "\n";
-    body += "  border_width: " + borderWidth + "\n";
-    body += "# set this object's count to: " + steps + "\n";
+  if (independent) {
+    // One pattern (+ marker color override) block per arm that has a fitted circle -- a
+    // single-arm session (still the common case) emits exactly what this tool always
+    // emitted, byte for byte; a bimanual one emits one block per arm, each meant for a
+    // SEPARATE object, with a distinct marker color so the two simultaneous targets stay
+    // tell-apart-able (see config.py's per-object `marker:` override). `arm.fittedCircle`/
+    // `arm.seed`/etc. are used uniformly for every arm, including the active one --
+    // renderAll() already synced arms[activeArmIndex] from the live globals/form fields
+    // before this function runs, so there's no need to special-case "the currently active
+    // arm" here.
+    arms.forEach(function (arm) {
+      if (!arm.fittedCircle) return;
+      const target = arms.length > 1 ? "the \"" + arm.name + "\"" : "the relevant";
+      body += "\n# paste into " + target + " object's pattern:\n";
+      body += "pattern:\n";
+      body += "  shape: sector\n";
+      body += "  center: [" + arm.fittedCircle.center[0].toFixed(1) + ", " + arm.fittedCircle.center[1].toFixed(1) + "]\n";
+      body += "  radius: " + arm.fittedCircle.radius.toFixed(1) + "\n";
+      body += "  inner_radius: 0\n";
+      body += "  angle_start_deg: 0\n";
+      body += "  angle_end_deg: 360\n";
+      body += "  seed: " + arm.seed + "\n";
+      body += "  distribution: " + arm.distribution + "\n";
+      body += "  border_width: " + arm.borderWidth + "\n";
+      if (arm.countMode === "variable") body += "  count_mode: variable\n";
+      body += "# set this object's count to: " + arm.steps + "\n";
+      body += orientationExportBlock(arm);
+      if (arms.length > 1) {
+        body += "# distinct color so this arm's target is tell-apart-able from the other arm(s):\n";
+        body += "marker:\n";
+        body += "  color_rgba: " + hexToRgbaArrayString(arm.color) + "\n";
+      }
+    });
+  } else {
+    // Combined (default): every arm's circle goes into ONE pattern, sampled as their shared
+    // UNION (see sampleUnionPoints/generate_union_points) -- there's no per-arm marker color
+    // here, since this is meant for ONE object, not one per arm. With exactly one circle
+    // (the common single-arm case), `shape: union` would be numerically equivalent but is
+    // needlessly the newer, less-established shape for what's just a plain circle -- export
+    // the original, long-tested `shape: sector` instead, so a single-arm session's export
+    // stays byte-for-byte identical to what this tool emitted before this feature existed.
+    const circlesForExport = arms.filter(function (a) { return a.fittedCircle; });
+    if (circlesForExport.length === 1) {
+      const circle = circlesForExport[0].fittedCircle;
+      body += "\n# paste into the relevant object's pattern:\n";
+      body += "pattern:\n";
+      body += "  shape: sector\n";
+      body += "  center: [" + circle.center[0].toFixed(1) + ", " + circle.center[1].toFixed(1) + "]\n";
+      body += "  radius: " + circle.radius.toFixed(1) + "\n";
+      body += "  inner_radius: 0\n";
+      body += "  angle_start_deg: 0\n";
+      body += "  angle_end_deg: 360\n";
+      body += "  seed: " + combinedSettings.seed + "\n";
+      body += "  distribution: " + combinedSettings.distribution + "\n";
+      body += "  border_width: " + combinedSettings.borderWidth + "\n";
+      if (combinedSettings.countMode === "variable") body += "  count_mode: variable\n";
+      body += "# set this object's count to: " + combinedSettings.steps + "\n";
+      body += orientationExportBlock(combinedSettings);
+    } else if (circlesForExport.length > 1) {
+      body += "\n# paste into the relevant object's pattern:\n";
+      body += "pattern:\n";
+      body += "  shape: union\n";
+      body += "  circles:\n";
+      circlesForExport.forEach(function (arm) {
+        body += "    - center: [" + arm.fittedCircle.center[0].toFixed(1) + ", " + arm.fittedCircle.center[1].toFixed(1) + "]\n";
+        body += "      radius: " + arm.fittedCircle.radius.toFixed(1) + "\n";
+      });
+      body += "  seed: " + combinedSettings.seed + "\n";
+      body += "  distribution: " + combinedSettings.distribution + "\n";
+      body += "  border_width: " + combinedSettings.borderWidth + "\n";
+      body += "# set this object's count to: " + combinedSettings.steps + "\n";
+      body += orientationExportBlock(combinedSettings);
+    }
   }
   if (cutShapesCanonical.length > 0 && homography) {
     // exclude_zones in the YAML are always pixel-space facts about the image (see
@@ -1526,34 +2979,30 @@ function getCanvasPoint(canvas, evt) {
   return [(evt.clientX - rect.left) * scaleX, (evt.clientY - rect.top) * scaleY];
 }
 
-function updateModeUI() {
-  const interaction = activeInteraction();
-  finishCutBtn.disabled = !(interaction === "polygon" && polyDraft.length >= 3);
-}
-
 function resetCutDraftState() {
   polyDraft = [];
+  polyHoverCanonical = null;
   cutDragging = false; cutAnchor = null; cutPreview = null;
-  updateModeUI();
 }
 
 function updateToolUI() {
   toolExtreme.classList.toggle("active", tool === "extreme");
   toolCorners.classList.toggle("active", tool === "corners");
+  toolSelect.classList.toggle("active", tool === "select");
+  toolAddRemovePoint.classList.toggle("active", tool === "addRemovePoint");
   toolRect.classList.toggle("active", tool === "rectangle");
   toolCircle.classList.toggle("active", tool === "circle");
   toolPolygon.classList.toggle("active", tool === "polygon");
-  toolEditCuts.classList.toggle("active", tool === "editCuts");
   updateCursors();
-  updateModeUI();
 }
 
 function updateCursors() {
   cameraCanvas.classList.remove("cut-cursor", "edit-cursor");
-  orthoCanvas.classList.remove("edit-cursor");
+  orthoCanvas.classList.remove("cut-cursor", "edit-cursor");
   if (tool === "rectangle" || tool === "circle" || tool === "polygon") {
     cameraCanvas.classList.add("cut-cursor");
-  } else if (tool === "editCuts") {
+    orthoCanvas.classList.add("cut-cursor");
+  } else if (tool === "corners" || tool === "select") {
     cameraCanvas.classList.add("edit-cursor");
     orthoCanvas.classList.add("edit-cursor");
   }
@@ -1567,55 +3016,250 @@ function setTool(newTool) {
 }
 toolExtreme.addEventListener("click", function () { setTool("extreme"); });
 toolCorners.addEventListener("click", function () { setTool("corners"); });
+toolSelect.addEventListener("click", function () { setTool("select"); });
+toolAddRemovePoint.addEventListener("click", function () { setTool("addRemovePoint"); });
 toolRect.addEventListener("click", function () { setTool("rectangle"); });
 toolCircle.addEventListener("click", function () { setTool("circle"); });
 toolPolygon.addEventListener("click", function () { setTool("polygon"); });
-toolEditCuts.addEventListener("click", function () { setTool("editCuts"); });
+toolbarToggleBtn.addEventListener("click", function () {
+  const expanded = floatingToolbarTools.style.display !== "none";
+  floatingToolbarTools.style.display = expanded ? "none" : "flex";
+  toolbarToggleBtn.classList.toggle("active", !expanded);
+});
 
 lockCornersBtn.addEventListener("click", function () {
+  // Deliberately NOT undo-tracked -- this is a UI guard, not a geometry edit (see the
+  // undo/redo scoping note above the snapshot/restore functions).
   cornersLocked = !cornersLocked;
   lockCornersBtn.classList.toggle("active", cornersLocked);
   lockCornersBtn.innerHTML = cornersLocked ? "&#x1F512;" : "&#x1F513;";
   resetCornersBtn.disabled = cornersLocked;
   renderAll();
 });
-resetCornersBtn.addEventListener("click", function () { resetCorners(); renderAll(); });
+resetCornersBtn.addEventListener("click", function () { recordUndo(); resetCorners(); renderAll(); });
+lockCircleBtn.addEventListener("click", function () {
+  circleLocked = !circleLocked;
+  lockCircleBtn.classList.toggle("active", circleLocked);
+  lockCircleBtn.innerHTML = circleLocked ? "&#x1F512;" : "&#x1F513;";
+  renderAll();
+});
+lockPatternBtn.addEventListener("click", function () {
+  patternLocked = !patternLocked;
+  lockPatternBtn.classList.toggle("active", patternLocked);
+  lockPatternBtn.innerHTML = patternLocked ? "&#x1F512;" : "&#x1F513;";
+  [stepsInput, seedInput, distributionSelect, borderWidthInput, countModeSelect].forEach(function (el) {
+    el.disabled = patternLocked;
+  });
+  renderAll();
+});
 
 document.addEventListener("keydown", function (e) {
   if (e.key === "Escape" && polyDraft.length > 0) {
     resetCutDraftState();
     renderAll();
+    return;
+  }
+  // Ignore inside a form field -- number inputs etc. have their own native undo, and
+  // hijacking Ctrl+Z there would fight the browser's own text-editing behavior.
+  const tag = (e.target && e.target.tagName) || "";
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+  if (e.key === "Delete" || e.key === "Backspace") {
+    if (selectedCutIndex >= 0) {
+      recordUndo();
+      cutShapesCanonical.splice(selectedCutIndex, 1);
+      selectedCutIndex = -1;
+      renderAll();
+      return;
+    }
+    if (orientationSelectedIndices.length > 0 && !patternLocked) {
+      deleteSelectedSamples();
+      return;
+    }
+  }
+  const key = e.key.toLowerCase();
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && key === "z") {
+    e.preventDefault();
+    undo();
+  } else if ((e.ctrlKey || e.metaKey) && (key === "y" || (e.shiftKey && key === "z"))) {
+    e.preventDefault();
+    redo();
   }
 });
+
+// Shared by both canvases -- cutAnchor/cutPreview/polyDraft are canonical regardless of which
+// canvas started the gesture, so "finish a polygon" and "add an extreme point" need exactly
+// one implementation each, not one per canvas.
+// A manually-added point can land inside a cut (or outside the circle/bounds) -- previously
+// it was pushed as-is, so it never adapted to cut-outs the way the generator's own points do
+// (reported directly). Relocates it with the same closed-form-clamp-then-radial-search used
+// everywhere else in this engine, falling back to the original point if no nearby valid spot
+// exists at all (e.g. a cut covering the whole reachable area).
+function relocateNewPointIfInvalid(candidateCanonical) {
+  if (!fittedCircle || isValidCandidate(candidateCanonical)) return candidateCanonical;
+  const borderWidth = Math.max(0, parseFloat(borderWidthInput.value) || 0);
+  const cx = fittedCircle.center[0], cy = fittedCircle.center[1];
+  const effectiveOuter = fittedCircle.radius - borderWidth;
+  const clamp = function (c) { return clampToRegion(c, cx, cy, effectiveOuter, canonicalSize, borderWidth); };
+  try {
+    return relocateIfInvalid(candidateCanonical, isValidCandidate, clamp, Math.random,
+      Math.max(5, fittedCircle.radius * 0.05), "manually-added", -1, cx, cy, effectiveOuter);
+  } catch (e) {
+    return candidateCanonical;
+  }
+}
+
+function isInsideAnyCut(candidateCanonical) {
+  const borderWidth = Math.max(0, parseFloat(borderWidthInput.value) || 0);
+  for (let i = 0; i < cutPolygonsCanonical.length; i++) {
+    if (pointNearPolygon(candidateCanonical, cutPolygonsCanonical[i], borderWidth)) return true;
+  }
+  return false;
+}
+
+// A dragged-point override (sampleOverrides) is deliberately allowed OUTSIDE the circle/
+// bounds -- an operator nudging a specific point can put it exactly where they want,
+// including past the circle's edge (see the existing "override survives borderWidth change"
+// test, which sets one well outside the fitted circle on purpose) -- so this only ever
+// checks/escapes CUTS, unlike relocateNewPointIfInvalid's full circle+bounds+cuts check for
+// brand-new points. No circle reference is needed at all, so this works even with no
+// fittedCircle.
+function relocateOverrideIfInCut(candidateCanonical) {
+  if (!isInsideAnyCut(candidateCanonical)) return candidateCanonical;
+  const searchScale = canonicalSize ? Math.max(5, Math.min(canonicalSize[0], canonicalSize[1]) * 0.05) : 10;
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const radius = searchScale * (0.5 + 0.25 * Math.floor(attempt / 3));
+    const probe = [candidateCanonical[0] + (Math.random() * 2 - 1) * radius, candidateCanonical[1] + (Math.random() * 2 - 1) * radius];
+    if (!isInsideAnyCut(probe)) return probe;
+  }
+  return candidateCanonical;
+}
+
+// Manually-added points (extraSamplePoints) and dragged-point overrides (sampleOverrides)
+// are fixed, absolute coordinates that the generator never re-derives -- so unlike the
+// generator's own points (which are recomputed fresh every render against the CURRENT cuts),
+// drawing a new cut over one of these did nothing at all (reported directly: "if i create a
+// cutout over added points they still remain there", and again as "add points manually AND
+// THEN add the cuts, the cuts dont affect them" after an earlier, narrower fix attempt missed
+// this exact path). Called unconditionally at the top of every render (see renderAll), the
+// same way the generator's own points already self-heal every render -- removes the entire
+// "did I hook every mutation path" category of bug that the earlier, call-site-specific
+// version was prone to.
+function revalidateManualPoints() {
+  if (fittedCircle) {
+    extraSamplePoints = extraSamplePoints.map(function (p) { return relocateNewPointIfInvalid(p); });
+  }
+  Object.keys(sampleOverrides).forEach(function (k) {
+    sampleOverrides[k] = relocateOverrideIfInCut(sampleOverrides[k]);
+  });
+}
+
+function addRemoveSamplePointAt(canonicalPoint, hitIndex) {
+  recordUndo();
+  if (hitIndex !== null) {
+    const origin = sampleOrigins[hitIndex];
+    if (origin.kind === "base") removedSampleIndices.push(origin.baseIndex);
+    else extraSamplePoints.splice(origin.extraIndex, 1);
+  } else {
+    extraSamplePoints.push(relocateNewPointIfInvalid(canonicalPoint));
+  }
+  // Adding/removing a point shifts every LATER index in the final array -- a selection (or
+  // an override) keyed by the OLD indices would silently end up pointing at different points
+  // afterward ("the selection shifts to the next 2 points", reported directly), so both are
+  // invalidated here exactly like a steps/seed/distribution change already does.
+  orientationSelectedIndices = [];
+  Object.keys(orientationOverrides).forEach(function (k) { delete orientationOverrides[k]; });
+  renderAll();
+}
+
+// Delete/Backspace with the "select" tool's box-selection non-empty: removes every selected
+// sample point in one action. Extra (manually-added) points must be spliced out highest-index
+// first -- removing several in ascending order would invalidate the later sampleOrigins
+// extraIndex values the loop already captured (the classic "delete multiple array indices"
+// pitfall: removing index 2 first shifts what used to be index 5 down to index 4).
+function deleteSelectedSamples() {
+  if (orientationSelectedIndices.length === 0) return;
+  recordUndo();
+  const extraIndices = [];
+  orientationSelectedIndices.forEach(function (i) {
+    const origin = sampleOrigins[i];
+    if (!origin) return;
+    if (origin.kind === "base") removedSampleIndices.push(origin.baseIndex);
+    else extraIndices.push(origin.extraIndex);
+  });
+  extraIndices.sort(function (a, b) { return b - a; }).forEach(function (idx) { extraSamplePoints.splice(idx, 1); });
+  orientationSelectedIndices = [];
+  Object.keys(orientationOverrides).forEach(function (k) { delete orientationOverrides[k]; });
+  renderAll();
+}
+
+function pushExtremePoint(pixelPoint) {
+  recordUndo();
+  extremePointsCamera.push(pixelPoint);
+  fitCircleBtn.disabled = extremePointsCamera.length < 3 || circleLocked;
+  renderAll();
+}
+function finishPolygonDraft() {
+  if (polyDraft.length < 3) return;
+  recordUndo();
+  cutShapesCanonical.push({ type: "polygon", vertices: polyDraft });
+  resetCutDraftState();
+  renderAll();
+}
+
+// "select" tool, shared by both canvases: a hit on a sample point either moves the WHOLE
+// current selection together (if that point is one of 2+ selected points) or just that one
+// point (today's original "Move sample points" behavior) -- otherwise the caller falls back
+// to starting a box-select drag. Returns true if a drag was started.
+function startSelectDrag(target, canonicalAnchor) {
+  if (!target || patternLocked) return false;
+  recordUndo();
+  if (orientationSelectedIndices.length > 1 && orientationSelectedIndices.indexOf(target.index) !== -1) {
+    activeDrag = {
+      kind: "sampleGroup",
+      anchorCanonical: canonicalAnchor,
+      indices: orientationSelectedIndices.slice(),
+      originals: orientationSelectedIndices.map(function (i) { return samplePointsCanonical[i].slice(); }),
+    };
+  } else {
+    // startCanonical lets mouseup tell a real drag apart from a plain click (see the
+    // "select" tool's mouseup handler) -- a plain click on a point deletes it instead of
+    // requiring box-select + Delete/Backspace every time (requested directly).
+    activeDrag = Object.assign({}, target, { startCanonical: samplePointsCanonical[target.index].slice() });
+  }
+  return true;
+}
 
 cameraCanvas.addEventListener("mousedown", function (e) {
   const p = getCanvasPoint(cameraCanvas, e);
   const interaction = activeInteraction();
   if (interaction === "corners") {
-    let bestIdx = -1, bestDist = 20;
-    if (!cornersLocked) {
-      cameraCorners.forEach(function (c, i) {
-        const d = Math.hypot(c[0] - p[0], c[1] - p[1]);
-        if (d < bestDist) { bestDist = d; bestIdx = i; }
-      });
-    }
-    if (bestIdx >= 0) {
-      draggingCornerIndex = bestIdx;
-    } else if (homography && fittedCircle) {
-      // Fitted-circle editing on the camera view: hit-test against the forward-mapped
-      // handles (the circle itself renders as an ellipse here under perspective).
-      let bestMode = null, bestDist2 = 15;
-      circleHandles(fittedCircle).forEach(function (h, idx) {
-        const hp = toPixel(h.point);
-        const d = Math.hypot(hp[0] - p[0], hp[1] - p[1]);
-        if (d < bestDist2) { bestDist2 = d; bestMode = idx === 0 ? "center" : "radius"; }
-      });
-      if (bestMode) circleDragMode = bestMode;
+    const target = findCameraCornersTarget(p);
+    if (target) { recordUndo(); activeDrag = target; }
+  } else if (interaction === "select") {
+    const cutTarget = findCameraEditTarget(p);
+    if (cutTarget) {
+      recordUndo();
+      activeDrag = cutTarget;
+    } else if (!startSelectDrag(findCameraSampleTarget(p), inverseHomography ? toCanonical(p) : p) && inverseHomography) {
+      const cp = toCanonical(p);
+      const hitCut = cutShapesCanonical.findIndex(function (s) { return pointInCutShape(cp, s); });
+      if (hitCut !== -1) {
+        selectedCutIndex = hitCut;
+        renderAll();
+      } else {
+        cutAnchor = cp; cutPreview = cp; cutDragging = true;
+      }
     }
   } else if (interaction === "extreme") {
-    extremePointsCamera.push(p);
-    fitCircleBtn.disabled = extremePointsCamera.length < 3;
-    renderAll();
+    pushExtremePoint(p);
+  } else if (interaction === "addRemovePoint") {
+    if (!inverseHomography || patternLocked) return;
+    let hit = null, bestD = 12;
+    samplePointsCamera.forEach(function (sp, i) {
+      const d = Math.hypot(sp[0] - p[0], sp[1] - p[1]);
+      if (d < bestD) { bestD = d; hit = i; }
+    });
+    addRemoveSamplePointAt(toCanonical(p), hit);
   } else if (interaction === "rectangle" || interaction === "circle") {
     if (!inverseHomography) return;
     const cp = toCanonical(p);
@@ -1623,57 +3267,62 @@ cameraCanvas.addEventListener("mousedown", function (e) {
   } else if (interaction === "polygon") {
     if (!inverseHomography) return;
     polyDraft.push(toCanonical(p));
-    updateModeUI();
-    renderAll();
-  } else if (interaction === "editCuts") {
-    let best = null, bestDist = 20;
-    if (homography) {
-      cutShapesCanonical.forEach(function (shape) {
-        pixelHandlesForShape(shape, homography).forEach(function (h) {
-          const d = Math.hypot(h.pixelPoint[0] - p[0], h.pixelPoint[1] - p[1]);
-          if (d < bestDist) { bestDist = d; best = h; }
-        });
-      });
-    }
-    editDragTarget = best;
-  }
-});
-cameraCanvas.addEventListener("dblclick", function () {
-  if (activeInteraction() === "polygon" && polyDraft.length >= 3) {
-    cutShapesCanonical.push({ type: "polygon", vertices: polyDraft });
-    resetCutDraftState();
     renderAll();
   }
 });
+cameraCanvas.addEventListener("dblclick", finishPolygonDraft);
 cameraCanvas.addEventListener("mousemove", function (e) {
   const p = getCanvasPoint(cameraCanvas, e);
-  lastMousePos = p;
-  if (draggingCornerIndex !== null) {
-    cameraCorners[draggingCornerIndex] = p;
-    renderAll();
-  } else if (circleDragMode) {
-    if (inverseHomography) {
+  if (activeDrag) {
+    if (activeDrag.kind === "corner") {
+      cameraCorners[activeDrag.index] = p;
+      renderAll();
+    } else if (activeDrag.kind === "edge") {
+      const i = activeDrag.index, j = (i + 1) % 4;
+      const a = cameraCorners[i], b = cameraCorners[j];
+      const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+      // Axis-locked: a vertical (left/right) edge only ever changes x, a horizontal
+      // (top/bottom) edge only ever changes y -- otherwise a side could drift off-axis while
+      // "scaling" (reported directly).
+      const dx = activeDrag.isVertical ? p[0] - mid[0] : 0;
+      const dy = activeDrag.isVertical ? 0 : p[1] - mid[1];
+      cameraCorners[i] = [a[0] + dx, a[1] + dy];
+      cameraCorners[j] = [b[0] + dx, b[1] + dy];
+      renderAll();
+    } else if (activeDrag.kind === "scaleAll") {
+      const d = Math.hypot(p[0] - activeDrag.centroid[0], p[1] - activeDrag.centroid[1]);
+      const scale = Math.max(0.05, 1 + (d - activeDrag.restDist) / activeDrag.baseDist);
+      const c = activeDrag.centroid;
+      cameraCorners = activeDrag.corners.map(function (orig) {
+        return [c[0] + (orig[0] - c[0]) * scale, c[1] + (orig[1] - c[1]) * scale];
+      });
+      renderAll();
+    } else if (activeDrag.kind === "extreme") {
+      extremePointsCamera[activeDrag.index] = p;
+      renderAll();
+    } else if (inverseHomography && activeDrag.kind === "shape") {
+      activeDrag.handle.onDrag(toCanonical(p));
+      renderAll();
+    } else if (inverseHomography && activeDrag.kind === "sample") {
+      sampleOverrides[activeDrag.index] = toCanonical(p);
+      renderAll();
+    } else if (inverseHomography && activeDrag.kind === "sampleGroup") {
       const cp = toCanonical(p);
-      if (circleDragMode === "center") fittedCircle.center = cp;
-      else fittedCircle.radius = Math.hypot(cp[0] - fittedCircle.center[0], cp[1] - fittedCircle.center[1]);
+      const dx = cp[0] - activeDrag.anchorCanonical[0], dy = cp[1] - activeDrag.anchorCanonical[1];
+      activeDrag.indices.forEach(function (idx, k) {
+        sampleOverrides[idx] = [activeDrag.originals[k][0] + dx, activeDrag.originals[k][1] + dy];
+      });
       renderAll();
     }
   } else if (cutDragging) {
     if (inverseHomography) { cutPreview = toCanonical(p); renderAll(); }
-  } else if (editDragTarget) {
-    if (inverseHomography) { editDragTarget.onDrag(toCanonical(p)); renderAll(); }
   } else if (activeInteraction() === "polygon" && polyDraft.length > 0) {
-    renderAll();
-  }
-});
-finishCutBtn.addEventListener("click", function () {
-  if (polyDraft.length >= 3) {
-    cutShapesCanonical.push({ type: "polygon", vertices: polyDraft });
-    resetCutDraftState();
+    if (inverseHomography) polyHoverCanonical = toCanonical(p);
     renderAll();
   }
 });
 clearCutsBtn.addEventListener("click", function () {
+  recordUndo();
   cutShapesCanonical = [];
   renderAll();
 });
@@ -1682,55 +3331,137 @@ orthoCanvas.addEventListener("mousedown", function (e) {
   if (!canonicalSize) return;
   const p = getCanvasPoint(orthoCanvas, e);
   const cp = [p[0] / orthoScale, p[1] / orthoScale];
-  if (activeInteraction() === "editCuts") {
-    // Cuts are editable directly on the orthographic view too, in the same canonical space
-    // they're already stored in -- no homography conversion needed here at all.
-    let best = null, bestDist = 10 / orthoScale;
-    cutShapesCanonical.forEach(function (shape) {
-      getCutHandles(shape).forEach(function (h) {
-        const d = Math.hypot(h.point[0] - cp[0], h.point[1] - cp[1]);
-        if (d < bestDist) { bestDist = d; best = h; }
-      });
+  const interaction = activeInteraction();
+  if (interaction === "corners") {
+    const target = findOrthoCornersTarget(cp);
+    if (target) { recordUndo(); activeDrag = target; }
+  } else if (interaction === "select") {
+    const cutTarget = findOrthoEditTarget(cp);
+    if (cutTarget) {
+      recordUndo();
+      activeDrag = cutTarget;
+    } else if (!startSelectDrag(findOrthoSampleTarget(cp), cp)) {
+      const hitCut = cutShapesCanonical.findIndex(function (s) { return pointInCutShape(cp, s); });
+      if (hitCut !== -1) {
+        selectedCutIndex = hitCut;
+        renderAll();
+      } else {
+        cutAnchor = cp; cutPreview = cp; cutDragging = true;
+      }
+    }
+  } else if (interaction === "extreme") {
+    // Adding a NEW extreme point from the orthographic view has no live arm feed underneath
+    // it (unlike the camera view) -- still useful for fine-tuning an existing fit by eye
+    // against the undistorted surface, with the camera view open alongside to cross-check.
+    pushExtremePoint(toPixel(cp));
+  } else if (interaction === "addRemovePoint") {
+    if (patternLocked) return;
+    let hit = null, bestD = 12 / orthoScale;
+    samplePointsCanonical.forEach(function (sp, i) {
+      const d = Math.hypot(sp[0] - cp[0], sp[1] - cp[1]);
+      if (d < bestD) { bestD = d; hit = i; }
     });
-    editDragTarget = best;
-    return;
-  }
-  if (!fittedCircle) return;
-  const dCenter = Math.hypot(cp[0] - fittedCircle.center[0], cp[1] - fittedCircle.center[1]);
-  const threshold = 10 / orthoScale;
-  if (dCenter < threshold) {
-    circleDragMode = "center";
-  } else if (Math.abs(dCenter - fittedCircle.radius) < threshold) {
-    circleDragMode = "radius";
+    addRemoveSamplePointAt(cp, hit);
+  } else if (interaction === "rectangle" || interaction === "circle") {
+    cutAnchor = cp; cutPreview = cp; cutDragging = true;
+  } else if (interaction === "polygon") {
+    polyDraft.push(cp);
+    renderAll();
   }
 });
+orthoCanvas.addEventListener("dblclick", finishPolygonDraft);
 orthoCanvas.addEventListener("mousemove", function (e) {
   const p = getCanvasPoint(orthoCanvas, e);
   const cp = [p[0] / orthoScale, p[1] / orthoScale];
-  if (editDragTarget) {
-    editDragTarget.onDrag(cp);
+  if (activeDrag) {
+    if (activeDrag.kind === "shape") {
+      activeDrag.handle.onDrag(cp);
+      renderAll();
+    } else if (activeDrag.kind === "extreme") {
+      if (homography) { extremePointsCamera[activeDrag.index] = toPixel(cp); renderAll(); }
+    } else if (activeDrag.kind === "sample") {
+      sampleOverrides[activeDrag.index] = cp;
+      renderAll();
+    } else if (activeDrag.kind === "sampleGroup") {
+      const dx = cp[0] - activeDrag.anchorCanonical[0], dy = cp[1] - activeDrag.anchorCanonical[1];
+      activeDrag.indices.forEach(function (idx, k) {
+        sampleOverrides[idx] = [activeDrag.originals[k][0] + dx, activeDrag.originals[k][1] + dy];
+      });
+      renderAll();
+    }
+  } else if (cutDragging) {
+    cutPreview = cp;
     renderAll();
-    return;
+  } else if (activeInteraction() === "polygon" && polyDraft.length > 0) {
+    polyHoverCanonical = cp;
+    renderAll();
   }
-  if (!circleDragMode) return;
-  if (circleDragMode === "center") {
-    fittedCircle.center = cp;
-  } else {
-    fittedCircle.radius = Math.hypot(cp[0] - fittedCircle.center[0], cp[1] - fittedCircle.center[1]);
-  }
-  renderAll();
 });
 window.addEventListener("mouseup", function () {
-  draggingCornerIndex = null;
-  circleDragMode = null;
-  editDragTarget = null;
+  const endedDrag = activeDrag;
+  activeDrag = null;
+  // A plain click (no real drag) on a single sample point toggles its SELECTION -- the same
+  // membership-toggle the box-select drag below already does, just for one point at a time
+  // by clicking it directly instead of having to drag a box around it ("i just want to be
+  // able to select the points...by just clicking on them nothing more to add"). A real drag
+  // (movement over the threshold) is unaffected and still just moves the point -- this only
+  // fires when nothing actually moved.
+  if (endedDrag && endedDrag.kind === "sample" && endedDrag.startCanonical) {
+    const current = sampleOverrides[endedDrag.index] || endedDrag.startCanonical;
+    if (Math.hypot(current[0] - endedDrag.startCanonical[0], current[1] - endedDrag.startCanonical[1]) < 2) {
+      const pos = orientationSelectedIndices.indexOf(endedDrag.index);
+      if (pos === -1) orientationSelectedIndices.push(endedDrag.index);
+      else orientationSelectedIndices.splice(pos, 1);
+      populateOrientationInputsFrom(
+        orientationSelectedIndices.length > 0
+          ? (orientationOverrides[orientationSelectedIndices[0]] || currentDefaultOrientationSettings())
+          : currentDefaultOrientationSettings()
+      );
+      renderAll();
+    }
+  }
   if (cutDragging && cutAnchor && cutPreview) {
     const interaction = activeInteraction();
+    recordUndo();
     if (interaction === "rectangle") {
       cutShapesCanonical.push({ type: "rectangle", corners: rectangleVertices(cutAnchor, cutPreview) });
     } else if (interaction === "circle") {
       const r = Math.hypot(cutPreview[0] - cutAnchor[0], cutPreview[1] - cutAnchor[1]);
       cutShapesCanonical.push({ type: "circle", center: cutAnchor, radius: r });
+    } else if (interaction === "select") {
+      const xLo = Math.min(cutAnchor[0], cutPreview[0]), xHi = Math.max(cutAnchor[0], cutPreview[0]);
+      const yLo = Math.min(cutAnchor[1], cutPreview[1]), yHi = Math.max(cutAnchor[1], cutPreview[1]);
+      if (xHi - xLo < 2 && yHi - yLo < 2) {
+        // A plain click (no real drag) on empty space just DESELECTS -- it must NOT also
+        // clear overrides. An earlier version did clear them here too (so the yellow rings
+        // wouldn't linger), but that made clicking away from a selection silently destroy
+        // whatever direction config was just dialed in for those points -- reported directly
+        // ("whenever i select some points to edit their direction config it doesnt get
+        // saved... it just goes back to the general config" the moment you click elsewhere).
+        // Deselecting is supposed to be a safe, reversible action; only the explicit "Reset
+        // to default" button actually deletes override data now.
+        orientationSelectedIndices = [];
+        populateOrientationInputsFrom(currentDefaultOrientationSettings());
+        cutDragging = false; cutAnchor = null; cutPreview = null;
+        renderAll();
+        return;
+      }
+      // Toggle each enclosed point's SELECTION (not its override) -- the panel below is now
+      // an inspector bound to this selection, so further edits to count/method/angles/etc.
+      // apply only to these points, leaving everything else untouched. See
+      // orientationSelectedIndices' own comment for why this replaced "stamp on drag."
+      samplePointsCanonical.forEach(function (p, i) {
+        if (p[0] >= xLo && p[0] <= xHi && p[1] >= yLo && p[1] <= yHi) {
+          const pos = orientationSelectedIndices.indexOf(i);
+          if (pos === -1) orientationSelectedIndices.push(i);
+          else orientationSelectedIndices.splice(pos, 1);
+        }
+      });
+      populateOrientationInputsFrom(
+        orientationSelectedIndices.length > 0
+          ? (orientationOverrides[orientationSelectedIndices[0]] || currentDefaultOrientationSettings())
+          : currentDefaultOrientationSettings()
+      );
     }
     cutDragging = false; cutAnchor = null; cutPreview = null;
     renderAll();
@@ -1738,24 +3469,58 @@ window.addEventListener("mouseup", function () {
 });
 
 fitCircleBtn.addEventListener("click", function () {
-  if (extremePointsCanonical.length < 3) return;
+  if (extremePointsCanonical.length < 3 || circleLocked) return;
+  recordUndo();
   fittedCircle = fitCircleLeastSquares(extremePointsCanonical);
   renderAll();
 });
 clearExtremeBtn.addEventListener("click", function () {
+  recordUndo();
   extremePointsCamera = [];
   fittedCircle = null;
   fitCircleBtn.disabled = true;
   renderAll();
 });
 gridToggle.addEventListener("change", renderAll);
-stepsInput.addEventListener("input", renderAll);
-seedInput.addEventListener("input", renderAll);
-distributionSelect.addEventListener("change", renderAll);
+// steps/seed/distribution change the generated point set's size or its underlying algorithm,
+// so an index-keyed manual override could otherwise silently misapply to an unrelated point
+// (see the sampleOverrides declaration above) -- clear it here, but NOT on borderWidthInput,
+// which is treated as continuous fine-tuning an override should survive. Not undo-tracked,
+// for the same reason no other plain form-field change is (see the undo/redo scoping note).
+stepsInput.addEventListener("input", function () { sampleOverrides = {}; orientationOverrides = {}; removedSampleIndices = []; orientationSelectedIndices = []; populateOrientationInputsFrom(currentDefaultOrientationSettings()); renderAll(); });
+seedInput.addEventListener("input", function () { sampleOverrides = {}; orientationOverrides = {}; removedSampleIndices = []; orientationSelectedIndices = []; populateOrientationInputsFrom(currentDefaultOrientationSettings()); renderAll(); });
+distributionSelect.addEventListener("change", function () { sampleOverrides = {}; orientationOverrides = {}; removedSampleIndices = []; orientationSelectedIndices = []; populateOrientationInputsFrom(currentDefaultOrientationSettings()); renderAll(); });
+countModeSelect.addEventListener("change", function () { sampleOverrides = {}; orientationOverrides = {}; removedSampleIndices = []; orientationSelectedIndices = []; populateOrientationInputsFrom(currentDefaultOrientationSettings()); renderAll(); });
 borderWidthInput.addEventListener("input", renderAll);
+// Orientation fields never affect the POSITION sample set's size/algorithm (only steps/seed/
+// distribution do, above), so none of these need to clear sampleOverrides.
+orientationToggle.addEventListener("change", renderAll);
+orientationCountInput.addEventListener("input", renderAll);
+orientationMethodSelect.addEventListener("change", renderAll);
+orientationInitialAngleInput.addEventListener("input", renderAll);
+orientationAngleStartInput.addEventListener("input", renderAll);
+orientationAngleEndInput.addEventListener("input", renderAll);
+orientationSeedInput.addEventListener("input", renderAll);
+orientationArrowLengthInput.addEventListener("input", renderAll);
+resetOrientationBtn.addEventListener("click", function () {
+  // Selected points: clear just their own override, reverting to the default. Nothing
+  // selected: clear every override -- the only bulk "start over" action, now that a plain
+  // click with the box-select tool means "deselect" (not "delete"), not the other way round.
+  // Must ALSO clear the selection: syncActiveArmFromGlobals() re-stamps every selected
+  // point's override from the live panel fields on every render, so leaving the just-reset
+  // points selected would silently recreate the override on the very next renderAll().
+  const targets = orientationSelectedIndices.length > 0 ? orientationSelectedIndices : Object.keys(orientationOverrides).map(Number);
+  targets.forEach(function (idx) { delete orientationOverrides[idx]; });
+  orientationSelectedIndices = [];
+  populateOrientationInputsFrom(currentDefaultOrientationSettings());
+  renderAll();
+});
 
-updateModeUI();
+loadActiveArmIntoGlobals(); // seeds armNameInput/armColorInput (and steps/seed/etc, redundant
+                            // with their HTML defaults but harmless) from arms[0]
 updateToolUI();
+updateUndoRedoUI();
+renderArmChips();
 renderAll();
 </script>
 </body>
