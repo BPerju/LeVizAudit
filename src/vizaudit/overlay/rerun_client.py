@@ -5,9 +5,25 @@ Filesystem/dataset-facing code does not belong here — see dataset_watcher.py f
 
 from __future__ import annotations
 
+import math
+
 import rerun as rr
 
 from vizaudit.overlay.config import MarkerConfig
+
+Point = tuple[float, float]
+
+# Mirrors the calibration tool's OBJECT_STACK_FAN_RADIUS/stackOffsetPosition exactly (see
+# calibrate.js) so a stacked marker's visual layout in the live overlay matches what the
+# operator already previewed while authoring the config.
+STACK_FAN_RADIUS = 7.0
+
+
+def _stack_offset_position(point: Point, level: int, stack_size: int) -> Point:
+    if stack_size <= 1:
+        return point
+    angle = 2 * math.pi * level / stack_size
+    return (point[0] + STACK_FAN_RADIUS * math.cos(angle), point[1] + STACK_FAN_RADIUS * math.sin(angle))
 
 # Rerun's actual recording identity is the (application_id, recording_id) PAIR, not
 # recording_id alone -- empirically verified via the dataframe API (`rr.dataframe.
@@ -48,36 +64,69 @@ def log_target(
     object_name: str,
     marker: MarkerConfig,
     orientation_tip: tuple[float, float] | None = None,
+    level: int = 0,
+    stack_size: int = 1,
 ) -> None:
     """Logs a target marker as a child entity of the live camera image entity, so Rerun's
     Spatial2D view composites it directly on top of the feed.
 
     Re-logging to the same path (one fixed path per object) replaces the prior marker in
-    the viewer's current-time view, so no `rr.Clear` is needed here.
+    the viewer's current-time view, so no `rr.Clear` is needed here -- see `clear_target` for
+    the one case that does need it (an object not active this episode, under
+    `OverlayConfig.episode_targets == "one"`).
+
+    ``level``/``stack_size`` (default ``0``/``1``, today's exact behavior -- a lone marker
+    with no offset or badge) describe this object's place in a STACK of objects sharing one
+    point this episode -- always derived from 2+ objects' patterns landing on the same point
+    (`co_location: "stack"`), including a `"keep_apart"` residual collision that couldn't be
+    avoided; session.py decides which objects are involved, this function only renders the
+    result. When ``stack_size > 1``, the marker is fanned out by ``level`` around ``point``
+    (see `_stack_offset_position`, mirroring the calibration tool's tower-legend anchor point
+    exactly) so stacked markers are visually distinguishable, and the level is appended to its
+    label.
 
     ``orientation_tip``, if given, draws an arrow from ``point`` to it as a separate child
     entity -- the already-projected orientation guide (see
     ``pattern.orientation_arrow_points``, which does the homography-aware projection; this
-    function only logs the two points it's handed, with no perspective math of its own).
-    Whether an object has an orientation arrow at all is fixed for the whole session (set by
-    its config, not toggled per episode), so there's no need to ever clear a stale one here.
+    function only logs the two points it's handed, with no perspective math of its own). The
+    arrow is translated by the same fan offset as its marker, so it stays visually anchored
+    to it. Whether an object has an orientation arrow at all is fixed for the whole session
+    (set by its config, not toggled per episode), so there's no need to ever clear a stale one
+    here.
     """
     path = f"{camera_key}/target/{object_name}"
+    display_point = _stack_offset_position(point, level, stack_size)
+    label = f"{object_name} L{level}" if stack_size > 1 else object_name
     rr.log(
         path,
         rr.Points2D(
-            positions=[point],
+            positions=[display_point],
             radii=marker.radius_px,
             colors=[marker.color_rgba],
-            labels=[object_name] if marker.label else None,
+            labels=[label] if marker.label else None,
         ),
     )
     if orientation_tip is not None:
+        vector = (orientation_tip[0] - point[0], orientation_tip[1] - point[1])
         rr.log(
             f"{path}/orientation",
             rr.Arrows2D(
-                origins=[point],
-                vectors=[(orientation_tip[0] - point[0], orientation_tip[1] - point[1])],
+                origins=[display_point],
+                vectors=[vector],
                 colors=[marker.color_rgba],
             ),
         )
+
+
+def clear_target(camera_key: str, object_name: str) -> None:
+    """Removes a previously-logged target marker (and its orientation arrow, if any).
+
+    Re-logging to the same path normally replaces stale data for free (see `log_target`'s
+    docstring) -- but an object not in this episode's active SITE (under
+    `OverlayConfig.episode_targets == "one"` -- session.py's `show_targets` picks exactly one
+    of this episode's coincidence-grouped sites to show, see CLAUDE.md) has nothing new to log
+    at all, so skipping the call entirely would leave the PREVIOUS episode's marker visibly
+    stuck on screen instead of disappearing.
+    """
+    path = f"{camera_key}/target/{object_name}"
+    rr.log(path, rr.Clear(recursive=True))

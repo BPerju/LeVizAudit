@@ -1,0 +1,4494 @@
+// VizAudit calibration page logic -- extracted from calibrate.html (see calibrate.css for
+// the extracted styles) so this ~3000-line file can be edited on its own. One classic script,
+// not ES modules -- keeps the existing flat shared-scope design intact (every function/const
+// below is reachable from every other one, the same as when this lived inline), which is also
+// what lets a Node harness run this file's body directly in one scope to test it.
+//
+// Section index (grep the exact banner text to jump to one):
+//   "── Camera setup ──"                   getUserMedia device list + live video element
+//   "── State (source of truth..."         the one mutable `tool`/lock/corner state every
+//                                           other section reads
+//   "── Arms (bimanual support) ──"        per-arm reach-circle calibration + combined/
+//                                           independent (union) sampling mode
+//   "── Objects (multi-object scenes) ──"  named objects assigned onto sample points, stacking
+//                                           (level), per-object rotation, episode stepper
+//   "── Undo/redo ──"                      geometry-only snapshot/restore stack
+//   "── Math: ported from..."              homography, circle fit, RNG -- pure functions
+//                                           ported from perspective.py/pattern.py
+//   "── Hit-testing..."                    shared mousedown hit-tests for both canvases
+//   "── Zone-aware structural fixes..."     exclude_zones-aware grid/radial density helpers
+//   "── Derived state, recomputed..."       renderAll() and the per-render derived globals
+//   "── Rendering ──"                      camera-view/ortho-view canvas drawing
+//   "── Export ──"                         YAML config-snippet generation
+//   "── Save ──"                           POST /save + fallback download
+//   "── Interaction ──"                    tool switching + mouse/keyboard event wiring
+
+// ── Camera setup ─────────────────────────────────────────────────────────
+const video = document.getElementById("video");
+const cameraCanvas = document.getElementById("cameraCanvas");
+const orthoCanvas = document.getElementById("orthoCanvas");
+const deviceSelect = document.getElementById("deviceSelect");
+const startBtn = document.getElementById("startBtn");
+const armChips = document.getElementById("armChips");
+const armColorInput = document.getElementById("armColorInput");
+const armNameInput = document.getElementById("armNameInput");
+const addArmBtn = document.getElementById("addArmBtn");
+const removeArmBtn = document.getElementById("removeArmBtn");
+const independentToggle = document.getElementById("independentToggle");
+const patternPreviewLabel = document.getElementById("patternPreviewLabel");
+const objectChips = document.getElementById("objectChips");
+const objectColorInput = document.getElementById("objectColorInput");
+const objectNameInput = document.getElementById("objectNameInput");
+const addObjectBtn = document.getElementById("addObjectBtn");
+const removeObjectBtn = document.getElementById("removeObjectBtn");
+const assignSelectedBtn = document.getElementById("assignSelectedBtn");
+const unassignSelectedBtn = document.getElementById("unassignSelectedBtn");
+const objectSequencingSelect = document.getElementById("objectSequencingSelect");
+const objectSeedInput = document.getElementById("objectSeedInput");
+const episodeTargetsSelect = document.getElementById("episodeTargetsSelect");
+const combinationCountInput = document.getElementById("combinationCountInput");
+const combinationModeSelect = document.getElementById("combinationModeSelect");
+const combinationSeedInput = document.getElementById("combinationSeedInput");
+const coLocationSelect = document.getElementById("coLocationSelect");
+const stackLevelStrategySelect = document.getElementById("stackLevelStrategySelect");
+const stackLevelSeedInput = document.getElementById("stackLevelSeedInput");
+const collisionWarning = document.getElementById("collisionWarning");
+const sampleCountLabel = document.getElementById("sampleCountLabel");
+const previewModeSelect = document.getElementById("previewModeSelect");
+const episodeStepper = document.getElementById("episodeStepper");
+const episodePrevBtn = document.getElementById("episodePrevBtn");
+const episodeNextBtn = document.getElementById("episodeNextBtn");
+const episodePlayBtn = document.getElementById("episodePlayBtn");
+const episodeLabel = document.getElementById("episodeLabel");
+const toolExtreme = document.getElementById("toolExtreme");
+const toolCorners = document.getElementById("toolCorners");
+const toolSelect = document.getElementById("toolSelect");
+const toolAddRemovePoint = document.getElementById("toolAddRemovePoint");
+const lockCornersBtn = document.getElementById("lockCornersBtn");
+const resetCornersBtn = document.getElementById("resetCornersBtn");
+const fitCircleBtn = document.getElementById("fitCircleBtn");
+const lockCircleBtn = document.getElementById("lockCircleBtn");
+const lockPatternBtn = document.getElementById("lockPatternBtn");
+const clearExtremeBtn = document.getElementById("clearExtremeBtn");
+const toolRect = document.getElementById("toolRect");
+const toolCircle = document.getElementById("toolCircle");
+const toolPolygon = document.getElementById("toolPolygon");
+const clearCutsBtn = document.getElementById("clearCutsBtn");
+const floatingToolbarTools = document.getElementById("floatingToolbarTools");
+const toolbarToggleBtn = document.getElementById("toolbarToggleBtn");
+const undoBtn = document.getElementById("undoBtn");
+const redoBtn = document.getElementById("redoBtn");
+const gridToggle = document.getElementById("gridToggle");
+const stepsInput = document.getElementById("stepsInput");
+const seedInput = document.getElementById("seedInput");
+const distributionSelect = document.getElementById("distributionSelect");
+const distributionRadialOption = document.getElementById("distributionRadialOption");
+const borderWidthInput = document.getElementById("borderWidthInput");
+const countModeSelect = document.getElementById("countModeSelect");
+const actualCountLabel = document.getElementById("actualCountLabel");
+const countModeVariableOption = document.getElementById("countModeVariableOption");
+const orientationPreviewLabel = document.getElementById("orientationPreviewLabel");
+const orientationToggle = document.getElementById("orientationToggle");
+const orientationCountInput = document.getElementById("orientationCountInput");
+const orientationMethodSelect = document.getElementById("orientationMethodSelect");
+const orientationInitialAngleInput = document.getElementById("orientationInitialAngleInput");
+const orientationAngleStartInput = document.getElementById("orientationAngleStartInput");
+const orientationAngleEndInput = document.getElementById("orientationAngleEndInput");
+const orientationSeedInput = document.getElementById("orientationSeedInput");
+const orientationArrowLengthInput = document.getElementById("orientationArrowLengthInput");
+const resetOrientationBtn = document.getElementById("resetOrientationBtn");
+const orientationDetailFields = document.getElementById("orientationDetailFields");
+const armColorLegend = document.getElementById("armColorLegend");
+const yamlOut = document.getElementById("yamlOut");
+const saveConfigBtn = document.getElementById("saveConfigBtn");
+const saveStatus = document.getElementById("saveStatus");
+
+let currentStream = null;
+
+async function listDevices() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const videoInputs = devices.filter(function (d) { return d.kind === "videoinput"; });
+  deviceSelect.innerHTML = "";
+  videoInputs.forEach(function (d, i) {
+    const opt = document.createElement("option");
+    opt.value = d.deviceId;
+    opt.textContent = d.label || ("Camera " + (i + 1));
+    deviceSelect.appendChild(opt);
+  });
+}
+
+async function startCamera() {
+  if (currentStream) {
+    currentStream.getTracks().forEach(function (t) { t.stop(); });
+  }
+  const deviceId = deviceSelect.value;
+  const constraints = { video: deviceId ? { deviceId: { exact: deviceId } } : true };
+  currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+  video.srcObject = currentStream;
+  await listDevices();
+}
+
+startBtn.addEventListener("click", function () {
+  startCamera().catch(function (err) {
+    alert("Could not access camera: " + err.message);
+  });
+});
+
+video.addEventListener("loadedmetadata", function () {
+  cameraCanvas.width = video.videoWidth;
+  cameraCanvas.height = video.videoHeight;
+  if (cameraCorners.length === 0) {
+    resetCorners();
+  }
+  renderAll();
+});
+
+window.addEventListener("resize", function () { renderAll(); });
+
+listDevices();
+// Request camera permission proactively on load, rather than waiting for the operator to
+// find and click "Start camera" first. If this is denied or there's no camera yet, the
+// button below still works as a manual retry (e.g. after granting permission in the
+// browser's UI, or after plugging in a camera).
+startCamera().catch(function (err) {
+  console.warn("Camera not started automatically on load:", err.message);
+});
+
+// ── State (source of truth; everything else is derived in renderAll()) ───
+// One mutually-exclusive radio-button state for every interaction mode -- "corners" |
+// "extreme" | "select" | "addRemovePoint" | "rectangle" | "circle" | "polygon".
+//
+// "corners" is Workspace setup's own tool: corners, edges, the active arm's fitted reach
+// circle, and reach points -- everything involved in calibrating the workspace/reach, and
+// ONLY reachable through this tool (requested explicitly: "reach circles and points should
+// be editable from the setup tab edit tool only"). The default tool, since it's the first
+// thing a new session needs.
+//
+// "select" (floating toolbar) merges what used to be THREE separate tools -- cuts-only
+// "edit", "samples" (drag one point), and an orientation-only box-select -- into one, since
+// none of their hit-tests actually collide (cuts vs. sample points are different geometry
+// entirely): click/drag a cut's handle to reshape it, click its body (no handle nearby) to
+// select it for Delete/Backspace; drag a box over empty space to select sample points (the
+// Rotation panel then edits just the selection, and Delete/Backspace removes them); drag any
+// single sample point to move it, or -- if MULTIPLE points are selected -- drag any one of
+// them to move the whole selection together. One gesture set, not three tools for what's
+// fundamentally "operate on this view's editable things."
+let tool = "corners";
+let selectedCutIndex = -1; // which cutShapesCanonical entry is selected (via the "select"
+                            // tool clicking a cut's body) for Delete/Backspace -- -1 = none.
+let cornersLocked = false; // independent of `tool` -- suppresses corner/edge-drag only, in
+                            // EVERY tool ("the grid" only -- circle/cuts/extreme/samples are
+                            // never affected by this flag, requested explicitly).
+let circleLocked = false; // suppresses dragging the ACTIVE arm's fitted reach circle once
+                           // it's been generated -- cut-shape circles are a different thing
+                           // entirely and stay editable regardless of this flag.
+let patternLocked = false; // disables the Pattern card's inputs so they can't be bumped by
+                            // accident once a pattern's been dialed in.
+let cameraCorners = []; // 4 [x,y] points, camera/video pixel space -- shared by every arm,
+                         // since a bimanual setup's two arms still sit in the SAME camera
+                         // frame, with one homography for the whole tool (see the "Arms"
+                         // section below for what IS per-arm).
+
+// ── Arms (bimanual support) ──────────────────────────────────────────────────────────────
+// One "arm" = one independently-calibrated reach circle: its own extreme-reach points, fitted
+// circle, sample-point overrides, and pattern-preview settings (steps/seed/distribution/
+// border width) -- everything that's naturally tied to a SPECIFIC physical arm's own reach,
+// as opposed to cameraCorners/cutShapesCanonical above, which describe the shared camera
+// frame and its obstacles and stay global regardless of arm count. A single-arm setup is just
+// `arms.length === 1` -- nothing else in the tool changes shape for that common case, and the
+// very first arm keeps the tool's original default name/color so an existing single-arm
+// workflow looks identical to before this feature existed.
+//
+// `extremePointsCamera`/`fittedCircle`/`sampleOverrides` below stay as plain top-level
+// variables holding the ACTIVE arm's live, in-progress state -- every existing function in
+// this file (sampleSectorPoints, the edit/sample hit-testers, the drag handlers, etc.) already
+// reads/mutates them directly, and rewriting all of those to thread an explicit "current arm"
+// parameter through would be a much bigger, riskier change for the same result. Instead,
+// `syncActiveArmFromGlobals()`/`loadActiveArmIntoGlobals()` copy between these live globals
+// and `arms[activeArmIndex]` at the points that matter (switching arms, snapshotting for
+// undo/redo, rendering) -- so only a handful of call sites need to know "arms" exist at all.
+const ARM_PALETTE = ["#34d399", "#f59e0b", "#a78bfa", "#fb7185", "#60a5fa", "#facc15", "#2dd4bf", "#f472b6"];
+
+function makeArm(name, color) {
+  return {
+    name: name,
+    color: color,
+    extremePointsCamera: [],
+    fittedCircle: null,
+    sampleOverrides: {},
+    orientationOverrides: {}, // per-point full orientation-config snapshots, keyed by sample
+                                // index -- set/cleared via the box-select tool
+    extraSamplePoints: [], // manually added points (canonical), appended after generation
+    removedSampleIndices: [], // generated-point indices manually removed
+    steps: 20,
+    seed: 0,
+    distribution: "grid",
+    borderWidth: 0,
+    countMode: "fixed",
+    // Orientation guide arrow -- mirrors config.py's OrientationConfig defaults exactly
+    // (count required there; defaulted to 1 here purely as a UI starting value, same role
+    // every other default in this object plays). See generateRotationAngles/
+    // orientationTipCanonical below for what these drive.
+    orientationEnabled: false,
+    orientationCount: 1,
+    orientationMethod: "uniform",
+    orientationAngleStart: 0,
+    orientationAngleEnd: 360,
+    orientationSeed: 0,
+    orientationArrowLength: 40,
+    orientationInitialAngle: 0,
+  };
+}
+
+let arms = [makeArm("Arm 1", ARM_PALETTE[0])];
+let activeArmIndex = 0;
+
+// Independent (off by default) controls how MULTIPLE arms' circles combine for sampling --
+// not whether each arm's own circle/extreme-points are independently calibrated, which they
+// always are (you still pick the active arm via the chips and mark/fit its own points either
+// way). OFF (default, "combined"): every arm's fitted circle is sampled as one shared UNION
+// region (generate_union_points/sampleUnionPoints) -- the point of this whole toggle: two
+// arms' reach circles in a real bimanual rig typically OVERLAP in the middle of the shared
+// workspace, and sampling each circle's pattern independently would sample that overlap at
+// roughly DOUBLE the density of the non-overlapping parts (each circle's own pattern adds
+// points there, unaware the other circle already covers it) -- see CLAUDE.md. ON:
+// today's original per-arm behavior, each arm's own independent pattern -- appropriate when
+// arms work in genuinely separate, non-overlapping zones and you want N independent patterns,
+// not one shared one. With only 1 arm, the two modes sample identically (a "union" of one
+// circle IS that circle) but render DIFFERENTLY -- combined mode draws every sample dot in a
+// neutral color since no single arm owns the result, which looks wrong once there's only one
+// arm to begin with (reported directly) -- so `independent` is forced true whenever
+// `arms.length === 1` (see updateIndependentAvailability). `independentUserPreference` is
+// the actual last value the user chose via the checkbox, kept separate so a forced `true`
+// while at 1 arm doesn't get mistaken for the user's real preference and leak forward once a
+// 2nd arm is added back -- adding a 2nd arm restores whatever combined/independent choice
+// was in effect before, rather than always landing on "independent" just because it
+// happened to be the effective value at 1 arm.
+let independent = false;
+let independentUserPreference = false;
+
+// The steps/seed/distribution/borderWidth/sampleOverrides an arm's own fields (in `arms[i]`)
+// hold are only actually USED when `independent` is true. When false, this single shared
+// object is used instead -- the "Pattern preview" fields apply to the combined pattern as a
+// whole, not to whichever arm happens to be active. `extremePointsCamera`/`fittedCircle`
+// stay per-arm regardless of `independent`, since calibrating EACH arm's own circle is always
+// a per-arm action.
+let combinedSettings = {
+  steps: 20, seed: 0, distribution: "grid", borderWidth: 0, sampleOverrides: {}, countMode: "fixed",
+  orientationOverrides: {}, extraSamplePoints: [], removedSampleIndices: [],
+  orientationEnabled: false, orientationCount: 1, orientationMethod: "uniform",
+  orientationAngleStart: 0, orientationAngleEnd: 360, orientationSeed: 0, orientationArrowLength: 40,
+  orientationInitialAngle: 0,
+};
+
+let extremePointsCamera = arms[0].extremePointsCamera; // pixel space; added via "extreme", repositioned via "corners"
+let fittedCircle = arms[0].fittedCircle; // {center:[x,y], radius} in CANONICAL space -- sticky, manual-editable
+
+// Cut shapes are stored in CANONICAL space (exactly like fittedCircle), not pixel space --
+// this is what makes them "follow the surface" when corners are twisted: their rendered
+// pixel position is forward-mapped through the CURRENT homography every render, just like
+// the fitted circle already was, instead of staying pinned to a fixed pixel location that
+// silently drifts out of sync with the workspace once the corners move. It's also what
+// fixes the orthographic view showing samples inside cuts: validity checks now compare
+// candidates directly against these canonical shapes, with no separate pixel<->canonical
+// conversion step that could fall out of sync.
+//
+// Each shape keeps its own type (not flattened to a generic polygon) so editing respects
+// its natural degrees of freedom -- dragging one of a circle's many vertices was fiddly and
+// pointless; a circle should just have a center + radius handle.
+// type: "circle" {center, radius} | "rectangle" {corners: [4 pts]} | "polygon" {vertices}
+let cutShapesCanonical = [];
+
+// Manual per-index overrides for the generated sample-point preview, in CANONICAL space --
+// applied on top of sampleSectorPoints()'s output in renderAll(), keyed by array index. Lets
+// an operator nudge one generated point by hand (the "Move sample points" tool) without
+// touching the circle/cuts/distribution that produced the rest. Cleared whenever steps/seed/
+// distribution change (the index<->point correspondence is only meaningful for a fixed
+// algorithm+count; a different count or distribution is a conceptually different point set,
+// so a stale override would silently misapply to an unrelated point), but NOT on border-width
+// changes, which -- like a circle/corner edit -- are treated as continuous fine-tuning that a
+// manual override should survive. Per-arm, same as fittedCircle.
+let sampleOverrides = arms[0].sampleOverrides;
+let orientationOverrides = arms[0].orientationOverrides;
+let extraSamplePoints = arms[0].extraSamplePoints;
+let removedSampleIndices = arms[0].removedSampleIndices;
+// Which sample-point indices the box-select tool currently has selected -- an "inspector
+// panel" pattern (Figma/Blender-style): the orientation toolbar fields always edit whatever
+// this selection contains, falling back to the shared default settings when empty, instead
+// of always writing to the default while a separate stamp action wrote a frozen snapshot at
+// drag time. The earlier "stamp on drag" design had edits to the toolbar AFTER selecting
+// silently affect only the UNSELECTED points (since selected ones already had a frozen
+// snapshot) -- exactly backwards from what a user expects when they select something and
+// then change a setting. Transient UI state, not undo-tracked (like `tool`/`activeArmIndex`)
+// and not per-arm -- cleared whenever the active point set changes meaning (arm/independent
+// switch, or steps/seed/distribution/countMode edits, same triggers that already clear
+// orientationOverrides).
+let orientationSelectedIndices = [];
+let sampleOrigins = []; // recomputed each renderAll: per final samplePointsCanonical index,
+                          // {kind:"base",baseIndex} | {kind:"extra",extraIndex} -- lets the
+                          // add/remove tool know what a clicked point actually is.
+
+// activeDrag describes whatever's being dragged across a mousedown/mousemove/mouseup gesture,
+// for BOTH canvases uniformly: {kind: "corner"|"edge"|"extreme"|"shape"|"sample", index?, handle?}.
+// "shape" covers both the fitted circle and any cut -- circleHandles()/getCutHandles() already
+// return the identical {point, onDrag} shape, so one drag path handles both without caring
+// which it is.
+let activeDrag = null;
+// Cut-drawing and extreme-point-marking ("rectangle"/"circle"/"polygon"/"extreme" tools) work
+// identically starting from EITHER canvas -- cutAnchor/cutPreview/polyDraft are already
+// canonical, so the camera view forward-maps them through the homography to draw/hit-test,
+// while the orthographic view uses them directly with no conversion at all. A single drag
+// gesture (mousedown..mouseup) stays on whichever canvas it started on, same as any native
+// browser drag.
+let cutAnchor = null, cutPreview = null, cutDragging = false; // rectangle/circle cut creation (canonical)
+let polyDraft = []; // in-progress cut polygon vertices (canonical)
+let polyHoverCanonical = null; // current pointer pos in canonical space, for the polygon-draft rubber-band line
+
+// Copies the live globals into arms[activeArmIndex] (always, for extremePointsCamera/
+// fittedCircle) and into whichever settings target is currently live for steps/seed/
+// distribution/borderWidth/sampleOverrides -- arms[activeArmIndex] itself when `independent`,
+// or the single shared `combinedSettings` otherwise. Called before anything reads `arms`/
+// `combinedSettings` directly (switching away, snapshotting for undo, rendering/exporting),
+// so neither is ever more than one editing gesture stale. Cheap reference copies, not deep
+// clones -- in-place mutations (e.g. dragging fittedCircle.center) stay visible through
+// arms[activeArmIndex] automatically between syncs, since both names point at the same
+// object until the next loadActiveArmIntoGlobals() swaps the globals to a different target.
+// With exactly 1 arm, "Independent" must be a no-op (a union of 1 circle IS that circle) --
+// but `arm` and `combinedSettings` are still two separate objects, so without this they'd
+// silently drift apart (whichever wasn't the live target kept stale/default values), making
+// toggling "Independent" appear to change the config for no reason.
+const SETTINGS_FIELDS = [
+  "sampleOverrides", "orientationOverrides", "extraSamplePoints", "removedSampleIndices",
+  "steps", "seed", "distribution", "borderWidth",
+  "countMode", "orientationEnabled", "orientationCount", "orientationMethod",
+  "orientationAngleStart", "orientationAngleEnd", "orientationSeed", "orientationArrowLength",
+  "orientationInitialAngle",
+];
+
+// The single source of truth for "what do the 8 orientation fields currently show" --
+// shared by the default-settings write path, the per-point override write path, and (in
+// the other direction) populateOrientationInputsFrom's caller.
+function captureOrientationInputsAsConfig() {
+  return {
+    orientationEnabled: orientationToggle.checked,
+    orientationCount: Math.max(1, parseInt(orientationCountInput.value) || 1),
+    orientationMethod: orientationMethodSelect.value,
+    orientationAngleStart: parseFloat(orientationAngleStartInput.value) || 0,
+    orientationAngleEnd: parseFloat(orientationAngleEndInput.value) || 0,
+    orientationSeed: parseInt(orientationSeedInput.value) || 0,
+    orientationArrowLength: Math.max(0.01, parseFloat(orientationArrowLengthInput.value) || 40),
+    orientationInitialAngle: parseFloat(orientationInitialAngleInput.value) || 0,
+  };
+}
+
+function populateOrientationInputsFrom(cfg) {
+  orientationToggle.checked = !!cfg.orientationEnabled;
+  orientationCountInput.value = String(cfg.orientationCount || 1);
+  orientationMethodSelect.value = cfg.orientationMethod || "uniform";
+  orientationAngleStartInput.value = String(cfg.orientationAngleStart || 0);
+  orientationAngleEndInput.value = String(cfg.orientationAngleEnd === undefined ? 360 : cfg.orientationAngleEnd);
+  orientationSeedInput.value = String(cfg.orientationSeed || 0);
+  orientationArrowLengthInput.value = String(cfg.orientationArrowLength || 40);
+  orientationInitialAngleInput.value = String(cfg.orientationInitialAngle || 0);
+}
+
+// Whatever the Rotation card/box-select-override machinery currently edits -- the active
+// OBJECT (see the "Objects" section below) if any object has been defined, else the same
+// arm/combinedSettings target this returned before objects existed. Objects own their own
+// orientation* fields/orientationOverrides (same field names as an arm, see makeObject), so
+// every existing reader of this function (captureOrientationInputsAsConfig's write targets,
+// populateOrientationInputsFrom's read source, the box-select mouseup handlers) keeps working
+// unmodified -- only WHICH object those fields live on changes.
+function currentDefaultOrientationSettings() {
+  if (objects.length > 0 && activeObjectIndex >= 0) return objects[activeObjectIndex];
+  return independent ? arms[activeArmIndex] : combinedSettings;
+}
+
+// The inverse direction of the sync below, for orientation alone: repoints the live
+// orientationOverrides global and the Rotation card's form fields at whatever
+// currentDefaultOrientationSettings() now resolves to. Factored out of
+// loadActiveArmIntoGlobals() so switching the ACTIVE OBJECT (which never changes the active
+// arm) can trigger the identical refresh without duplicating these lines.
+function orientationPreviewLabelText() {
+  if (objects.length > 0) {
+    return "Rotation (" + (activeObjectIndex >= 0 ? objects[activeObjectIndex].name : "no object") + ")";
+  }
+  return "Rotation" + (arms.length > 1 ? " (" + (independent ? "active arm" : "combined") + ")" : "");
+}
+
+function loadOrientationTargetIntoGlobals() {
+  const target = currentDefaultOrientationSettings();
+  orientationOverrides = target.orientationOverrides || {};
+  orientationSelectedIndices = []; // the active target is changing; a stale selection's
+                                     // indices would no longer mean anything
+  populateOrientationInputsFrom(target);
+  orientationPreviewLabel.textContent = orientationPreviewLabelText();
+}
+
+function syncActiveArmFromGlobals() {
+  const arm = arms[activeArmIndex];
+  arm.extremePointsCamera = extremePointsCamera;
+  arm.fittedCircle = fittedCircle;
+  const settings = independent ? arm : combinedSettings;
+  settings.sampleOverrides = sampleOverrides;
+  settings.extraSamplePoints = extraSamplePoints;
+  settings.removedSampleIndices = removedSampleIndices;
+  settings.steps = Math.max(1, parseInt(stepsInput.value) || 1);
+  settings.seed = parseInt(seedInput.value) || 0;
+  settings.distribution = distributionSelect.value;
+  settings.borderWidth = Math.max(0, parseFloat(borderWidthInput.value) || 0);
+  settings.countMode = countModeSelect.value;
+  // The orientation panel always targets currentDefaultOrientationSettings() -- the active
+  // OBJECT once any exist, else arm/combinedSettings exactly as before objects existed -- NOT
+  // necessarily the same `settings` the position-pattern fields above just wrote to.
+  const orientationTarget = currentDefaultOrientationSettings();
+  orientationTarget.orientationOverrides = orientationOverrides;
+  // The orientation panel is a selection-bound inspector: with points selected (box-select
+  // tool), these fields edit ONLY those points' own override snapshot; the shared default
+  // is left untouched so unselected points can't be affected by mistake (see
+  // orientationSelectedIndices' own comment for the bug this replaced). With no selection,
+  // they edit the default exactly as before.
+  if (orientationSelectedIndices.length > 0) {
+    const cfg = captureOrientationInputsAsConfig();
+    orientationSelectedIndices.forEach(function (idx) { orientationOverrides[idx] = cfg; });
+  } else {
+    Object.assign(orientationTarget, captureOrientationInputsAsConfig());
+  }
+  if (arms.length === 1) {
+    const other = settings === arm ? combinedSettings : arm;
+    SETTINGS_FIELDS.forEach(function (f) { other[f] = settings[f]; });
+  }
+}
+
+// The inverse: loads arms[activeArmIndex]'s circle, plus whichever settings target is now
+// live, back into the live globals AND the pattern-preview form fields, so every existing
+// tool/handler that reads those globals/fields transparently operates on the right thing.
+function loadActiveArmIntoGlobals() {
+  const arm = arms[activeArmIndex];
+  extremePointsCamera = arm.extremePointsCamera;
+  fittedCircle = arm.fittedCircle;
+  const settings = independent ? arm : combinedSettings;
+  sampleOverrides = settings.sampleOverrides;
+  extraSamplePoints = settings.extraSamplePoints || [];
+  removedSampleIndices = settings.removedSampleIndices || [];
+  stepsInput.value = String(settings.steps);
+  seedInput.value = String(settings.seed);
+  distributionSelect.value = settings.distribution;
+  borderWidthInput.value = String(settings.borderWidth);
+  countModeSelect.value = settings.countMode || "fixed";
+  loadOrientationTargetIntoGlobals();
+  fitCircleBtn.disabled = extremePointsCamera.length < 3 || circleLocked;
+  armNameInput.value = arm.name;
+  armColorInput.value = arm.color;
+  patternPreviewLabel.textContent = "Pattern" + (arms.length > 1 ? " (" + (independent ? "active arm" : "combined") + ")" : "");
+}
+
+function setIndependent(value) {
+  independentUserPreference = value; // only ever reached via the checkbox, i.e. arms.length > 1
+  if (value === independent) return;
+  syncActiveArmFromGlobals(); // write back using the OLD `independent`
+  independent = value;
+  loadActiveArmIntoGlobals(); // read forward using the NEW `independent`
+  renderAll();
+}
+
+function renderArmChips() {
+  armChips.innerHTML = "";
+  arms.forEach(function (arm, i) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "arm-chip" + (i === activeArmIndex ? " active" : "");
+    chip.title = "Switch to " + arm.name;
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    dot.style.background = arm.color;
+    chip.appendChild(dot);
+    chip.appendChild(document.createTextNode(arm.name));
+    if (i === activeArmIndex) { chip.style.borderColor = arm.color; chip.style.color = arm.color; }
+    chip.addEventListener("click", function () { switchArm(i); });
+    armChips.appendChild(chip);
+  });
+  removeArmBtn.disabled = arms.length <= 1;
+}
+
+function switchArm(newIndex) {
+  if (newIndex === activeArmIndex) return;
+  syncActiveArmFromGlobals();
+  activeArmIndex = newIndex;
+  loadActiveArmIntoGlobals();
+  // Not undo-tracked -- this only changes WHICH arm subsequent edits apply to, not any
+  // geometry itself (syncActiveArmFromGlobals() above already preserved whatever was live).
+  resetCutDraftState();
+  activeDrag = null;
+  renderArmChips();
+  renderAll();
+}
+
+function addArm() {
+  recordUndo();
+  const color = ARM_PALETTE[arms.length % ARM_PALETTE.length];
+  arms.push(makeArm("Arm " + (arms.length + 1), color));
+  switchArm(arms.length - 1);
+}
+
+function removeArm() {
+  if (arms.length <= 1) return; // always keep at least one arm
+  recordUndo();
+  arms.splice(activeArmIndex, 1);
+  activeArmIndex = Math.min(activeArmIndex, arms.length - 1);
+  loadActiveArmIntoGlobals();
+  resetCutDraftState();
+  activeDrag = null;
+  renderArmChips();
+  renderAll();
+}
+
+addArmBtn.addEventListener("click", addArm);
+removeArmBtn.addEventListener("click", removeArm);
+armNameInput.addEventListener("input", function () {
+  arms[activeArmIndex].name = armNameInput.value || arms[activeArmIndex].name;
+  renderArmChips();
+  renderAll();
+});
+armColorInput.addEventListener("input", function () {
+  arms[activeArmIndex].color = armColorInput.value;
+  renderArmChips();
+  renderAll();
+});
+independentToggle.addEventListener("change", function () { setIndependent(independentToggle.checked); });
+
+// ── Objects (multi-object scenes) ────────────────────────────────────────────────────────
+// An "object" is a named, colored thing assigned onto a SUBSET of the existing sample-point
+// cloud (arms/union sampling above is completely unaware objects exist -- it keeps generating
+// the same one shared cloud it always has). Assignment is many-to-many: one point can hold
+// several objects (a stack -- e.g. a block placed ON TOP of another), and one object's own
+// points are whatever subset of the cloud the operator selected with the general "select"
+// tool and handed to the "Assign"/"Unassign" buttons below -- selecting first, THEN assigning
+// (not a dedicated drag-to-assign tool) was a deliberate reversal from this feature's first
+// pass, requested directly: picking a tool before you could even see what you were selecting
+// read backwards compared to every other selection-driven action in this file. Per-episode,
+// EVERY object with at least one assigned point is placed simultaneously, each cycling its OWN
+// sorted assigned-point list independently (target_for_episode's existing index%length idiom,
+// applied per object rather than per arm) -- see computeEpisodePlacements(). This is
+// deliberately "even marginals only" (no joint decorrelation/collision solver across objects):
+// each object's own assigned subset is whatever the operator chose, and nothing here tries to
+// re-balance objects against each other -- ENGINE support for the exported `objects:`/
+// `shape: points` schema this produces is a documented follow-up (see CLAUDE.md), not built
+// yet.
+//
+// Deliberately NOT a rename/generalization of "arms" (a real alternative considered and
+// rejected): arms describe INDEPENDENTLY CALIBRATED REACH REGIONS feeding the shared sample
+// cloud; objects describe WHAT GETS PLACED on points already in that cloud. A bimanual rig
+// might have 2 arms and 2 objects (one per gripper) with no relation between the counts, or 1
+// arm and 3 objects (three things placed within one arm's reach across different episodes).
+//
+// With ZERO objects defined (every session before this feature existed, and the default for
+// a new one), every line in this file behaves EXACTLY as before -- the Rotation card edits
+// arm/combinedSettings exactly as it always did (currentDefaultOrientationSettings's first
+// branch is unreachable), and updateExportText's objects-block is gated off entirely. This is
+// the single seam that keeps every pre-existing config/test byte-for-byte unaffected.
+const OBJECT_PALETTE = ["#f87171", "#fb923c", "#facc15", "#4ade80", "#22d3ee", "#818cf8", "#e879f9", "#94a3b8"];
+
+function makeObject(name, color) {
+  return {
+    name: name,
+    color: color,
+    assigned: [], // sample-point indices (into samplePointsCanonical) this object occupies
+    // assignedSeq[pointIndex] = the value of nextAssignmentSeq at the moment this object was
+    // assigned to that point -- the ONLY thing stacking order ("level") is derived from. No
+    // manual level field: requested directly ("the level should get automatically assigned
+    // to a point if more objects use it not manually"), since a hand-typed number an operator
+    // has to keep consistent across however many objects/points share a spot is exactly the
+    // kind of bookkeeping this tool should do for them. objectStackAt/computeEpisodePlacements
+    // sort by this per-point, so the SAME object can rank differently at two different shared
+    // points depending on assignment order there -- there is no single global "this object's
+    // level," only "this object's rank wherever it happens to be stacked."
+    assignedSeq: {},
+    orientationOverrides: {}, // per-point full orientation-config snapshot, same shape/role
+                                // as an arm's own orientationOverrides
+    // Mirrors an arm's own orientation* field names exactly (see makeArm) so this object can
+    // be passed directly to captureOrientationInputsAsConfig/populateOrientationInputsFrom/
+    // orientationExportBlock/generateRotationAngles with no adapter.
+    orientationEnabled: false,
+    orientationCount: 1,
+    orientationMethod: "uniform",
+    orientationAngleStart: 0,
+    orientationAngleEnd: 360,
+    orientationSeed: 0,
+    orientationArrowLength: 40,
+    orientationInitialAngle: 0,
+    // Real config.py ObjectConfig field (sequencing), not preview-only -- see pattern.py's
+    // sequence_index. "seed" feeds this object's "shuffled" sequencing (mirrors config.py's
+    // PatternConfig gaining an optional `seed:` under `shape: points` for exactly this
+    // purpose). `jitterPx`/`presence`, two earlier per-object knobs, were removed after a
+    // direct report that they didn't pull their weight -- see CLAUDE.md.
+    sequencing: "lockstep",
+    seed: 0,
+  };
+}
+
+let objects = [];
+let activeObjectIndex = -1; // -1 = no objects defined -- the all-existing-sessions default
+// Monotonically increasing -- the only source of "which object got assigned to a given point
+// first." Included in undo snapshots (see snapshotState) so an undo/redo round-trip can't
+// make a later assignment's seq collide with or precede an earlier one's.
+let nextAssignmentSeq = 1;
+// Preview-only UI state (not undo-tracked, not exported) -- mirrors how `tool`/`activeArmIndex`
+// are already excluded from undo/redo as plain UI state, not geometry.
+let previewMode = "marginal"; // "marginal" (every object's full assigned cloud, today's-style
+                                // always-on preview) | "episode" (one simultaneous placement)
+let currentEpisode = 0;
+let episodePlaying = false;
+let episodePlayTimer = null;
+// SCENE-LEVEL (not per-object): how many of this episode's SITES (one occupied point, holding
+// one object or, when 2+ objects are assigned there, a GUARANTEED stack -- see occupiedSites/
+// computeEpisodePlacements) are visible at once. "all" (default, today's exact behavior): every
+// site shown simultaneously, every episode -- decoupled from any one object's own pattern
+// length via combinationCount below. "one": exactly one OCCUPIED POINT is shown per episode,
+// round-robin in declaration order over the STATIC union of every object's own assigned points
+// -- #episodes equals the number of distinct occupied points, not the longest object's pattern
+// length -- see CLAUDE.md for the reports that shaped this (stacks were rare/partial under an
+// earlier dynamic-coincidence design for this mode).
+let episodeTargets = "all"; // "all" | "one"
+// SCENE-LEVEL (not per-object), "all" mode only: how many distinct simultaneous-combination
+// episodes to cycle through via combinationIndex, instead of each object independently
+// lockstep/shuffled-sweeping its own pattern (sequenceIndex) -- decouples the visible
+// combination count from any one object's own pattern length (reported directly: "if i have 3
+// objects and 20 steps the combinations are limited to the nr of steps"). `0`/falsy (default)
+// keeps today's exact lockstep/shuffled behavior, byte-for-byte. Ignored under
+// episodeTargets === "one", which has no notion of "combination" at all.
+let combinationCount = 0;
+// SCENE-LEVEL (not per-object), "all" mode only: which of the 5 combination-generation
+// strategies combinationCount drives -- see combinationIndex/resolveCombinationIndices/
+// combinationPeriod for the full rationale of each. "systematic" (default): deterministic,
+// evenly-spread, capped per object at that object's own pattern length. "random": independent
+// seeded draws (combinationSeed) -- escapes that per-object cap, since the joint space is up
+// to the PRODUCT of every object's length. "coprime": a deterministic, no-RNG alternative to
+// "systematic" with the same per-object cap. "cartesian": the full Cartesian product,
+// enumerated deterministically -- escapes the cap with no randomness; can get very large
+// (combinationCount, if set, caps it). "lcm": plain lockstep, but run for exactly
+// lcm(every object's own length) episodes so every pairing lockstep naturally produces
+// appears once. "cartesian"/"lcm" derive their own natural period when combinationCount is
+// left unset/falsy; "random"/"coprime" need it set explicitly.
+let combinationMode = "systematic"; // "systematic" | "random" | "coprime" | "cartesian" | "lcm"
+let combinationSeed = 0; // "random" mode only
+// SCENE-LEVEL (not per-object): whether 2+ objects sharing a point this episode are a real
+// STACK (default -- z-order via stackLevelStrategy/stackLevelSeed below) or should be kept
+// apart instead, each nudged onto one of its OWN other assigned points where possible
+// (resolveKeepApart) -- see CLAUDE.md for why this replaced the earlier per-object "phase"
+// sequencing mode, which conflated object-pair decorrelation with this distinct concern. Only
+// meaningful under episodeTargets === "all" -- under "one", co-location is a static, guaranteed
+// fact derived from occupiedSites, not something that can or can't coincide per episode.
+let coLocation = "stack"; // "stack" | "keep_apart"
+// GLOBAL (not per-object): how 2+ objects' stacking order (level) varies across episodes when
+// they share a point -- both a genuine stack (coLocation === "stack") and a RESIDUAL,
+// unavoidable collision under "keep_apart" use this one setting this pass (per-stack override
+// deferred -- see CLAUDE.md). The marginal overlay's level badge deliberately stays the plain
+// assignment-order rank regardless of this setting, since there's no single "this episode" for
+// a static, always-on view to vary it across.
+let stackLevelStrategy = "fixed";
+let stackLevelSeed = 0;
+let episodeKeepApartResidual = []; // object names left colliding this episode (keep_apart only)
+
+function renderObjectChips() {
+  objectChips.innerHTML = "";
+  objects.forEach(function (obj, i) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "arm-chip" + (i === activeObjectIndex ? " active" : "");
+    chip.title = "Switch to " + obj.name;
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    dot.style.background = obj.color;
+    chip.appendChild(dot);
+    chip.appendChild(document.createTextNode(obj.name));
+    if (i === activeObjectIndex) { chip.style.borderColor = obj.color; chip.style.color = obj.color; }
+    chip.addEventListener("click", function () { switchObject(i); });
+    objectChips.appendChild(chip);
+  });
+  removeObjectBtn.disabled = objects.length === 0;
+  objectColorInput.disabled = objectNameInput.disabled = objects.length === 0;
+  objectSequencingSelect.disabled = objectSeedInput.disabled = activeObjectIndex < 0;
+  previewModeSelect.disabled = objects.length === 0;
+  if (activeObjectIndex >= 0) {
+    const active = objects[activeObjectIndex];
+    objectColorInput.value = active.color;
+    objectNameInput.value = active.name;
+    objectSequencingSelect.value = active.sequencing;
+    objectSeedInput.value = active.seed;
+  }
+}
+
+function switchObject(newIndex) {
+  if (newIndex === activeObjectIndex) return;
+  syncActiveArmFromGlobals(); // flushes the Rotation card into the OLD active object first
+  activeObjectIndex = newIndex;
+  loadOrientationTargetIntoGlobals();
+  renderObjectChips();
+  renderAll();
+}
+
+function addObject() {
+  recordUndo();
+  const color = OBJECT_PALETTE[objects.length % OBJECT_PALETTE.length];
+  objects.push(makeObject("Object " + (objects.length + 1), color));
+  switchObject(objects.length - 1);
+}
+
+function removeObject() {
+  if (objects.length === 0) return;
+  recordUndo();
+  objects.splice(activeObjectIndex, 1);
+  activeObjectIndex = objects.length === 0 ? -1 : Math.min(activeObjectIndex, objects.length - 1);
+  loadOrientationTargetIntoGlobals();
+  renderObjectChips();
+  renderAll();
+}
+
+addObjectBtn.addEventListener("click", addObject);
+removeObjectBtn.addEventListener("click", removeObject);
+objectNameInput.addEventListener("input", function () {
+  if (activeObjectIndex < 0) return;
+  objects[activeObjectIndex].name = objectNameInput.value || objects[activeObjectIndex].name;
+  renderObjectChips();
+  renderAll();
+});
+objectColorInput.addEventListener("input", function () {
+  if (activeObjectIndex < 0) return;
+  objects[activeObjectIndex].color = objectColorInput.value;
+  renderObjectChips();
+  renderAll();
+});
+objectSequencingSelect.addEventListener("change", function () {
+  if (activeObjectIndex < 0) return;
+  objects[activeObjectIndex].sequencing = objectSequencingSelect.value;
+  renderAll();
+});
+objectSeedInput.addEventListener("input", function () {
+  if (activeObjectIndex < 0) return;
+  objects[activeObjectIndex].seed = parseInt(objectSeedInput.value, 10) || 0;
+  renderAll();
+});
+// combinationCount/coLocation only apply under episodeTargets === "all" (combinationCount has
+// no meaning under "one", which has no notion of "combination" at all; co_location is moot
+// under "one" since co-location there is a static, guaranteed fact derived from occupiedSites,
+// not a per-episode coincidence). stackLevelStrategy/stackLevelSeed, by contrast, are relevant
+// under "one" UNCONDITIONALLY (every multi-member site there is a guaranteed stack) and under
+// "all" only when coLocation === "stack" -- so their availability is a separate check, not
+// simply tied to episodeTargets.
+function updateSceneLevelControlsAvailability() {
+  const isOne = episodeTargets === "one";
+  combinationCountInput.disabled = isOne;
+  combinationModeSelect.disabled = isOne;
+  combinationSeedInput.disabled = isOne || combinationMode !== "random";
+  coLocationSelect.disabled = isOne;
+  const levelControlsRelevant = isOne || coLocation === "stack";
+  stackLevelStrategySelect.disabled = !levelControlsRelevant;
+  stackLevelSeedInput.disabled = !levelControlsRelevant;
+}
+episodeTargetsSelect.addEventListener("change", function () {
+  episodeTargets = episodeTargetsSelect.value;
+  updateSceneLevelControlsAvailability();
+  // episode_targets is a per-EPISODE sequencing concept: it only changes WHICH groups are
+  // shown on a given episode, which is only ever visible in the episode stepper. The marginal
+  // overlay draws every assigned point of every object at once (a coverage check across ALL
+  // episodes), so by construction it CANNOT show "one group per episode" -- toggling this while
+  // in marginal preview looked like it did nothing at all (the reported bug). So selecting "one"
+  // auto-engages the episode preview, where the rotation is actually visible. "all" leaves the
+  // current preview as-is (marginal is perfectly meaningful there -- it's today's behavior).
+  if (episodeTargets === "one" && objects.length > 0 && previewMode !== "episode") {
+    previewMode = "episode";
+    previewModeSelect.value = "episode";
+    episodeStepper.style.display = "";
+  }
+  renderAll();
+});
+combinationCountInput.addEventListener("input", function () {
+  combinationCount = parseInt(combinationCountInput.value, 10) || 0;
+  renderAll();
+});
+combinationModeSelect.addEventListener("change", function () {
+  combinationMode = combinationModeSelect.value;
+  updateSceneLevelControlsAvailability();
+  renderAll();
+});
+combinationSeedInput.addEventListener("input", function () {
+  combinationSeed = parseInt(combinationSeedInput.value, 10) || 0;
+  renderAll();
+});
+coLocationSelect.addEventListener("change", function () {
+  coLocation = coLocationSelect.value;
+  updateSceneLevelControlsAvailability();
+  renderAll();
+});
+stackLevelStrategySelect.addEventListener("change", function () {
+  stackLevelStrategy = stackLevelStrategySelect.value;
+  renderAll();
+});
+stackLevelSeedInput.addEventListener("input", function () {
+  stackLevelSeed = parseInt(stackLevelSeedInput.value, 10) || 0;
+  renderAll();
+});
+assignSelectedBtn.addEventListener("click", assignSelectedToActiveObject);
+unassignSelectedBtn.addEventListener("click", unassignSelectedFromActiveObject);
+previewModeSelect.addEventListener("change", function () {
+  previewMode = previewModeSelect.value;
+  episodeStepper.style.display = previewMode === "episode" ? "" : "none";
+  if (previewMode !== "episode") stopEpisodePlayback();
+  renderAll();
+});
+episodePrevBtn.addEventListener("click", function () {
+  currentEpisode = Math.max(0, currentEpisode - 1);
+  renderAll();
+});
+episodeNextBtn.addEventListener("click", function () {
+  currentEpisode = currentEpisode + 1; // clamped against the actual max in renderAll()
+  renderAll();
+});
+function stopEpisodePlayback() {
+  episodePlaying = false;
+  if (episodePlayTimer !== null) { clearInterval(episodePlayTimer); episodePlayTimer = null; }
+  episodePlayBtn.textContent = "▶"; // ▶
+}
+episodePlayBtn.addEventListener("click", function () {
+  if (episodePlaying) {
+    stopEpisodePlayback();
+    return;
+  }
+  episodePlaying = true;
+  episodePlayBtn.textContent = "⏸"; // ⏸
+  episodePlayTimer = setInterval(function () {
+    currentEpisode = currentEpisode + 1; // wraps via the same clamp renderAll() already applies
+    renderAll();
+  }, 600);
+});
+
+// Every object currently assigned to final sample-index `pointIndex`, sorted bottom-to-top by
+// ASSIGNMENT ORDER AT THIS POINT (assignedSeq -- see makeObject's comment for why there's no
+// manual level field), automatically-derived `level` (its 0-based rank in this sorted stack --
+// 0 = first assigned = bottom), and orientation-arrow tips (all of that object's configured
+// angles, exactly like the legacy per-point preview drew every angle from every point -- see
+// anglesForPoint). ALL members share the same `point` -- there is no per-member fan-out;
+// rendering draws one dot plus a tower legend instead (see drawStackLegend), which is what
+// actually makes "which object is on top" legible, instead of a ring of identical-looking
+// dots a fixed radius apart. Computed once per render (renderAll, into objectStacksAtPoint)
+// and consumed by both views' marginal-overlay render loop.
+function objectStackAt(pointIndex, point) {
+  const here = objects.filter(function (o) { return o.assigned.indexOf(pointIndex) !== -1; });
+  here.sort(function (a, b) { return (a.assignedSeq[pointIndex] || 0) - (b.assignedSeq[pointIndex] || 0); });
+  return here.map(function (o, stackPos) {
+    const cfg = o.orientationOverrides[pointIndex] || o;
+    const tips = cfg.orientationEnabled
+      ? anglesForPoint(cfg, pointIndex).map(function (a) { return orientationTipCanonical(point, a, cfg.orientationArrowLength); })
+      : [];
+    return { object: o, point: point, tips: tips, level: stackPos };
+  });
+}
+
+// Whether the combinationMode/combinationCount subsystem is active for "all" mode. Diverges
+// slightly from session.py's `combination_active` (active whenever combinationCount is set OR
+// combinationMode != "systematic") for live-preview robustness: Python's config is validated
+// eagerly at load time, so "random"/"coprime" without a count can never actually reach
+// show_targets -- but this tool's dropdown/number-input can transiently be in exactly that
+// state while the operator is mid-edit (e.g. just switched to "Random" before typing a
+// count), and combinationPeriod() throws for that combination. Rather than crash renderAll()
+// on every keystroke, "random"/"coprime" only activate once a count is actually set,
+// otherwise this falls through to legacy lockstep/shuffled -- "cartesian"/"lcm" are always
+// active regardless, since they tolerate an absent count by design.
+function combinationSubsystemActive() {
+  if (combinationMode === "cartesian" || combinationMode === "lcm") return true;
+  return !!combinationCount;
+}
+
+// The number of distinct episodes this scene actually has -- mirrors session.py's show_targets
+// exactly. Under `episodeTargets === "one"`: the number of distinct OCCUPIED POINTS
+// (occupiedSites), a static structural fact about the scene, not a per-episode computation --
+// an object with several assigned points gets one dedicated turn per point, so this is exactly
+// the rotation period, not a soft bound. Under "all": combinationPeriod() when the combination
+// subsystem is active (decoupling the visible combination count from any one object's own
+// pattern length), else the longest assigned-point list (today's exact lockstep/shuffled
+// behavior). At least 1 so the stepper never divides by zero with no objects/assignments yet.
+function maxEpisodeCount() {
+  if (episodeTargets === "one") {
+    return Math.max(1, occupiedSites().length);
+  }
+  const lens = objects.filter(function (o) { return o.assigned.length > 0; }).map(function (o) { return o.assigned.length; });
+  if (combinationSubsystemActive()) {
+    return Math.max(1, combinationPeriod(lens, combinationMode, combinationCount));
+  }
+  return lens.length > 0 ? Math.max.apply(null, lens) : 1;
+}
+
+// The exact simultaneous multi-object placement for one episode -- mirrors session.py's
+// show_targets exactly, with the same two-mode split.
+//
+// `episodeTargets === "one"`: exactly ONE occupied point (occupiedSites -- the STATIC union of
+// every object's own assigned points) is shown, with its full, GUARANTEED membership (a single
+// object, or, since assignment to the same point now means co-location, full stop, several at
+// once -- never a per-episode coincidence). Every object outside that one site is implicitly
+// absent. `coLocation`/`sequencing` don't apply here -- see CLAUDE.md for why an earlier,
+// dynamic-coincidence design for this mode made stacks rare and partial, which this replaced.
+//
+// `episodeTargets === "all"`: every site shown simultaneously, exactly as before this setting
+// existed -- each object's own index is either the systematic `combinationIndex` spread (when
+// `combinationCount` is set) or the legacy per-object `sequenceIndex` sweep, then a branch on
+// `coLocation` ("stack": leave natural indices untouched, so two objects whose patterns
+// coincide this episode group into a real stack; "keep_apart": resolveKeepApart nudges a
+// colliding object onto one of its own other points first), then grouped by exact
+// resolved-position equality -- recomputed fresh EVERY episode.
+//
+// Returns `{sites, residual}`: `sites` is `[{point, members: [{object, tip, level}]}]` (one
+// entry per OCCUPIED point, never per member -- a stack is one site with several members, not
+// several co-located placements) and `residual` is the object NAMES left colliding this episode
+// under "keep_apart" (always `[]` under "stack", and always `[]` under "one", which has no
+// notion of keep-apart at all).
+function computeEpisodePlacements(episodeIndex) {
+  if (episodeTargets === "one") {
+    const sites = occupiedSites();
+    if (sites.length === 0) return { sites: [], residual: [] };
+    const site = sites[episodeIndex % sites.length];
+    const idx = site.idx;
+    const point = samplePointsCanonical[idx];
+    if (!point) return { sites: [], residual: [] };
+    const here = site.members.map(function (ordinal) { return { object: objects[ordinal] }; })
+      .sort(function (a, b) { return (a.object.assignedSeq[idx] || 0) - (b.object.assignedSeq[idx] || 0); });
+    const levels = levelOrder(here.length, episodeIndex, stackLevelStrategy, stackLevelSeed);
+    const visitNumber = Math.floor(episodeIndex / sites.length);
+    const members = here.map(function (e, rank) {
+      const o = e.object;
+      const level = levels[rank];
+      const cfg = o.orientationOverrides[idx] || o;
+      let tip = null;
+      if (cfg.orientationEnabled) {
+        const angles = anglesForPoint(cfg, idx);
+        tip = orientationTipCanonical(point, angles[visitNumber % angles.length], cfg.orientationArrowLength);
+      }
+      return { object: o, point: point, tip: tip, level: level };
+    });
+    return { sites: [{ point: point, members: members }], residual: [] };
+  }
+
+  const numObjects = objects.length;
+  const assignedLists = objects.map(function (o) { return o.assigned.slice().sort(function (a, b) { return a - b; }); });
+
+  let naturalIndices;
+  if (combinationSubsystemActive()) {
+    // cartesian/lcm need every PRESENT object's length jointly -- absent objects (no points
+    // assigned yet, a transient calibration-tool-only state with no Python equivalent) are
+    // filtered out first, then results are mapped back onto their original ordinal position.
+    const presentOrdinals = [];
+    const presentLengths = [];
+    objects.forEach(function (o, ordinal) {
+      if (assignedLists[ordinal].length === 0) return;
+      presentOrdinals.push(ordinal);
+      presentLengths.push(assignedLists[ordinal].length);
+    });
+    naturalIndices = objects.map(function () { return null; });
+    if (presentLengths.length > 0) {
+      const period = combinationPeriod(presentLengths, combinationMode, combinationCount);
+      const comboIdx = episodeIndex % period;
+      const resolved = resolveCombinationIndices(comboIdx, presentLengths, combinationMode, period, combinationSeed);
+      presentOrdinals.forEach(function (ordinal, i) {
+        naturalIndices[ordinal] = assignedLists[ordinal][resolved[i]];
+      });
+    }
+  } else {
+    naturalIndices = objects.map(function (o, ordinal) {
+      if (o.assigned.length === 0) return null;
+      const sorted = assignedLists[ordinal];
+      const seqIdx = sequenceIndex(episodeIndex, sorted.length, o.sequencing, ordinal, numObjects, o.seed);
+      return sorted[seqIdx];
+    });
+  }
+
+  let resolvedIndices, residualOrdinals;
+  if (coLocation === "keep_apart") {
+    const result = resolveKeepApart(naturalIndices, assignedLists, episodeIndex);
+    resolvedIndices = result[0];
+    residualOrdinals = result[1];
+  } else {
+    resolvedIndices = naturalIndices;
+    residualOrdinals = [];
+  }
+
+  const byIndex = {};
+  objects.forEach(function (o, ordinal) {
+    const idx = resolvedIndices[ordinal];
+    if (idx === null || idx === undefined) return;
+    (byIndex[idx] = byIndex[idx] || []).push({ object: o, ordinal: ordinal });
+  });
+
+  const entries = Object.keys(byIndex).map(function (key) {
+    return { idx: parseInt(key, 10), members: byIndex[key] };
+  });
+
+  const sites = [];
+  entries.forEach(function (entry) {
+    const idx = entry.idx;
+    const point = samplePointsCanonical[idx];
+    if (!point) return;
+    const here = entry.members.slice().sort(function (a, b) { return (a.object.assignedSeq[idx] || 0) - (b.object.assignedSeq[idx] || 0); });
+    const levels = levelOrder(here.length, episodeIndex, stackLevelStrategy, stackLevelSeed);
+    const members = here.map(function (e, rank) {
+      const o = e.object;
+      const level = levels[rank];
+      const cfg = o.orientationOverrides[idx] || o;
+      let tip = null;
+      if (cfg.orientationEnabled) {
+        const angles = anglesForPoint(cfg, idx);
+        tip = orientationTipCanonical(point, angles[episodeIndex % angles.length], cfg.orientationArrowLength);
+      }
+      return { object: o, point: point, tip: tip, level: level };
+    });
+    sites.push({ point: point, members: members });
+  });
+  return { sites: sites, residual: residualOrdinals.map(function (o) { return objects[o].name; }) };
+}
+
+// Draws ONE dot at `point` (the real, shared site -- never fanned) plus, for a stack of 2+, a
+// compact vertical legend beside it listing members top (highest level) -> bottom (lowest
+// level) by color + name, so it's unambiguous which object is "on top" without inferring it
+// from a ring of identical-looking dots (the previous design). `members` is `[{color, name,
+// level}]` in any order; this function sorts descending by level itself.
+const STACK_LEGEND_ROW_HEIGHT = 11;
+const STACK_LEGEND_SWATCH_SIZE = 7;
+const STACK_LEGEND_OFFSET_X = 9;
+const STACK_LEGEND_PADDING = 4;
+const STACK_LEGEND_WIDTH = 76;
+function drawStackLegend(ctx, point, sampleRadius, members) {
+  const sorted = members.slice().sort(function (a, b) { return b.level - a.level; });
+  ctx.beginPath(); ctx.arc(point[0], point[1], sampleRadius, 0, 2 * Math.PI);
+  ctx.fillStyle = sorted[0].color; ctx.fill();
+  if (sorted.length <= 1) return;
+  ctx.fillStyle = "#0a0e17"; ctx.font = "bold 7px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("×" + sorted.length, point[0], point[1]); // x2, x3, ...
+
+  const rowH = STACK_LEGEND_ROW_HEIGHT;
+  const boxHeight = sorted.length * rowH + STACK_LEGEND_PADDING * 2;
+  const boxX = point[0] + sampleRadius + STACK_LEGEND_OFFSET_X;
+  const boxY = point[1] - boxHeight / 2;
+
+  ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(point[0] + sampleRadius, point[1]); ctx.lineTo(boxX, point[1]); ctx.stroke();
+
+  ctx.fillStyle = "rgba(10,14,23,0.88)";
+  ctx.fillRect(boxX, boxY, STACK_LEGEND_WIDTH, boxHeight);
+  ctx.strokeStyle = "rgba(255,255,255,0.15)";
+  ctx.strokeRect(boxX, boxY, STACK_LEGEND_WIDTH, boxHeight);
+
+  sorted.forEach(function (m, row) {
+    const rowY = boxY + STACK_LEGEND_PADDING + row * rowH + rowH / 2;
+    const swatchX = boxX + STACK_LEGEND_PADDING + STACK_LEGEND_SWATCH_SIZE / 2;
+    ctx.beginPath(); ctx.arc(swatchX, rowY, STACK_LEGEND_SWATCH_SIZE / 2, 0, 2 * Math.PI);
+    ctx.fillStyle = m.color; ctx.fill();
+    ctx.fillStyle = "#e7ebf3"; ctx.font = "8px sans-serif";
+    ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    ctx.fillText(m.name + " (L" + m.level + ")", boxX + STACK_LEGEND_PADDING * 2 + STACK_LEGEND_SWATCH_SIZE, rowY);
+  });
+}
+
+// Drops every object's reference to a batch of final sample-cloud indices being removed, and
+// renumbers every SURVIVING reference (assigned points, their orientationOverrides, AND their
+// assignedSeq -- a point's automatic level is meaningless once its index changes, so the seq
+// recorded against it has to follow the same renumbering) down by however many of the removed
+// indices preceded it -- the correct general fix (unlike a wholesale clear) since a plain "+"
+// add never shifts any existing index (it only ever appends), so only removal paths need this
+// at all. Mirrors the same index-invalidation hazard steps/seed/distribution changes already
+// guard against for the pattern-level orientationOverrides/orientationSelectedIndices, just
+// precise instead of total because objects' assignments are this feature's main deliverable,
+// worth not nuking wholesale on every single point edit.
+function remapObjectAssignmentsForBatchRemoval(removedIndices) {
+  if (removedIndices.length === 0) return;
+  function remapIndex(idx) {
+    let shift = 0;
+    removedIndices.forEach(function (r) { if (r < idx) shift++; });
+    return idx - shift;
+  }
+  function remapIndexKeyedMap(map) {
+    const result = {};
+    Object.keys(map).forEach(function (k) {
+      const idx = parseInt(k, 10);
+      if (removedIndices.indexOf(idx) !== -1) return;
+      result[remapIndex(idx)] = map[k];
+    });
+    return result;
+  }
+  objects.forEach(function (o) {
+    o.assigned = o.assigned
+      .filter(function (idx) { return removedIndices.indexOf(idx) === -1; })
+      .map(remapIndex);
+    o.orientationOverrides = remapIndexKeyedMap(o.orientationOverrides);
+    o.assignedSeq = remapIndexKeyedMap(o.assignedSeq);
+  });
+}
+
+// Toggles the ACTIVE object's membership for ONE point -- the shared primitive both the
+// select-then-assign buttons below and any direct callers use. Persistent scene data, unlike
+// orientationSelectedIndices' plain (non-undo-tracked) selection -- assignment IS this
+// feature's main deliverable, so callers wrap this in recordUndo()/renderAll() themselves.
+function toggleObjectAssignment(pointIndex) {
+  if (activeObjectIndex < 0) return;
+  const obj = objects[activeObjectIndex];
+  const pos = obj.assigned.indexOf(pointIndex);
+  if (pos === -1) {
+    obj.assigned.push(pointIndex);
+    obj.assignedSeq[pointIndex] = nextAssignmentSeq++;
+  } else {
+    obj.assigned.splice(pos, 1);
+    delete obj.assignedSeq[pointIndex];
+  }
+}
+
+// "Select first with the general tool, THEN assign" -- the requested order, reversed from
+// this feature's first pass (a dedicated drag-to-assign tool an operator had to switch into
+// BEFORE they could even see what they were selecting). Both buttons operate on whatever
+// orientationSelectedIndices currently holds (populated by the existing "select" tool's
+// box-select/click-to-select, already used for scoping the Rotation card's per-point
+// overrides) -- assigning/unassigning is just another action over that same selection, not a
+// second, parallel selection mechanism. Deliberately two distinct buttons rather than one
+// toggle: a toggle's meaning is ambiguous the moment the selection is a MIX of already-
+// assigned and not-yet-assigned points, which is common once an operator is selecting by
+// region rather than one point at a time.
+function assignSelectedToActiveObject() {
+  if (activeObjectIndex < 0 || orientationSelectedIndices.length === 0) return;
+  recordUndo();
+  const obj = objects[activeObjectIndex];
+  orientationSelectedIndices.forEach(function (i) {
+    if (obj.assigned.indexOf(i) === -1) {
+      obj.assigned.push(i);
+      obj.assignedSeq[i] = nextAssignmentSeq++;
+    }
+  });
+  renderAll();
+}
+function unassignSelectedFromActiveObject() {
+  if (activeObjectIndex < 0 || orientationSelectedIndices.length === 0) return;
+  recordUndo();
+  const obj = objects[activeObjectIndex];
+  orientationSelectedIndices.forEach(function (i) {
+    const pos = obj.assigned.indexOf(i);
+    if (pos !== -1) {
+      obj.assigned.splice(pos, 1);
+      delete obj.assignedSeq[i];
+    }
+  });
+  renderAll();
+}
+
+// ── Undo/redo ───────────────────────────────────────────────────────────────
+// Scoped to GEOMETRY only (cameraCorners, cutShapesCanonical, and every arm's own
+// extremePointsCamera/fittedCircle/sampleOverrides, plus the arms list itself -- add/remove/
+// reorder) -- not to form fields like steps/seed/distribution/border width, an arm's name/
+// color, cornersLocked, the active tool, or which arm is active, all of which are plain UI
+// state an operator can already "undo" just by re-entering the old value or switching back.
+// One snapshot is pushed right before each discrete mutation (a drag's first mousedown, or a
+// button click that changes geometry), so an entire drag gesture undoes as a single step
+// rather than one step per mousemove.
+let undoStack = [], redoStack = [];
+const UNDO_LIMIT = 50;
+
+function snapshotState() {
+  syncActiveArmFromGlobals(); // arms[activeArmIndex]/combinedSettings must be fresh first
+  return JSON.parse(JSON.stringify({
+    cameraCorners: cameraCorners,
+    cutShapesCanonical: cutShapesCanonical,
+    arms: arms,
+    activeArmIndex: activeArmIndex,
+    combinedSettings: combinedSettings,
+    objects: objects,
+    activeObjectIndex: activeObjectIndex,
+    nextAssignmentSeq: nextAssignmentSeq,
+  }));
+}
+
+function restoreState(s) {
+  cameraCorners = s.cameraCorners;
+  cutShapesCanonical = s.cutShapesCanonical;
+  arms = s.arms;
+  activeArmIndex = s.activeArmIndex;
+  combinedSettings = s.combinedSettings;
+  objects = s.objects || [];
+  activeObjectIndex = objects.length > 0 ? Math.min(s.activeObjectIndex, objects.length - 1) : -1;
+  // Restoring an OLDER nextAssignmentSeq would risk a future assignment's seq colliding with
+  // (or sorting before) one already recorded in geometry this restore just brought back --
+  // monotonically advancing past whichever is larger keeps every future comparison correct
+  // regardless of how many undo/redo hops happened in between.
+  nextAssignmentSeq = Math.max(nextAssignmentSeq, s.nextAssignmentSeq || 1);
+  loadActiveArmIntoGlobals();
+  renderArmChips();
+  renderObjectChips();
+}
+
+function updateUndoRedoUI() {
+  undoBtn.disabled = undoStack.length === 0;
+  redoBtn.disabled = redoStack.length === 0;
+}
+
+function recordUndo() {
+  undoStack.push(snapshotState());
+  if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+  redoStack = [];
+  updateUndoRedoUI();
+}
+
+function undo() {
+  if (undoStack.length === 0) return;
+  redoStack.push(snapshotState());
+  restoreState(undoStack.pop());
+  activeDrag = null;
+  resetCutDraftState();
+  updateUndoRedoUI();
+  renderAll();
+}
+
+function redo() {
+  if (redoStack.length === 0) return;
+  undoStack.push(snapshotState());
+  restoreState(redoStack.pop());
+  activeDrag = null;
+  resetCutDraftState();
+  updateUndoRedoUI();
+  renderAll();
+}
+
+undoBtn.addEventListener("click", undo);
+redoBtn.addEventListener("click", redo);
+
+function activeInteraction() {
+  return tool;
+}
+
+function resetCorners() {
+  const w = video.videoWidth || 640, h = video.videoHeight || 480;
+  const mx = w * 0.1, my = h * 0.1;
+  cameraCorners = [[mx, my], [w - mx, my], [w - mx, h - my], [mx, h - my]];
+}
+
+// ── Math: ported from vizaudit/overlay/perspective.py and pattern.py.
+// Calibration is deliberately backend-free (no Python process while calibrating, see
+// CLAUDE.md), so this duplicates -- rather than shares -- that math. Keep the two in sync
+// conceptually if either changes. ──────────────────────────────────────────
+
+function solveLinearSystem(A, b) {
+  // Gauss-Jordan elimination with partial pivoting. A: NxN array of arrays, b: length-N array.
+  const n = A.length;
+  const M = A.map(function (row, i) { return row.concat([b[i]]); });
+  for (let col = 0; col < n; col++) {
+    let pivotRow = col, maxVal = Math.abs(M[col][col]);
+    for (let r = col + 1; r < n; r++) {
+      if (Math.abs(M[r][col]) > maxVal) { maxVal = Math.abs(M[r][col]); pivotRow = r; }
+    }
+    if (pivotRow !== col) { const tmp = M[col]; M[col] = M[pivotRow]; M[pivotRow] = tmp; }
+    const pivot = M[col][col];
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const factor = M[r][col] / pivot;
+      for (let c = col; c <= n; c++) { M[r][c] -= factor * M[col][c]; }
+    }
+  }
+  return M.map(function (row, i) { return row[n] / row[i]; });
+}
+
+function canonicalRectDims(corners) {
+  // Mirrors perspective.py's canonical_rect_dims (aspect_ratio always derived here, not
+  // configurable from this tool -- keeps the UI to one less number to manage).
+  const dist = function (a, b) { return Math.hypot(b[0] - a[0], b[1] - a[1]); };
+  const top = dist(corners[0], corners[1]), bottom = dist(corners[3], corners[2]);
+  const left = dist(corners[0], corners[3]), right = dist(corners[1], corners[2]);
+  return [(top + bottom) / 2, (left + right) / 2];
+}
+
+function computeHomography(corners) {
+  // Mirrors perspective.py's compute_homography exactly (same 8-equation linear system).
+  const dims = canonicalRectDims(corners);
+  const width = dims[0], height = dims[1];
+  const canonical = [[0, 0], [width, 0], [width, height], [0, height]];
+  const A = [], b = [];
+  for (let i = 0; i < 4; i++) {
+    const u = canonical[i][0], v = canonical[i][1];
+    const x = corners[i][0], y = corners[i][1];
+    A.push([u, v, 1, 0, 0, 0, -u * x, -v * x]); b.push(x);
+    A.push([0, 0, 0, u, v, 1, -u * y, -v * y]); b.push(y);
+  }
+  const h = solveLinearSystem(A, b);
+  return [[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], 1]];
+}
+
+function applyHomography(H, point) {
+  const x = point[0], y = point[1];
+  const px = H[0][0] * x + H[0][1] * y + H[0][2];
+  const py = H[1][0] * x + H[1][1] * y + H[1][2];
+  const pw = H[2][0] * x + H[2][1] * y + H[2][2];
+  return [px / pw, py / pw];
+}
+
+function invertMatrix3(M) {
+  const a = M[0][0], b = M[0][1], c = M[0][2];
+  const d = M[1][0], e = M[1][1], f = M[1][2];
+  const g = M[2][0], h = M[2][1], i = M[2][2];
+  const det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+  const id = 1 / det;
+  return [
+    [(e * i - f * h) * id, (c * h - b * i) * id, (b * f - c * e) * id],
+    [(f * g - d * i) * id, (a * i - c * g) * id, (c * d - a * f) * id],
+    [(d * h - e * g) * id, (b * g - a * h) * id, (a * e - b * d) * id],
+  ];
+}
+
+function fitCircleLeastSquares(points) {
+  // Kasa method: x^2+y^2+Dx+Ey+F=0, solved via the normal equations of [x,y,1]*[D,E,F]=-(x^2+y^2).
+  // Same closed form for exactly-3 points (reduces to the exact circumcircle) and N>3.
+  let Sx = 0, Sy = 0, Sxx = 0, Syy = 0, Sxy = 0, Bx = 0, By = 0, B1 = 0;
+  const n = points.length;
+  points.forEach(function (p) {
+    const x = p[0], y = p[1];
+    Sx += x; Sy += y; Sxx += x * x; Syy += y * y; Sxy += x * y;
+    const bi = -(x * x + y * y);
+    Bx += x * bi; By += y * bi; B1 += bi;
+  });
+  const A = [[Sxx, Sxy, Sx], [Sxy, Syy, Sy], [Sx, Sy, n]];
+  const sol = solveLinearSystem(A, [Bx, By, B1]);
+  const D = sol[0], E = sol[1], F = sol[2];
+  const center = [-D / 2, -E / 2];
+  const radius = Math.sqrt(Math.max(center[0] * center[0] + center[1] * center[1] - F, 0));
+  return { center: center, radius: radius };
+}
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ── Multi-object behavioral randomization (sequencing / levels) ──
+// Bit-for-bit ports of pattern.py's same-named (snake_case) functions -- verified directly
+// against the Python outputs, not just "looks like an equivalent algorithm" (see CLAUDE.md).
+// These are REAL config knobs the live overlay consumes, not preview-only math, so the
+// episode-stepper preview here must show exactly what a real session would record.
+
+function combineSeed() {
+  let h = 0;
+  for (let i = 0; i < arguments.length; i++) {
+    h = (Math.imul(h, 1000003) + (arguments[i] >>> 0)) >>> 0;
+  }
+  return h;
+}
+
+function seededPermutation(length, seed) {
+  const rng = mulberry32(seed);
+  const perm = [];
+  for (let i = 0; i < length; i++) perm.push(i);
+  for (let i = length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const tmp = perm[i]; perm[i] = perm[j]; perm[j] = tmp;
+  }
+  return perm;
+}
+
+function sequenceIndex(episodeIndex, length, mode, objectOrdinal, numObjects, seed) {
+  if (length < 1) throw new Error("length must be >= 1, got " + length);
+  mode = mode || "lockstep";
+  objectOrdinal = objectOrdinal || 0;
+  numObjects = numObjects || 1;
+  seed = seed || 0;
+  if (mode === "lockstep") return episodeIndex % length;
+  if (mode === "shuffled") {
+    const perm = seededPermutation(length, combineSeed(seed, objectOrdinal));
+    return perm[episodeIndex % length];
+  }
+  // A third mode, "phase", shipped briefly and was removed: it conflated "decorrelate two
+  // SEPARATE objects' sweeps" with "keep two objects that share a point from ever
+  // co-occupying it," which is the distinct, scene-level `coLocation === "keep_apart"` concern
+  // handled by resolveKeepApart below instead -- see CLAUDE.md.
+  throw new Error("Unknown sequencing mode: " + mode);
+}
+
+// Bit-for-bit port of pattern.py's combination_index -- "all" mode + the combination
+// subsystem active: which of an object's own `length` assigned points to show for combination
+// `combinationIndex_` out of `numCombinations` total, decoupling the visible combination count
+// from any one object's own pattern length (today's lockstep `sequenceIndex` caps it at
+// `length`). Handles the 3 modes that only need THIS object's own length/ordinal
+// ("systematic"/"random"/"coprime") -- "cartesian"/"lcm" need every object's length jointly
+// and go through resolveCombinationIndices instead (see pattern.py's docstring for the full
+// rationale of each mode, ported verbatim here).
+//
+// "systematic" (default) branches on under- vs over-sampling: undersampling
+// (numCombinations <= length) uses the proportional spread (Math.floor is exact floor
+// division for non-negative operands, matching Python's `//` exactly -- no round()/
+// Math.round() divergence to guard against here); oversampling uses plain modulo cycling --
+// FIXES a real, reported bug where the proportional formula, applied unconditionally even
+// when numCombinations > length, repeated the SAME index for several consecutive episodes in
+// a row ("combinations repeat themselves if i set a number higher than the sample count")
+// instead of cycling -- correct in aggregate count, visibly wrong in time. Both branches are
+// then phase-shifted by objectOrdinal so equal-length objects don't always pair the same way.
+function combinationIndex(combinationIndex_, length, objectOrdinal, numCombinations, mode, seed) {
+  mode = mode || "systematic";
+  seed = seed || 0;
+  if (length < 1) throw new Error("length must be >= 1, got " + length);
+  if (numCombinations < 1) throw new Error("numCombinations must be >= 1, got " + numCombinations);
+  if (PER_OBJECT_COMBINATION_MODES.indexOf(mode) === -1) {
+    throw new Error("combinationIndex only handles " + PER_OBJECT_COMBINATION_MODES.join(",") + " -- " + mode + " needs every object's length jointly, use resolveCombinationIndices");
+  }
+  if (mode === "systematic") {
+    let raw;
+    if (numCombinations <= length) raw = Math.floor((combinationIndex_ * length) / numCombinations);
+    else raw = combinationIndex_ % length;
+    return (raw + objectOrdinal) % length;
+  }
+  if (mode === "random") {
+    const rng = mulberry32(combineSeed(seed, combinationIndex_, objectOrdinal));
+    return Math.min(length - 1, Math.floor(rng() * length));
+  }
+  // mode === "coprime"
+  const stride = coprimeStrideFor(length, objectOrdinal);
+  return (combinationIndex_ * stride + objectOrdinal) % length;
+}
+
+const PER_OBJECT_COMBINATION_MODES = ["systematic", "random", "coprime"];
+
+function gcd(a, b) {
+  while (b) { const t = b; b = a % b; a = t; }
+  return a;
+}
+
+// Bit-for-bit port of pattern.py's _coprime_stride_for: a stride coprime to `length`, varying
+// deterministically by `objectOrdinal`.
+function coprimeStrideFor(length, objectOrdinal) {
+  if (length <= 2) return 1;
+  let candidate = 1 + (objectOrdinal % (length - 1));
+  for (let i = 0; i < length; i++) {
+    if (gcd(candidate, length) === 1) return candidate;
+    candidate = (candidate % (length - 1)) + 1;
+  }
+  return 1;
+}
+
+// Bit-for-bit port of pattern.py's _cartesian_indices -- standard mixed-radix decomposition,
+// every possible simultaneous combination of object positions appears exactly once as
+// `combinationIndex_` ranges over `[0, product(lengths))`.
+function cartesianIndices(combinationIndex_, lengths) {
+  let total = 1;
+  for (let i = 0; i < lengths.length; i++) total *= lengths[i];
+  let idx = total > 0 ? combinationIndex_ % total : 0;
+  const indices = [];
+  for (let i = 0; i < lengths.length; i++) {
+    indices.push(idx % lengths[i]);
+    idx = Math.floor(idx / lengths[i]);
+  }
+  return indices;
+}
+
+// Bit-for-bit port of pattern.py's resolve_combination_indices -- the top-level dispatcher for
+// ALL 5 combinationMode values, including "cartesian"/"lcm" which need every object's length
+// jointly. "lcm" deliberately has NO phase shift (plain `combinationIndex_ % length` per
+// object) -- its whole point is exposing the TRUE periodicity of vanilla lockstep cycling
+// itself, not adding decorrelation on top of it.
+function resolveCombinationIndices(combinationIndex_, lengths, mode, numCombinations, seed) {
+  mode = mode || "systematic";
+  if (mode === "cartesian") return cartesianIndices(combinationIndex_, lengths);
+  if (mode === "lcm") return lengths.map(function (length) { return combinationIndex_ % length; });
+  if (numCombinations === null || numCombinations === undefined) {
+    throw new Error("combinationMode=" + mode + " requires combinationCount to be set");
+  }
+  return lengths.map(function (length, ordinal) {
+    return combinationIndex(combinationIndex_, length, ordinal, numCombinations, mode, seed);
+  });
+}
+
+function lcmOf(values) {
+  return values.reduce(function (a, b) { return (a * b) / gcd(a, b); }, 1);
+}
+
+// Bit-for-bit port of pattern.py's combination_period -- the effective number of distinct
+// combinations to cycle through. "cartesian"/"lcm" derive their own natural period (the
+// product, or the lcm, of every object's own length) when combinationCount is unset/falsy;
+// "systematic"/"random"/"coprime" have no natural period of their own and REQUIRE it.
+function combinationPeriod(lengths, mode, combinationCountValue) {
+  mode = mode || "systematic";
+  if (COMBINATION_MODES.indexOf(mode) === -1) throw new Error("Unknown combinationMode: " + mode);
+  if (mode === "cartesian") {
+    let natural = 1;
+    for (let i = 0; i < lengths.length; i++) natural *= lengths[i];
+    return combinationCountValue ? Math.min(combinationCountValue, natural) : natural;
+  }
+  if (mode === "lcm") {
+    const natural = lengths.length > 0 ? lcmOf(lengths) : 1;
+    return combinationCountValue ? Math.min(combinationCountValue, natural) : natural;
+  }
+  if (!combinationCountValue) throw new Error("combinationMode=" + mode + " requires combinationCount to be set");
+  return combinationCountValue;
+}
+
+const COMBINATION_MODES = ["systematic", "random", "coprime", "cartesian", "lcm"];
+
+// Bit-for-bit port of pattern.py's occupied_sites -- "one" mode: every distinct sample-point
+// INDEX at least one object is assigned to, across ALL of that object's own `assigned` points
+// (not just "this episode's swept position"). Specialized to this tool's shared
+// samplePointsCanonical index space, so -- unlike the Python original, which has to key by
+// float coordinate since each object's pattern is its own independent list of raw points --
+// two objects "sharing a point" here are always the literal same array index already, no
+// coordinate-equality keying needed. Returns `[{idx, members: [objectOrdinal, ...]}, ...]`,
+// ordered by the smallest `(objectOrdinal, indexWithinThatObjectsOwnAssignedList)` among each
+// site's members -- deterministic, matching pattern.py's ordering exactly.
+function occupiedSites() {
+  const byIndex = {};
+  const orderKey = {};
+  objects.forEach(function (o, ordinal) {
+    const sorted = o.assigned.slice().sort(function (a, b) { return a - b; });
+    sorted.forEach(function (idx, posInOwn) {
+      if (!byIndex[idx]) byIndex[idx] = [];
+      if (byIndex[idx].indexOf(ordinal) === -1) byIndex[idx].push(ordinal);
+      const key = [ordinal, posInOwn];
+      const existing = orderKey[idx];
+      if (!existing || key[0] < existing[0] || (key[0] === existing[0] && key[1] < existing[1])) {
+        orderKey[idx] = key;
+      }
+    });
+  });
+  const indices = Object.keys(byIndex).map(function (k) { return parseInt(k, 10); });
+  indices.sort(function (a, b) {
+    return orderKey[a][0] - orderKey[b][0] || orderKey[a][1] - orderKey[b][1];
+  });
+  return indices.map(function (idx) { return { idx: idx, members: byIndex[idx] }; });
+}
+
+// Mirrors pattern.py's resolve_keep_apart exactly. For `coLocation === "keep_apart"`: given
+// each present object's NATURAL (already-sequenceIndex-resolved) point index this episode
+// (`null` for an absent object, left untouched), greedily resolves same-episode collisions in
+// DECLARATION order (array order == object ordinal): the first object wanting a point keeps
+// it; each later object wanting an already-taken point advances through its OWN
+// `assignedLists` entry (cyclically, starting at `episodeIndex % length`) to the first
+// currently-free point among its own assigned points. If none of its own points are free, it
+// keeps its natural (colliding) index, and its ordinal is reported in the second return value
+// -- a residual, unavoidable overlap the caller surfaces as a warning and renders as a
+// (visible, leveled) stack rather than silently overlapping. Objects with disjoint
+// assigned-point sets are mathematically untouched. Returns `[resolvedIndices, residualOrdinals]`.
+function resolveKeepApart(naturalIndices, assignedLists, episodeIndex) {
+  const resolved = naturalIndices.map(function () { return null; });
+  const taken = {};
+  const residual = [];
+  naturalIndices.forEach(function (natural, i) {
+    if (natural === null || natural === undefined) return;
+    if (!taken[natural]) {
+      resolved[i] = natural;
+      taken[natural] = true;
+      return;
+    }
+    const length = assignedLists[i].length;
+    const start = episodeIndex % length;
+    let found = null;
+    for (let k = 0; k < length; k++) {
+      const candidate = assignedLists[i][(start + k) % length];
+      if (!taken[candidate]) { found = candidate; break; }
+    }
+    if (found !== null) {
+      resolved[i] = found;
+      taken[found] = true;
+    } else {
+      resolved[i] = natural;
+      residual.push(i);
+    }
+  });
+  return [resolved, residual];
+}
+
+function levelOrder(stackSize, episodeIndex, strategy, seed) {
+  if (stackSize < 1) throw new Error("stackSize must be >= 1, got " + stackSize);
+  strategy = strategy || "fixed";
+  seed = seed || 0;
+  if (strategy === "fixed") {
+    const order = [];
+    for (let i = 0; i < stackSize; i++) order.push(i);
+    return order;
+  }
+  if (strategy === "shuffle") return seededPermutation(stackSize, combineSeed(seed, episodeIndex));
+  if (strategy === "cycle") {
+    const order = [];
+    for (let i = 0; i < stackSize; i++) order.push((i + episodeIndex) % stackSize);
+    return order;
+  }
+  if (strategy === "balanced") {
+    const base = seededPermutation(stackSize, seed);
+    const order = [];
+    for (let i = 0; i < stackSize; i++) order.push(base[(i + episodeIndex) % stackSize]);
+    return order;
+  }
+  throw new Error("Unknown level strategy: " + strategy);
+}
+
+const GOLDEN_ANGLE_DEG = 137.50776405003785; // 360 * (1 - 1/phi)
+
+function pointInPolygon(point, vertices) {
+  // Standard ray-casting test. Mirrors pattern.py's _point_in_polygon.
+  const x = point[0], y = point[1];
+  let inside = false;
+  const n = vertices.length;
+  for (let i = 0; i < n; i++) {
+    const x1 = vertices[i][0], y1 = vertices[i][1];
+    const x2 = vertices[(i + 1) % n][0], y2 = vertices[(i + 1) % n][1];
+    if ((y1 > y) !== (y2 > y)) {
+      const xIntersect = x1 + (y - y1) * (x2 - x1) / (y2 - y1);
+      if (x < xIntersect) inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function pointToSegmentDistance(point, a, b) {
+  const px = point[0], py = point[1], ax = a[0], ay = a[1], bx = b[0], by = b[1];
+  const abx = bx - ax, aby = by - ay;
+  const lengthSq = abx * abx + aby * aby;
+  if (lengthSq === 0) return Math.hypot(px - ax, py - ay);
+  let t = ((px - ax) * abx + (py - ay) * aby) / lengthSq;
+  t = Math.max(0, Math.min(1, t));
+  const projX = ax + t * abx, projY = ay + t * aby;
+  return Math.hypot(px - projX, py - projY);
+}
+
+function quadCentroid(corners) {
+  return [corners.reduce(function (s, c) { return s + c[0]; }, 0) / corners.length,
+    corners.reduce(function (s, c) { return s + c[1]; }, 0) / corners.length];
+}
+
+function scaleHandlePosition(corners) {
+  // Offset toward corner index 1 ("top right" in the default, unedited ordering) but inset
+  // 40% of the way back toward the centroid -- stays inside the quad (so it never goes out
+  // of bounds) without sitting on top of that corner's own drag handle. Placing it exactly AT
+  // the centroid (the original design) made scaling DOWN impossible: distance-from-centroid
+  // can never go below zero, so a scale anchored to that distance could only ever grow
+  // (reported directly: "i cant scale it down since the point is in the centre, only up").
+  // Offset from a real, non-zero rest distance instead, so dragging toward the centroid
+  // shrinks and dragging away grows.
+  const centroid = quadCentroid(corners);
+  return [centroid[0] + 0.6 * (corners[1][0] - centroid[0]), centroid[1] + 0.6 * (corners[1][1] - centroid[1])];
+}
+
+function pointNearPolygon(point, vertices, borderWidth) {
+  // True if inside, or within borderWidth of any edge -- the polygon "buffered" outward.
+  if (pointInPolygon(point, vertices)) return true;
+  if (borderWidth <= 0) return false;
+  const n = vertices.length;
+  for (let i = 0; i < n; i++) {
+    if (pointToSegmentDistance(point, vertices[i], vertices[(i + 1) % n]) < borderWidth) return true;
+  }
+  return false;
+}
+
+function cutShapeVertices(shape) {
+  return shape.type === "rectangle" ? shape.corners : shape.type === "polygon" ? shape.vertices : null;
+}
+
+// A cut dragged into (near-)zero area -- a misclick, e.g. a rectangle/circle drag that never
+// really moved -- has no real interior, so point-in-polygon/point-in-circle can never match
+// it; it could then never be selected (and therefore never deleted) by clicking its body
+// (reported directly: "if i accidentally made a cut so small that it looks like a
+// point...I cannot delete it"). Falls back to a generous click radius around its centroid
+// whenever its own bounding box is smaller than that radius.
+function cutShapeIsDegenerate(shape) {
+  const vertices = shape.type === "circle"
+    ? [[shape.center[0] - shape.radius, shape.center[1]], [shape.center[0] + shape.radius, shape.center[1]]]
+    : cutShapeVertices(shape);
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  vertices.forEach(function (v) {
+    minX = Math.min(minX, v[0]); maxX = Math.max(maxX, v[0]);
+    minY = Math.min(minY, v[1]); maxY = Math.max(maxY, v[1]);
+  });
+  return Math.max(maxX - minX, maxY - minY) < 6;
+}
+
+function cutShapeCentroid(shape) {
+  if (shape.type === "circle") return shape.center;
+  const vertices = cutShapeVertices(shape);
+  const sum = vertices.reduce(function (acc, v) { return [acc[0] + v[0], acc[1] + v[1]]; }, [0, 0]);
+  return [sum[0] / vertices.length, sum[1] / vertices.length];
+}
+
+function pointInCutShape(point, shape) {
+  if (cutShapeIsDegenerate(shape)) {
+    const c = cutShapeCentroid(shape);
+    return Math.hypot(point[0] - c[0], point[1] - c[1]) < 10;
+  }
+  if (shape.type === "circle") {
+    return Math.hypot(point[0] - shape.center[0], point[1] - shape.center[1]) <= shape.radius;
+  }
+  return pointInPolygon(point, cutShapeVertices(shape));
+}
+
+const CUT_CIRCLE_SEGMENTS = 32;
+
+function cutShapeBoundary(shape) {
+  // The shape's boundary as a polygon, in whatever space its own fields are in (always
+  // canonical, for shapes already in cutShapesCanonical). A circle becomes a fixed-segment
+  // polygon approximation -- used uniformly for the canonical-space validity check, the
+  // orthographic-view render, the camera-view render (forward-mapped), and the YAML export
+  // (also forward-mapped), so all four always agree on exactly the same boundary.
+  if (shape.type === "circle") {
+    const boundary = [];
+    for (let i = 0; i < CUT_CIRCLE_SEGMENTS; i++) {
+      const theta = 2 * Math.PI * i / CUT_CIRCLE_SEGMENTS;
+      boundary.push([shape.center[0] + shape.radius * Math.cos(theta), shape.center[1] + shape.radius * Math.sin(theta)]);
+    }
+    return boundary;
+  }
+  return cutShapeVertices(shape);
+}
+
+function circleHandles(circle) {
+  // {point, onDrag(newPoint)} pair shared by fittedCircle and circle-type cut shapes --
+  // onDrag mutates `circle` in place. `point`s are in whatever space `circle` itself is in
+  // (canonical, for both current callers).
+  return [
+    { point: circle.center, onDrag: function (p) { circle.center = p; } },
+    {
+      point: [circle.center[0] + circle.radius, circle.center[1]],
+      onDrag: function (p) { circle.radius = Math.hypot(p[0] - circle.center[0], p[1] - circle.center[1]); },
+    },
+  ];
+}
+
+function getCutHandles(shape) {
+  // One handle per vertex for rectangle/polygon; center + radius-edge for circle -- keeps
+  // each shape type's natural degrees of freedom (a circle has 2 handles, not N).
+  if (shape.type === "circle") return circleHandles(shape);
+  const vertices = cutShapeVertices(shape);
+  return vertices.map(function (v, i) {
+    return { point: v, onDrag: function (p) { vertices[i] = p; } };
+  });
+}
+
+function pixelHandlesForShape(shape, H) {
+  // Same handles, forward-mapped to pixel space for camera-view hit-testing/rendering --
+  // onDrag still expects a CANONICAL point, so callers must convert back via the inverse
+  // homography before invoking it.
+  return getCutHandles(shape).map(function (h) {
+    return { pixelPoint: applyHomography(H, h.point), onDrag: h.onDrag };
+  });
+}
+
+function toCanonical(pixelPoint) { return applyHomography(inverseHomography, pixelPoint); }
+function toPixel(canonicalPoint) { return applyHomography(homography, canonicalPoint); }
+
+// ── Hit-testing -- shared by both canvases ───────────────────────────────────────────────
+// Cuts only -- the circle/corners/reach points are only ever reachable through Workspace
+// setup's "corners" tool, never from here.
+function getAllCutHandles() {
+  let handles = [];
+  cutShapesCanonical.forEach(function (shape) {
+    // A degenerate (near-zero-area) shape's handles all sit virtually on top of each other,
+    // so a handle hit-test always wins over the body-click-select test below (it's checked
+    // first) -- the shape could be dragged but never selected/deleted. Skipping handles for
+    // a degenerate shape lets the click fall through to body-select instead, which (via
+    // pointInCutShape's own degenerate fallback) can actually select it.
+    if (cutShapeIsDegenerate(shape)) return;
+    handles = handles.concat(getCutHandles(shape));
+  });
+  return handles;
+}
+
+// Part of the "select" tool: drag a cut's handle to reshape it, or click its body (no handle
+// nearby) to SELECT it for Delete/Backspace -- selection is done by the caller (mousedown
+// handler) using pointInCutShape, since "select a shape" isn't a draggable handle.
+function findCameraEditTarget(p) {
+  if (!homography) return null;
+  let bestHandle = null, bestDist = 15;
+  getAllCutHandles().forEach(function (h) {
+    const hp = toPixel(h.point);
+    const d = Math.hypot(hp[0] - p[0], hp[1] - p[1]);
+    if (d < bestDist) { bestDist = d; bestHandle = h; }
+  });
+  return bestHandle ? { kind: "shape", handle: bestHandle } : null;
+}
+
+function findOrthoEditTarget(cp) {
+  const threshold = 10 / orthoScale;
+  let bestHandle = null, bestDist = threshold;
+  getAllCutHandles().forEach(function (h) {
+    const d = Math.hypot(h.point[0] - cp[0], h.point[1] - cp[1]);
+    if (d < bestDist) { bestDist = d; bestHandle = h; }
+  });
+  return bestHandle ? { kind: "shape", handle: bestHandle } : null;
+}
+
+// Workspace setup's "corners" tool: corners, edge midpoints (dragging one translates both its
+// corners together, so a whole side slides/scales rather than only ever pulling one vertex --
+// requested explicitly), the active arm's fitted reach circle, and reach points -- everything
+// involved in calibrating the workspace, and ONLY reachable through this tool. Corners/edges
+// are camera-only (the orthographic rectangle's corners aren't independently draggable, fixed
+// at [0,0]..canonicalSize by construction); circle/reach-points work on both views, so there's
+// a separate ortho variant below without the corner/edge cases.
+function findCameraCornersTarget(p) {
+  if (!cornersLocked) {
+    let bestIdx = -1, bestDist = 20;
+    cameraCorners.forEach(function (c, i) {
+      const d = Math.hypot(c[0] - p[0], c[1] - p[1]);
+      if (d < bestDist) { bestDist = d; bestIdx = i; }
+    });
+    if (bestIdx >= 0) return { kind: "corner", index: bestIdx };
+    // Hit-test the whole segment, not just its midpoint -- a midpoint-only test made long
+    // edges (typically top/bottom, in a landscape frame) practically ungrabbable anywhere
+    // except their exact center, while short edges (typically left/right) were grabbable
+    // almost anywhere, reading as "only side edges can scale" (reported directly).
+    let bestEdge = -1;
+    bestDist = 15;
+    for (let i = 0; i < 4; i++) {
+      const a = cameraCorners[i], b = cameraCorners[(i + 1) % 4];
+      const d = pointToSegmentDistance(p, a, b);
+      if (d < bestDist) { bestDist = d; bestEdge = i; }
+    }
+    if (bestEdge >= 0) {
+      // Locked in at hit-test time, not recomputed every mousemove: an edge that runs mostly
+      // vertically is a left/right SIDE, so dragging it should only change x (width), never
+      // drift the side up/down; an edge that runs mostly horizontally is a top/bottom edge,
+      // so dragging it should only change y (height) -- reported directly ("when i drag the
+      // side edges they shouldnt move on the y axis same as top and bottom shouldnt move on
+      // x"). Deciding once at grab-time (rather than re-deciding from the live, already-
+      // constrained corners on every move) avoids the classification flapping near 45 degrees.
+      const a = cameraCorners[bestEdge], b = cameraCorners[(bestEdge + 1) % 4];
+      const isVertical = Math.abs(a[1] - b[1]) > Math.abs(a[0] - b[0]);
+      return { kind: "edge", index: bestEdge, isVertical: isVertical };
+    }
+  }
+  if (homography && fittedCircle && !circleLocked) {
+    let bestHandle = null, bestDist = 15;
+    circleHandles(fittedCircle).forEach(function (h) {
+      const hp = toPixel(h.point);
+      const d = Math.hypot(hp[0] - p[0], hp[1] - p[1]);
+      if (d < bestDist) { bestDist = d; bestHandle = h; }
+    });
+    // Checked before the centroid scale-handle below: a circle centered in the workspace (a
+    // common case) puts its own center handle exactly on the quad's centroid too, and editing
+    // THAT specific circle is the more useful action to win the click.
+    if (bestHandle) return { kind: "shape", handle: bestHandle };
+  }
+  if (!cornersLocked) {
+    // A handle OFFSET from the quad's centroid (see scaleHandlePosition) scales all 4
+    // corners together, uniformly, about the centroid -- "just grab the middle and scale it
+    // up" (requested directly), as opposed to dragging one corner/edge at a time. Anchored to
+    // the handle's own fixed rest distance from the centroid (`restDist`), not to wherever it
+    // was actually clicked, so the gesture starts at exactly scale=1 regardless of where
+    // within the hit radius the grab landed. Capturing fresh `corners`/`centroid`/`baseDist`
+    // here (the CURRENT, already-edited geometry, not some original) is what makes repeated
+    // scale gestures accumulate instead of resetting -- "keep the state memorized."
+    const centroid = quadCentroid(cameraCorners);
+    const handlePos = scaleHandlePosition(cameraCorners);
+    if (Math.hypot(handlePos[0] - p[0], handlePos[1] - p[1]) < 20) {
+      return { kind: "scaleAll", corners: cameraCorners.map(function (c) { return c.slice(); }), centroid: centroid,
+        restDist: Math.hypot(handlePos[0] - centroid[0], handlePos[1] - centroid[1]),
+        baseDist: cameraCorners.reduce(function (s, c) { return s + Math.hypot(c[0] - centroid[0], c[1] - centroid[1]); }, 0) / 4 };
+    }
+  }
+  let bestIdx = -1, bestDist = 15;
+  extremePointsCamera.forEach(function (pt, i) {
+    const d = Math.hypot(pt[0] - p[0], pt[1] - p[1]);
+    if (d < bestDist) { bestDist = d; bestIdx = i; }
+  });
+  return bestIdx >= 0 ? { kind: "extreme", index: bestIdx } : null;
+}
+
+function findOrthoCornersTarget(cp) {
+  const threshold = 10 / orthoScale;
+  if (fittedCircle && !circleLocked) {
+    let bestHandle = null, bestDist = threshold;
+    circleHandles(fittedCircle).forEach(function (h) {
+      const d = Math.hypot(h.point[0] - cp[0], h.point[1] - cp[1]);
+      if (d < bestDist) { bestDist = d; bestHandle = h; }
+    });
+    if (bestHandle) return { kind: "shape", handle: bestHandle };
+  }
+  let bestIdx = -1, bestDist2 = threshold;
+  extremePointsCanonical.forEach(function (pt, i) {
+    const d = Math.hypot(pt[0] - cp[0], pt[1] - cp[1]);
+    if (d < bestDist2) { bestDist2 = d; bestIdx = i; }
+  });
+  return bestIdx >= 0 ? { kind: "extreme", index: bestIdx } : null;
+}
+
+function findCameraSampleTarget(p) {
+  let bestIdx = -1, bestDist = 10;
+  samplePointsCamera.forEach(function (pt, i) {
+    const d = Math.hypot(pt[0] - p[0], pt[1] - p[1]);
+    if (d < bestDist) { bestDist = d; bestIdx = i; }
+  });
+  return bestIdx >= 0 ? { kind: "sample", index: bestIdx } : null;
+}
+
+function findOrthoSampleTarget(cp) {
+  const threshold = 10 / orthoScale;
+  let bestIdx = -1, bestDist = threshold;
+  samplePointsCanonical.forEach(function (pt, i) {
+    const d = Math.hypot(pt[0] - cp[0], pt[1] - cp[1]);
+    if (d < bestDist) { bestDist = d; bestIdx = i; }
+  });
+  return bestIdx >= 0 ? { kind: "sample", index: bestIdx } : null;
+}
+
+// isValidCandidate operates entirely in canonical space -- this mirrors pattern.py's
+// generate_sector_points: border_width applies uniformly to the circle, the workspace
+// bounds, AND every cut. cutPolygonsCanonical is precomputed once per render, not per
+// candidate, and (now that cuts are canonical-native) needs no homography at all.
+function isValidCandidate(candidateCanonical) {
+  const borderWidth = Math.max(0, parseFloat(borderWidthInput.value) || 0);
+  const dx = candidateCanonical[0] - fittedCircle.center[0];
+  const dy = candidateCanonical[1] - fittedCircle.center[1];
+  const r = Math.hypot(dx, dy);
+  if (r > fittedCircle.radius - borderWidth) return false;
+  if (canonicalSize) {
+    if (candidateCanonical[0] < borderWidth || candidateCanonical[0] > canonicalSize[0] - borderWidth) return false;
+    if (candidateCanonical[1] < borderWidth || candidateCanonical[1] > canonicalSize[1] - borderWidth) return false;
+  }
+  for (let i = 0; i < cutPolygonsCanonical.length; i++) {
+    if (pointNearPolygon(candidateCanonical, cutPolygonsCanonical[i], borderWidth)) return false;
+  }
+  return true;
+}
+
+function allocateShares(sizes, count) {
+  // Largest-remainder apportionment (the standard method for splitting a fixed total across
+  // groups proportionally to size, e.g. parliamentary seat allocation): splits `count` picks
+  // across groups proportionally to `sizes`, every share within +/-1 of its exact
+  // proportional value, summing to exactly `count`. Mirrors pattern.py's _allocate_shares.
+  const total = sizes.reduce((a, b) => a + b, 0);
+  const exact = sizes.map((s) => (count * s) / total);
+  const shares = exact.map((e) => Math.floor(e));
+  let remainder = count - shares.reduce((a, b) => a + b, 0);
+  const order = sizes.map((_, i) => i).sort((a, b) => (exact[b] - shares[b]) - (exact[a] - shares[a]));
+  for (let k = 0; k < remainder; k++) shares[order[k]] += 1;
+  return shares;
+}
+
+function clampToRegion(candidate, cx, cy, effectiveOuter, bounds, borderWidth) {
+  // Disk-only clamp (mirrors pattern.py's _clamp_to_region, specialized: this tool never
+  // has an inner_radius or a restricted angle span, so there's no angle-snap/inner-radius
+  // step here). Radius clamps to effectiveOuter; if STILL outside `bounds` (the workspace
+  // rectangle, [width, height]), shrinks along the SAME ray from center until inside it --
+  // not an independent x/y clamp, which would collapse every point whose ideal x exceeds
+  // the bound onto the exact same vertical line regardless of its own y.
+  const dx = candidate[0] - cx, dy = candidate[1] - cy;
+  let r = Math.min(effectiveOuter, Math.hypot(dx, dy));
+  const theta = Math.atan2(dy, dx);
+  const cosT = Math.cos(theta), sinT = Math.sin(theta);
+  let x = cx + r * cosT, y = cy + r * sinT;
+  if (bounds) {
+    const bw = bounds[0], bh = bounds[1];
+    const inBounds = (px, py) => px >= borderWidth && px <= bw - borderWidth && py >= borderWidth && py <= bh - borderWidth;
+    if (!inBounds(x, y)) {
+      if (inBounds(cx, cy)) {
+        let lo = 0, hi = r;
+        for (let i = 0; i < 30; i++) {
+          const mid = (lo + hi) / 2;
+          if (inBounds(cx + mid * cosT, cy + mid * sinT)) lo = mid; else hi = mid;
+        }
+        x = cx + lo * cosT; y = cy + lo * sinT;
+      } else {
+        x = Math.max(borderWidth, Math.min(bw - borderWidth, x));
+        y = Math.max(borderWidth, Math.min(bh - borderWidth, y));
+      }
+    }
+  }
+  return [x, y];
+}
+
+function occupancyGuard(isValid, minSeparation) {
+  // Wraps `isValid` so a point within `minSeparation` of one already returned by a previous
+  // call also counts as invalid. Two cases need this: (1) two different ideal points that
+  // happen to share an angle from `center` can both shrink to the literal same nearest
+  // boundary point when `bounds` clips that side; (2) a small minSeparation (the default)
+  // only catches literal coincidences -- several points relocated off a shared central
+  // obstacle landing a small fraction of the expected spacing apart is visually distinct
+  // from a "missing point" but still visibly clumped, so minSeparation is set to a fraction
+  // of the expected inter-point spacing instead, pushing a relocation search past merely
+  // "different" into "different enough to blend in." Mirrors pattern.py's _occupancy_guard.
+  minSeparation = minSeparation || 1e-6;
+  const placed = [];
+  return {
+    isValid: function (candidate) {
+      if (!isValid(candidate)) return false;
+      return placed.every((p) => Math.hypot(candidate[0] - p[0], candidate[1] - p[1]) >= minSeparation);
+    },
+    markPlaced: function (point) { placed.push(point); },
+  };
+}
+
+function relocateIfInvalid(candidate, isValid, clamp, rng, searchScale, label, index, cx, cy, effectiveOuter) {
+  // Returns `candidate` unchanged if already valid. Otherwise tries, in order: (1) the
+  // closed-form `clamp`; (2) a radial search along the point's OWN angle from `center` --
+  // the remaining violation is usually an exclude_zones cut, which is typically small
+  // relative to the whole disk, so moving outward (then inward) at the point's own angle
+  // very often clears it, keeping points relocated off a shared central obstacle fanned out
+  // at their original angles instead of clumping at arbitrary ones; (3) only if that also
+  // fails, a local random search of growing radius around the clamped point. Mirrors
+  // pattern.py's _relocate_if_invalid.
+  if (isValid(candidate)) return candidate;
+  const clamped = clamp(candidate);
+  if (isValid(clamped)) return clamped;
+  const dx0 = clamped[0] - cx, dy0 = clamped[1] - cy;
+  const r0 = Math.hypot(dx0, dy0);
+  if (r0 > 1e-9) {
+    const cosT = dx0 / r0, sinT = dy0 / r0;
+    const step = Math.max(searchScale * 0.1, 1e-9);
+    for (const direction of [1, -1]) {
+      let r = r0;
+      for (let i = 0; i < 200; i++) {
+        r += direction * step;
+        if (r > effectiveOuter || r < 0) break;
+        const probe = [cx + r * cosT, cy + r * sinT];
+        if (isValid(probe)) return probe;
+      }
+    }
+  }
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const radius = searchScale * (0.5 + 0.25 * Math.floor(attempt / 3));
+    const probe = [clamped[0] + (rng() * 2 - 1) * radius, clamped[1] + (rng() * 2 - 1) * radius];
+    if (isValid(probe)) return probe;
+  }
+  throw new Error("Could not find a valid position near " + label + " point index " + index);
+}
+
+// ── Zone-aware structural fixes (mirrors pattern.py's _merge_intervals /
+// _subtract_intervals / _inflate_polygon / _polygon_vertical_intervals / _polygon_angle_block
+// / _merge_angle_intervals / _radial_available_area_cdf / _invert_radial_cdf) -- see
+// CLAUDE.md for why relocating individual out-of-zone points (the previous design) isn't
+// enough on its own: it patches one point at a time instead of letting the WHOLE pattern's
+// density adapt to the area a zone/border actually removes, which is what caused points to
+// pile into a dense ring right at a central zone's edge instead of spreading across the rest
+// of the disk. No circle-zone closed form is needed here (unlike pattern.py): cuts are
+// always stored canonical-native and a circle cut is already approximated as a fixed 32-gon
+// by cutShapeBoundary() by the time anything in this file sees it, so every zone these
+// functions deal with is already "just a polygon."
+
+function mergeIntervals(intervals) {
+  if (intervals.length === 0) return [];
+  const ordered = intervals.slice().sort((a, b) => a[0] - b[0]);
+  const merged = [ordered[0].slice()];
+  for (let i = 1; i < ordered.length; i++) {
+    const lo = ordered[i][0], hi = ordered[i][1];
+    const last = merged[merged.length - 1];
+    if (lo <= last[1]) last[1] = Math.max(last[1], hi);
+    else merged.push([lo, hi]);
+  }
+  return merged;
+}
+
+function subtractIntervals(baseLo, baseHi, excluded) {
+  const valid = [];
+  let cursor = baseLo;
+  for (const [rawLo, rawHi] of excluded) {
+    const lo = Math.max(rawLo, baseLo), hi = Math.min(rawHi, baseHi);
+    if (hi <= cursor || lo >= baseHi) continue;
+    if (lo > cursor) valid.push([cursor, lo]);
+    cursor = Math.max(cursor, hi);
+  }
+  if (cursor < baseHi) valid.push([cursor, baseHi]);
+  return valid;
+}
+
+function inflatePolygon(vertices, borderWidth) {
+  if (borderWidth <= 0) return vertices;
+  const n = vertices.length;
+  const centroidX = vertices.reduce((a, v) => a + v[0], 0) / n;
+  const centroidY = vertices.reduce((a, v) => a + v[1], 0) / n;
+  return vertices.map(function ([vx, vy]) {
+    const dx = vx - centroidX, dy = vy - centroidY;
+    const d = Math.hypot(dx, dy);
+    if (d < 1e-9) return [vx, vy];
+    const scale = (d + borderWidth) / d;
+    return [centroidX + dx * scale, centroidY + dy * scale];
+  });
+}
+
+function polygonVerticalIntervals(x, vertices) {
+  const ys = [];
+  const n = vertices.length;
+  for (let i = 0; i < n; i++) {
+    const [x1, y1] = vertices[i];
+    const [x2, y2] = vertices[(i + 1) % n];
+    if (x1 === x2) continue;
+    if ((x1 <= x && x <= x2) || (x2 <= x && x <= x1)) {
+      const t = (x - x1) / (x2 - x1);
+      ys.push(y1 + t * (y2 - y1));
+    }
+  }
+  ys.sort((a, b) => a - b);
+  const intervals = [];
+  for (let i = 0; i + 1 < ys.length; i += 2) intervals.push([ys[i], ys[i + 1]]);
+  return intervals;
+}
+
+function excludedYIntervalsAtX(x, borderWidth) {
+  const raw = [];
+  for (const poly of cutPolygonsCanonical) {
+    raw.push(...polygonVerticalIntervals(x, inflatePolygon(poly, borderWidth)));
+  }
+  return mergeIntervals(raw);
+}
+
+function segmentCircleIntersectionAngles(a, b, cx, cy, r) {
+  const [ax, ay] = a, [bx, by] = b;
+  const dx = bx - ax, dy = by - ay;
+  const ex = ax - cx, ey = ay - cy;
+  const coeffA = dx * dx + dy * dy;
+  if (coeffA < 1e-12) return [];
+  const coeffB = 2 * (ex * dx + ey * dy);
+  const coeffC = ex * ex + ey * ey - r * r;
+  const disc = coeffB * coeffB - 4 * coeffA * coeffC;
+  if (disc < 0) return [];
+  const sq = Math.sqrt(disc);
+  const angles = [];
+  for (const s of [(-coeffB - sq) / (2 * coeffA), (-coeffB + sq) / (2 * coeffA)]) {
+    if (s >= -1e-9 && s <= 1 + 1e-9) {
+      const sClamped = Math.min(1, Math.max(0, s));
+      const px = ax + sClamped * dx, py = ay + sClamped * dy;
+      angles.push(((Math.atan2(py - cy, px - cx) * 180 / Math.PI) % 360 + 360) % 360);
+    }
+  }
+  return angles;
+}
+
+function polygonAngleBlock(r, cx, cy, vertices) {
+  if (r <= 0) return pointInPolygon([cx, cy], vertices) ? [[0, 360]] : [];
+  let crossings = [];
+  const n = vertices.length;
+  for (let i = 0; i < n; i++) {
+    crossings.push(...segmentCircleIntersectionAngles(vertices[i], vertices[(i + 1) % n], cx, cy, r));
+  }
+  if (crossings.length === 0) {
+    const sample = [cx + r, cy];
+    return pointInPolygon(sample, vertices) ? [[0, 360]] : [];
+  }
+  crossings = Array.from(new Set(crossings.map((a) => Math.round(a * 1e9) / 1e9))).sort((a, b) => a - b);
+  const blocked = [];
+  const nC = crossings.length;
+  for (let i = 0; i < nC; i++) {
+    const lo = crossings[i];
+    const hi = i + 1 < nC ? crossings[i + 1] : crossings[0] + 360;
+    const midDeg = ((lo + hi) / 2) % 360;
+    const px = cx + r * Math.cos(midDeg * Math.PI / 180), py = cy + r * Math.sin(midDeg * Math.PI / 180);
+    if (pointInPolygon([px, py], vertices)) blocked.push([lo, hi]);
+  }
+  return blocked;
+}
+
+function mergeAngleIntervals(intervals) {
+  if (intervals.length === 0) return [];
+  const expanded = intervals.map(function ([lo, hi]) {
+    const loMod = ((lo % 360) + 360) % 360;
+    const span = hi - lo;
+    return [loMod, loMod + span];
+  });
+  const shifted = [];
+  for (const [lo, hi] of expanded) {
+    for (const offset of [-360, 0, 360]) shifted.push([lo + offset, hi + offset]);
+  }
+  const merged = mergeIntervals(shifted);
+  const clipped = [];
+  for (const [lo, hi] of merged) {
+    const clippedLo = Math.max(lo, 0), clippedHi = Math.min(hi, 360);
+    if (clippedHi > clippedLo) clipped.push([clippedLo, clippedHi]);
+  }
+  return mergeIntervals(clipped);
+}
+
+const RADIAL_CDF_SAMPLES = 300;
+
+function outsideBoundsAngleIntervals(r, cx, cy, bw, bh, borderWidth) {
+  // The angular interval(s) where the circle of radius r centered at (cx, cy) falls OUTSIDE
+  // the canonicalSize rectangle (inset by borderWidth) -- mirrors pattern.py's
+  // _outside_bounds_angle_intervals: reuses polygonAngleBlock by passing the inset rectangle
+  // itself (giving the INSIDE intervals), then takes the complement within [0, 360).
+  const xLo = borderWidth, xHi = bw - borderWidth;
+  const yLo = borderWidth, yHi = bh - borderWidth;
+  if (xHi <= xLo || yHi <= yLo) return [[0, 360]];
+  const rect = [[xLo, yLo], [xHi, yLo], [xHi, yHi], [xLo, yHi]];
+  const insideRaw = polygonAngleBlock(r, cx, cy, rect);
+  if (insideRaw.length === 0) return [[0, 360]];
+  return subtractIntervals(0, 360, mergeAngleIntervals(insideRaw));
+}
+
+function availableAngleIntervalsAtRadius(r, cx, cy, borderWidth) {
+  // The angular sub-interval(s) within [0, 360) where the circle of radius r centered at
+  // (cx, cy) is actually open -- not inside any cut, and not outside canonicalSize. Used by
+  // both radialAvailableAreaCdf (which only needs the total length) and, per point, by
+  // sampleSectorPoints's "radial" branch (which needs the actual intervals -- see the
+  // comment at that call site for why this is necessary, not just an optimization). Mirrors
+  // pattern.py's _available_angle_intervals_at_radius.
+  let blockedRaw = [];
+  for (const poly of cutPolygonsCanonical) {
+    blockedRaw.push(...polygonAngleBlock(r, cx, cy, inflatePolygon(poly, borderWidth)));
+  }
+  if (canonicalSize) {
+    blockedRaw.push(...outsideBoundsAngleIntervals(r, cx, cy, canonicalSize[0], canonicalSize[1], borderWidth));
+  }
+  if (blockedRaw.length === 0) return [[0, 360]];
+  const blockedMerged = mergeAngleIntervals(blockedRaw);
+  return subtractIntervals(0, 360, blockedMerged);
+}
+
+function placeInAvailableIntervals(intervals, fraction) {
+  // Maps `fraction` (in [0, 1)) to a point within `intervals`, positioned proportionally to
+  // where it falls within their concatenated total length. Returns null if there's nowhere
+  // to place a point at all (zero total length). Mirrors pattern.py's
+  // _place_in_available_intervals.
+  const total = intervals.reduce((a, [lo, hi]) => a + (hi - lo), 0);
+  if (total <= 0) return null;
+  const target = Math.max(0, Math.min(total, fraction * total));
+  let cursor = 0;
+  for (const [lo, hi] of intervals) {
+    const length = hi - lo;
+    if (target <= cursor + length) return lo + (target - cursor);
+    cursor += length;
+  }
+  return intervals[intervals.length - 1][1];
+}
+
+function candidateThetasInIntervals(intervals, numSamples) {
+  const candidates = [];
+  for (let k = 0; k < numSamples; k++) {
+    const theta = placeInAvailableIntervals(intervals, (k + 0.5) / numSamples);
+    if (theta !== null) candidates.push(theta);
+  }
+  return candidates;
+}
+
+function refineRadialLocalSeparation(placed, cx, cy, borderWidth, expectedSpacing) {
+  // Post-process pass that nudges any point too close to its nearest neighbor toward a
+  // better angle -- at the SAME radius, since that's already correct in aggregate via the
+  // area CDF -- within whatever's actually open there. Mirrors pattern.py's
+  // _refine_radial_local_separation: mapping each point's golden-angle fraction into its
+  // own radius's available interval preserves AGGREGATE density per radius shell but not
+  // golden angle's point-to-point separation guarantee, so two points at different radii
+  // can coincidentally land at nearly the same angle. A real, reported bug: adding
+  // borderWidth on top of an already-asymmetric canonicalSize clip made the
+  // nearest-neighbor ratio swing non-monotonically (0.57-0.89) across a borderWidth sweep
+  // on the same self-similarly-scaled shape, instead of degrading predictably.
+  const n = placed.length;
+  if (n < 2) return placed;
+  const passes = 3, minAcceptableRatio = 0.75, numCandidates = 24;
+  for (let pass = 0; pass < passes; pass++) {
+    const nnDistances = placed.map(function (p, i) {
+      return Math.min(...placed.filter((_, j) => j !== i).map((q) => Math.hypot(p[0] - q[0], p[1] - q[1])));
+    });
+    const avgNn = nnDistances.reduce((a, b) => a + b, 0) / n;
+    const minSeparation = minAcceptableRatio * Math.max(avgNn, expectedSpacing);
+    let improvedAny = false;
+    for (let i = 0; i < n; i++) {
+      const [xi, yi] = placed[i];
+      const bestD = Math.min(...placed.filter((_, j) => j !== i).map((q) => Math.hypot(xi - q[0], yi - q[1])));
+      if (bestD >= minSeparation) continue;
+      const r = Math.hypot(xi - cx, yi - cy);
+      const avail = availableAngleIntervalsAtRadius(r, cx, cy, borderWidth);
+      let bestTheta = null, bestScore = bestD;
+      for (const theta of candidateThetasInIntervals(avail, numCandidates)) {
+        const cx2 = cx + r * Math.cos(theta * Math.PI / 180), cy2 = cy + r * Math.sin(theta * Math.PI / 180);
+        // `avail` buffers a cut by pushing its vertices outward from the centroid -- an
+        // approximation, not a true offset -- so re-check the EXACT validity here too,
+        // the same fix as pattern.py's: a real, reported bug let this pick a candidate
+        // that still violated border_width near an off-center cut.
+        if (!isValidCandidate([cx2, cy2])) continue;
+        const score = Math.min(...placed.filter((_, j) => j !== i).map((q) => Math.hypot(cx2 - q[0], cy2 - q[1])));
+        if (score > bestScore) { bestScore = score; bestTheta = theta; }
+      }
+      if (bestTheta !== null) {
+        placed[i] = [cx + r * Math.cos(bestTheta * Math.PI / 180), cy + r * Math.sin(bestTheta * Math.PI / 180)];
+        improvedAny = true;
+      }
+    }
+    if (!improvedAny) break;
+  }
+  return placed;
+}
+
+function radialAvailableAreaCdf(cx, cy, effectiveOuter, borderWidth) {
+  // Numerically integrates, over RADIAL_CDF_SAMPLES radius samples, the angular span
+  // actually open at each radius -- see the comment block above this section for why this
+  // replaces a plain closed-form radius formula whenever any cuts or canonicalSize bounds
+  // restrict the disk.
+  const n = RADIAL_CDF_SAMPLES;
+  const radii = [];
+  for (let i = 0; i <= n; i++) radii.push((effectiveOuter * i) / n);
+  const availableSpan = radii.map(function (r) {
+    return availableAngleIntervalsAtRadius(r, cx, cy, borderWidth).reduce((a, [lo, hi]) => a + (hi - lo), 0);
+  });
+  const cumulative = [0];
+  for (let i = 1; i < radii.length; i++) {
+    const r0 = radii[i - 1], r1 = radii[i];
+    const area0 = availableSpan[i - 1] * r0, area1 = availableSpan[i] * r1;
+    cumulative.push(cumulative[cumulative.length - 1] + 0.5 * (area0 + area1) * (r1 - r0));
+  }
+  return { radii: radii, cumulative: cumulative };
+}
+
+function invertRadialCdf(cdf, targetFraction) {
+  const radii = cdf.radii, cumulative = cdf.cumulative;
+  const total = cumulative[cumulative.length - 1];
+  if (total <= 0) throw new Error("No available area to place radial points in");
+  const target = targetFraction * total;
+  for (let i = 1; i < cumulative.length; i++) {
+    if (cumulative[i] >= target) {
+      const c0 = cumulative[i - 1], c1 = cumulative[i];
+      const r0 = radii[i - 1], r1 = radii[i];
+      if (c1 === c0) return r1;
+      const t = (target - c0) / (c1 - c0);
+      return r0 + t * (r1 - r0);
+    }
+  }
+  return radii[radii.length - 1];
+}
+
+function variableGridPoints(density) {
+  const cx = fittedCircle.center[0], cy = fittedCircle.center[1];
+  let xMin = cx - fittedCircle.radius, xMax = cx + fittedCircle.radius;
+  let yMin = cy - fittedCircle.radius, yMax = cy + fittedCircle.radius;
+  if (canonicalSize) {
+    xMin = Math.max(xMin, 0); xMax = Math.min(xMax, canonicalSize[0]);
+    yMin = Math.max(yMin, 0); yMax = Math.min(yMax, canonicalSize[1]);
+  }
+  const aspect = (xMax - xMin) / (yMax - yMin);
+  const cols = Math.max(1, Math.round(Math.sqrt(density * aspect)));
+  const rows = Math.max(1, Math.round(density / cols));
+  const stepX = (xMax - xMin) / cols, stepY = (yMax - yMin) / rows;
+  const points = [];
+  for (let i = 0; i < cols; i++) {
+    for (let j = 0; j < rows; j++) {
+      const p = [xMin + (i + 0.5) * stepX, yMin + (j + 0.5) * stepY];
+      if (isValidCandidate(p)) points.push(p);
+    }
+  }
+  return points;
+}
+
+function variableRadialPoints(density, seed) {
+  const cx = fittedCircle.center[0], cy = fittedCircle.center[1];
+  const rng = mulberry32(seed || 0);
+  const angleOffset = rng() * 360;
+  const points = [];
+  for (let i = 0; i < density; i++) {
+    const t = (i + 0.5) / density;
+    const r = Math.sqrt(t) * fittedCircle.radius;
+    const theta = (angleOffset + i * GOLDEN_ANGLE_DEG) * Math.PI / 180;
+    const p = [cx + r * Math.cos(theta), cy + r * Math.sin(theta)];
+    if (isValidCandidate(p)) points.push(p);
+  }
+  return points;
+}
+
+// Mirrors pattern.py's _search_variable_density: `count` is the TARGET final count, not a
+// fixed resolution -- re-tries at higher/lower density until the survivor count is as close
+// to `count` as achievable (a single-shot resolution can land far short whenever a lot of the
+// candidate grid/spiral falls outside the valid area).
+function searchVariableDensity(makePoints, targetCount) {
+  let density = targetCount;
+  let best = null;
+  for (let iter = 0; iter < 8; iter++) {
+    const pts = makePoints(Math.max(1, density));
+    if (best === null || Math.abs(pts.length - targetCount) < Math.abs(best.length - targetCount)) best = pts;
+    if (pts.length >= targetCount) break;
+    density = pts.length === 0 ? density * 2 : Math.max(density + 1, Math.round(density * targetCount / pts.length));
+  }
+  return best || [];
+}
+
+function sampleSectorPointsVariable(count, seed, distribution) {
+  // Mirrors pattern.py's count_mode="variable": generate IDEAL grid/radial positions and
+  // drop whichever aren't valid, instead of relocating to force an exact final count.
+  if (!fittedCircle) return [];
+  let points;
+  if (distribution === "grid") {
+    points = searchVariableDensity(variableGridPoints, count);
+  } else if (distribution === "radial") {
+    points = searchVariableDensity(function (d) { return variableRadialPoints(d, seed); }, count);
+  } else {
+    throw new Error("count_mode='variable' only supports distribution 'grid' or 'radial'");
+  }
+  if (points.length === 0) throw new Error("count_mode='variable' produced zero valid points");
+  return points;
+}
+
+function sampleSectorPoints(count, seed, distribution) {
+  // Disk-specialized (inner_radius=0, full circle) version of pattern.py's
+  // generate_sector_points -- this tool only ever produces full disks. Always returns
+  // CANONICAL-space points; the caller maps them to pixel space for the camera-view overlay.
+  if (!fittedCircle) return [];
+  const cx = fittedCircle.center[0], cy = fittedCircle.center[1];
+  const outerRadius = fittedCircle.radius;
+  const borderWidth = Math.max(0, parseFloat(borderWidthInput.value) || 0);
+  const effectiveOuter = outerRadius - borderWidth;
+  // The scale relocateIfInvalid's fallback jitter search grows from -- the expected spacing
+  // between neighboring points for a roughly area-uniform disk packing of `count` points.
+  const expectedSpacing = effectiveOuter / Math.max(1, Math.sqrt(count));
+
+  if (distribution === "random") {
+    const rng = mulberry32(seed);
+    const points = [];
+    const maxAttempts = count * 200;
+    let attempts = 0;
+    while (points.length < count) {
+      attempts++;
+      if (attempts > maxAttempts) { throw new Error("Could not sample " + count + " points"); }
+      const r = Math.sqrt(rng() * outerRadius * outerRadius);
+      const theta = rng() * 2 * Math.PI;
+      const candidate = [cx + r * Math.cos(theta), cy + r * Math.sin(theta)];
+      if (!isValidCandidate(candidate)) continue;
+      points.push(candidate);
+    }
+    return points;
+  }
+
+  const clamp = (p) => clampToRegion(p, cx, cy, effectiveOuter, canonicalSize, borderWidth);
+
+  if (distribution === "grid") {
+    // Each lattice column gets its OWN continuously-computed valid y-range (the circle's
+    // chord at that x, intersected with the workspace bounds), and places its proportional
+    // share of `count` evenly spaced within that range -- instead of an earlier version that
+    // shared a single global row grid across every column and then trimmed a discrete
+    // candidate pool down to `count`. Sharing a row grid meant any two columns landing on
+    // the exact row through `center`'s own y were co-radial: when bounds clipped that side,
+    // "shrink along this point's own ray" found the literal same nearest point for both.
+    // Per-column continuous placement can't collide this way (no candidates are ever
+    // generated/discarded, so there's nothing to trim unevenly either). Mirrors pattern.py's
+    // "grid" full-disk fast path exactly -- this tool never has an inner_radius or a
+    // restricted angle span, so there's no annulus/sector fallback path here at all.
+    //
+    // Columns are spaced over the ACTUAL available x-range, not the full circle diameter --
+    // and `cols` itself is chosen from that range's aspect ratio, not a bare sqrt(count).
+    // An earlier version spaced `cols` columns over the full diameter, then dropped
+    // whichever fell outside the workspace bounds: the survivors stayed at their original
+    // (full-diameter) spacing while every dropped column's share of `count` piled into the
+    // survivors' own y-ranges, visibly stretching x-spacing far wider than y-spacing once
+    // bounds clipped a meaningful fraction of the circle away.
+    let xMin = cx - effectiveOuter, xMax = cx + effectiveOuter;
+    let yMin = cy - effectiveOuter, yMax = cy + effectiveOuter;
+    if (canonicalSize) {
+      const bw = canonicalSize[0], bh = canonicalSize[1];
+      xMin = Math.max(xMin, borderWidth); xMax = Math.min(xMax, bw - borderWidth);
+      yMin = Math.max(yMin, borderWidth); yMax = Math.min(yMax, bh - borderWidth);
+    }
+    if (xMax <= xMin || yMax <= yMin) { throw new Error("Could not place " + count + " grid points"); }
+    const aspect = (xMax - xMin) / (yMax - yMin);
+    const cols = Math.max(1, Math.round(Math.sqrt(count * aspect)));
+    const stepX = (xMax - xMin) / cols;
+    // Each column's chord is further split around any cuts it crosses, via
+    // excludedYIntervalsAtX/subtractIntervals -- a column halved by a central cut gets half
+    // its previous share below, instead of every point that would have landed in the cut
+    // being relocated onto a dense ring right at its edge (see the comment block above
+    // mergeIntervals for the regression this fixes).
+    const colRanges = [];
+    for (let i = 0; i < cols; i++) {
+      const x = xMin + (i + 0.5) * stepX;
+      const halfChordSq = effectiveOuter * effectiveOuter - (x - cx) * (x - cx);
+      if (halfChordSq <= 0) continue;
+      const halfChord = Math.sqrt(halfChordSq);
+      const yLo = Math.max(cy - halfChord, yMin), yHi = Math.min(cy + halfChord, yMax);
+      if (yHi <= yLo) continue;
+      const excluded = cutPolygonsCanonical.length > 0 ? excludedYIntervalsAtX(x, borderWidth) : [];
+      const subRanges = excluded.length > 0 ? subtractIntervals(yLo, yHi, excluded) : [[yLo, yHi]];
+      for (const [subLo, subHi] of subRanges) {
+        if (subHi > subLo) colRanges.push([x, subLo, subHi]);
+      }
+    }
+    if (colRanges.length === 0) { throw new Error("Could not place " + count + " grid points"); }
+    const shares = allocateShares(colRanges.map((c) => c[2] - c[1]), count);
+    const ideal = [];
+    colRanges.forEach(function (col, idx) {
+      const share = shares[idx];
+      if (share <= 0) return;
+      const x = col[0], yLo = col[1], yHi = col[2];
+      const stepY = (yHi - yLo) / share;
+      for (let k = 0; k < share; k++) ideal.push([x, yLo + (k + 0.5) * stepY]);
+    });
+    const jitterRng = mulberry32(0); // fixed, NOT `seed` -- grid stays deterministic regardless
+    const guard = occupancyGuard(isValidCandidate, 0.5 * expectedSpacing);
+    return ideal.map(function (p, i) {
+      const point = relocateIfInvalid(p, guard.isValid, clamp, jitterRng, expectedSpacing, "grid", i, cx, cy, effectiveOuter);
+      guard.markPlaced(point);
+      return point;
+    });
+  }
+
+  // distribution === "radial": a Fermat/Vogel spiral (the "sunflower seed" arrangement) --
+  // r_i = sqrt(t_i) * effectiveOuter (effectiveOuter, not the raw outerRadius -- using the
+  // raw radius here was a real, reported bug: a border_width of 2 on a radius-10 disk
+  // collapsed 45% of 60 points onto the exact effectiveOuter boundary ring instead of
+  // spreading them down to fill the now-smaller disk, since `clamp`'s ray-shrink caught every
+  // point whose ideal r exceeded it). theta_i = i * golden_angle. No two points ever align
+  // radially or angularly, so there's no visible row/column/spoke structure, unlike a
+  // Cartesian (even jittered) lattice.
+  //
+  // When any cuts OR canonicalSize bounds restrict the disk, r is instead drawn from
+  // radialAvailableAreaCdf's inverse -- the available-angle-at-this-radius integral -- so a
+  // radius band mostly covered/clipped is assigned proportionally fewer points up front,
+  // instead of being assigned the unobstructed share and then relocating every one of those
+  // points outward along its own angle onto a dense ring right at the obstruction's edge (a
+  // real, reported regression -- mirrors pattern.py's _radial_available_area_cdf exactly).
+  // canonicalSize was missing from the first pass at this fix (which only covered cuts) --
+  // found from a follow-up report that radial was "just as broken" even after that fix,
+  // since canonicalSize (the workspace quad) is this tool's primary, near-universal use case
+  // and was still relying on relocateIfInvalid's clamp for any boundary violation.
+  const rng = mulberry32(seed);
+  const angleOffsetDeg = rng() * 360;
+  const guard = occupancyGuard(isValidCandidate, 0.5 * expectedSpacing);
+  const restricted = cutPolygonsCanonical.length > 0 || !!canonicalSize;
+  const radialCdf = restricted ? radialAvailableAreaCdf(cx, cy, effectiveOuter, borderWidth) : null;
+  const placed = [];
+  for (let i = 0; i < count; i++) {
+    const t = (i + 0.5) / count;
+    const r = radialCdf !== null ? invertRadialCdf(radialCdf, t) : Math.sqrt(t) * effectiveOuter;
+    let thetaDeg = (angleOffsetDeg + i * GOLDEN_ANGLE_DEG) % 360;
+    if (radialCdf !== null) {
+      // The blind golden-angle theta can land in a blocked sector at THIS point's own radius
+      // even though the CDF above already accounted for blocking when deciding how many
+      // points this radius shell gets overall -- and relocateIfInvalid's clamp step, for a
+      // canonicalSize violation specifically, shrinks the point INWARD along this same angle
+      // until back in bounds, silently overriding the CDF's carefully chosen radius rather
+      // than preserving it. So instead of leaving this to relocate, place the angle directly
+      // within whatever's actually open at r (the same idea as the grid fast path placing a
+      // point within a column's available sub-interval, just in angle instead of y).
+      const avail = availableAngleIntervalsAtRadius(r, cx, cy, borderWidth);
+      const placedTheta = placeInAvailableIntervals(avail, thetaDeg / 360);
+      if (placedTheta !== null) thetaDeg = placedTheta;
+    }
+    const ideal = [cx + r * Math.cos(thetaDeg * Math.PI / 180), cy + r * Math.sin(thetaDeg * Math.PI / 180)];
+    const point = relocateIfInvalid(ideal, guard.isValid, clamp, rng, expectedSpacing, "radial", i, cx, cy, effectiveOuter);
+    guard.markPlaced(point);
+    placed.push(point);
+  }
+  if (radialCdf !== null) {
+    return refineRadialLocalSeparation(placed, cx, cy, borderWidth, expectedSpacing);
+  }
+  return placed;
+}
+
+function sampleUnionPoints(circles, count, seed, distribution, countMode) {
+  // Mirrors pattern.py's generate_union_points -- "combined" (Independent: off) sampling
+  // across the UNION of every arm's own fitted circle, so an overlap between two arms'
+  // circles doesn't get sampled at roughly double the density of the non-overlapping parts.
+  // `circles`: [{center:[cx,cy], radius:r}, ...] in CANONICAL space. Always returns
+  // CANONICAL-space points, same as sampleSectorPoints.
+  const borderWidth = Math.max(0, parseFloat(borderWidthInput.value) || 0);
+  const effectiveCircles = circles
+    .map(function (c) { return { cx: c.center[0], cy: c.center[1], r: c.radius - borderWidth }; })
+    .filter(function (c) { return c.r > 0; });
+  if (effectiveCircles.length === 0) {
+    throw new Error("border width leaves no circle with positive effective radius");
+  }
+  if (distribution === "radial") {
+    throw new Error(
+      "distribution 'radial' is not yet supported for combined (union) sampling -- the " +
+      "Fermat/Vogel spiral is inherently single-center; use 'grid' or 'random' for now"
+    );
+  }
+
+  function isValidUnion(candidate) {
+    const px = candidate[0], py = candidate[1];
+    const insideAny = effectiveCircles.some(function (c) {
+      return (px - c.cx) * (px - c.cx) + (py - c.cy) * (py - c.cy) <= c.r * c.r;
+    });
+    if (!insideAny) return false;
+    if (canonicalSize) {
+      if (px < borderWidth || px > canonicalSize[0] - borderWidth) return false;
+      if (py < borderWidth || py > canonicalSize[1] - borderWidth) return false;
+    }
+    for (let i = 0; i < cutPolygonsCanonical.length; i++) {
+      if (pointNearPolygon(candidate, cutPolygonsCanonical[i], borderWidth)) return false;
+    }
+    return true;
+  }
+
+  let xMin = Math.min.apply(null, effectiveCircles.map(function (c) { return c.cx - c.r; }));
+  let xMax = Math.max.apply(null, effectiveCircles.map(function (c) { return c.cx + c.r; }));
+  let yMin = Math.min.apply(null, effectiveCircles.map(function (c) { return c.cy - c.r; }));
+  let yMax = Math.max.apply(null, effectiveCircles.map(function (c) { return c.cy + c.r; }));
+  if (canonicalSize) {
+    xMin = Math.max(xMin, borderWidth); xMax = Math.min(xMax, canonicalSize[0] - borderWidth);
+    yMin = Math.max(yMin, borderWidth); yMax = Math.min(yMax, canonicalSize[1] - borderWidth);
+  }
+  if (xMax <= xMin || yMax <= yMin) {
+    throw new Error("Could not place " + count + " union point(s) -- bounds/border width leave no area");
+  }
+  // Based on total circle area (ignoring overlap -- fine as a search-scale estimate, not a
+  // correctness-critical value), NOT the bounding box's diagonal -- see pattern.py's
+  // generate_union_points for why a bbox-based estimate is the wrong proxy here (a smaller
+  // circle sharing a wide bbox with a bigger one gets an overestimated expected spacing,
+  // which made occupancyGuard's minSeparation too tight relative to that circle's true
+  // point-to-point spacing -- a real test failure, not a hypothetical).
+  const totalCircleArea = effectiveCircles.reduce(function (a, c) { return a + Math.PI * c.r * c.r; }, 0);
+  const expectedSpacing = totalCircleArea > 0 ? Math.sqrt(totalCircleArea / count) : 1;
+
+  if (countMode === "variable") {
+    if (distribution !== "grid") {
+      throw new Error("count_mode='variable' only supports distribution 'grid' for a union pattern");
+    }
+    const makeGrid = function (density) {
+      const aspect = (xMax - xMin) / (yMax - yMin);
+      const cols = Math.max(1, Math.round(Math.sqrt(density * aspect)));
+      const rows = Math.max(1, Math.round(density / cols));
+      const stepX = (xMax - xMin) / cols, stepY = (yMax - yMin) / rows;
+      const points = [];
+      for (let i = 0; i < cols; i++) {
+        for (let j = 0; j < rows; j++) {
+          const p = [xMin + (i + 0.5) * stepX, yMin + (j + 0.5) * stepY];
+          if (isValidUnion(p)) points.push(p);
+        }
+      }
+      return points;
+    };
+    const points = searchVariableDensity(makeGrid, count);
+    if (points.length === 0) throw new Error("count_mode='variable' produced zero valid points");
+    return points;
+  }
+
+  function nearestCircle(point) {
+    const px = point[0], py = point[1];
+    let best = effectiveCircles[0], bestScore = Math.hypot(px - best.cx, py - best.cy) - best.r;
+    for (let i = 1; i < effectiveCircles.length; i++) {
+      const c = effectiveCircles[i];
+      const score = Math.hypot(px - c.cx, py - c.cy) - c.r;
+      if (score < bestScore) { bestScore = score; best = c; }
+    }
+    return best;
+  }
+
+  if (distribution === "random") {
+    const rng = mulberry32(seed);
+    const points = [];
+    const maxAttempts = count * 200;
+    let attempts = 0;
+    while (points.length < count) {
+      attempts++;
+      if (attempts > maxAttempts) throw new Error("Could not sample " + count + " union point(s)");
+      const candidate = [xMin + rng() * (xMax - xMin), yMin + rng() * (yMax - yMin)];
+      if (!isValidUnion(candidate)) continue;
+      points.push(candidate);
+    }
+    return points;
+  }
+
+  // distribution === "grid"
+  const jitterRng = mulberry32(0);
+  const guard = occupancyGuard(isValidUnion, 0.5 * expectedSpacing);
+  const aspect = (xMax - xMin) / (yMax - yMin);
+  const cols = Math.max(1, Math.round(Math.sqrt(count * aspect)));
+  const stepX = (xMax - xMin) / cols;
+  const colRanges = [];
+  for (let i = 0; i < cols; i++) {
+    const x = xMin + (i + 0.5) * stepX;
+    const rawChords = [];
+    effectiveCircles.forEach(function (c) {
+      const dx = x - c.cx;
+      if (Math.abs(dx) > c.r) return;
+      const halfChord = Math.sqrt(c.r * c.r - dx * dx);
+      const lo = Math.max(c.cy - halfChord, yMin), hi = Math.min(c.cy + halfChord, yMax);
+      if (hi > lo) rawChords.push([lo, hi]);
+    });
+    const mergedChords = mergeIntervals(rawChords);
+    if (mergedChords.length === 0) continue;
+    if (cutPolygonsCanonical.length > 0) {
+      const excluded = excludedYIntervalsAtX(x, borderWidth);
+      mergedChords.forEach(function (chord) {
+        subtractIntervals(chord[0], chord[1], excluded).forEach(function (sub) {
+          if (sub[1] > sub[0]) colRanges.push([x, sub[0], sub[1]]);
+        });
+      });
+    } else {
+      mergedChords.forEach(function (chord) { colRanges.push([x, chord[0], chord[1]]); });
+    }
+  }
+  if (colRanges.length === 0) throw new Error("Could not place " + count + " union grid point(s)");
+  const shares = allocateShares(colRanges.map(function (c) { return c[2] - c[1]; }), count);
+  const ideal = [];
+  colRanges.forEach(function (col, idx) {
+    const share = shares[idx];
+    if (share <= 0) return;
+    const x = col[0], yLo = col[1], yHi = col[2];
+    const stepY = (yHi - yLo) / share;
+    for (let k = 0; k < share; k++) ideal.push([x, yLo + (k + 0.5) * stepY]);
+  });
+
+  return ideal.map(function (p, i) {
+    const nearest = nearestCircle(p);
+    const clamp = function (pt) { return clampToRegion(pt, nearest.cx, nearest.cy, nearest.r, canonicalSize, borderWidth); };
+    const point = relocateIfInvalid(p, guard.isValid, clamp, jitterRng, expectedSpacing, "union grid", i, nearest.cx, nearest.cy, nearest.r);
+    guard.markPlaced(point);
+    return point;
+  });
+}
+
+// Dispatches combined-mode sampling to whichever of sampleSectorPoints/sampleUnionPoints is
+// actually correct for the current circle count -- NOT just "call sampleUnionPoints whenever
+// independent is off." With exactly one circle (the common case: a single-arm session, which
+// defaults to combined mode), routing through sampleUnionPoints unconditionally was a real
+// bug, not just a missing feature: that function rejects distribution "radial" outright
+// regardless of circle count, so a brand-new single-arm session selecting "Radial" got a
+// preview error for no real reason -- the union machinery doesn't even apply when there's
+// nothing to union. Mirrors updateExportText's existing "exactly 1 circle -> shape: sector"
+// special case, so the live preview and the exported config always agree. Temporarily
+// repoints the module-level `fittedCircle` (which sampleSectorPoints/isValidCandidate read
+// directly) at the one circle being sampled, then restores it in a `finally` -- restoration
+// must happen even if sampleSectorPoints throws, since `fittedCircle` is relied on elsewhere
+// to mean "the ACTIVE arm's circle," not whichever circle happened to be the lone entry here
+// (the lone circle in a 1-circle union isn't necessarily the active arm's own -- e.g. the
+// active arm might still be uncalibrated while a different, inactive arm already has one).
+function sampleCombinedPoints(circles, count, seed, distribution, countMode) {
+  if (circles.length === 0) return [];
+  if (circles.length === 1) {
+    const savedFittedCircle = fittedCircle;
+    fittedCircle = circles[0];
+    try {
+      return countMode === "variable"
+        ? sampleSectorPointsVariable(count, seed, distribution)
+        : sampleSectorPoints(count, seed, distribution);
+    } finally {
+      fittedCircle = savedFittedCircle;
+    }
+  }
+  return sampleUnionPoints(circles, count, seed, distribution, countMode);
+}
+
+// Mirrors pattern.py's generate_rotation_angles exactly: `count` target angles, "uniform"
+// placed at the center of each of `count` equal sub-slices (NOT both inclusive endpoints --
+// that would duplicate the 0/360 wraparound point for the common full-rotation case),
+// "random" via `count` independent seeded draws.
+function generateRotationAngles(count, method, angleStart, angleEnd, seed, initialAngle) {
+  // angleStart/angleEnd are RELATIVE to initialAngle -- see pattern.py's docstring.
+  const start = (initialAngle || 0) + angleStart;
+  const end = (initialAngle || 0) + angleEnd;
+  const span = end - start;
+  if (method === "random") {
+    const rng = mulberry32(seed);
+    const angles = [];
+    for (let i = 0; i < count; i++) angles.push(start + rng() * span);
+    return angles;
+  }
+  if (count === 1) return [start];
+  const divisor = span % 360 === 0 ? count : count - 1;
+  const angles = [];
+  for (let i = 0; i < count; i++) angles.push(start + i * span / divisor);
+  return angles;
+}
+
+// Mirrors pattern.py's orientation_arrow_points -- but simpler here, since this tool already
+// keeps sample points in CANONICAL space directly (samplePointsCanonical), unlike the Python
+// overlay's session.py, which only has the final PIXEL-space point and has to recover
+// canonical coordinates via invert_homography first. Rotating in canonical space (not pixel
+// space) is what matters -- a homography doesn't preserve angles, so this is what makes the
+// arrow forward-mapped through it foreshorten/skew correctly to match how a real rotated
+// object would look under a tilted camera.
+function orientationTipCanonical(positionCanonical, angleDeg, length) {
+  const theta = angleDeg * Math.PI / 180;
+  return [positionCanonical[0] + length * Math.cos(theta), positionCanonical[1] + length * Math.sin(theta)];
+}
+
+// A point's own override (full config, set via the box-select tool) wins over whatever cfg
+// the caller passed as the default; "random" offsets the seed by the point's own index so
+// every point's random draw is independent rather than identical. Shared by the legacy
+// single-target preview (renderAll) and the per-object stacking preview (objectStackAt/
+// computeEpisodePlacements below) -- hoisted to top level (was a renderAll-local closure)
+// specifically so both can call it.
+function anglesForPoint(cfg, idx) {
+  return generateRotationAngles(
+    cfg.orientationCount, cfg.orientationMethod, cfg.orientationAngleStart,
+    cfg.orientationAngleEnd, cfg.orientationMethod === "random" ? cfg.orientationSeed + idx : cfg.orientationSeed,
+    cfg.orientationInitialAngle,
+  );
+}
+
+// Keeps the "Radial" distribution option enabled/disabled in sync with whether it's actually
+// usable right now, and falls back to "grid" if a selection that just became invalid was
+// already active -- e.g. the operator had "Radial" selected with one arm, then added/fitted a
+// second arm while in combined mode. Independent mode always samples exactly one (the
+// active) circle at a time, so radial is always available there regardless of arm count.
+function updateDistributionAvailability() {
+  const combinedCircleCount = arms.filter(function (a) { return a.fittedCircle; }).length;
+  const radialUnavailable = !independent && combinedCircleCount > 1;
+  distributionRadialOption.disabled = radialUnavailable;
+  distributionRadialOption.title = radialUnavailable
+    ? "Not available when combining 2+ arms (Independent: off) -- use Grid or Random, or turn Independent on"
+    : "";
+  if (radialUnavailable && distributionSelect.value === "radial") {
+    distributionSelect.value = "grid";
+    sampleOverrides = {};
+  }
+}
+
+// "Variable" count mode (mirrors pattern.py's count_mode='variable' restriction): never
+// available for "random" (rejection sampling already only returns valid points, nothing to
+// "search density" for). "radial" is fine for a single circle (independent mode, or exactly
+// one combined circle) but updateDistributionAvailability() already disables "radial"
+// outright once 2+ circles are being combined (Independent: off) -- so by the time this
+// runs, "radial" + 2+ combined circles can't actually be selected, and "grid" + 2+ combined
+// circles IS supported (sampleUnionPoints accepts count_mode='variable' for distribution
+// 'grid'). That leaves "random" as the only real restriction left to enforce here.
+// With exactly 1 arm, "combined" and "independent" produce an identical pattern (a union of
+// 1 circle IS that circle -- SETTINGS_FIELDS already mirrors arm/combinedSettings whenever
+// arms.length === 1, so there's nothing to lose by forcing this) -- but they render
+// DIFFERENTLY: combined mode draws every sample dot in a neutral color since "no single arm
+// owns it," which looks wrong (and was reported directly) for the overwhelmingly common
+// single-arm case, where every point obviously does belong to that one arm. Forcing
+// `independent = true` whenever there's only one arm makes sample dots (including ones added
+// via the "+" tool, since color is computed uniformly for the whole set, not per-point --
+// see sampleColor below) always show in that arm's own color. The checkbox is disabled in
+// this case since toggling it cannot change anything.
+function updateIndependentAvailability() {
+  independent = arms.length === 1 ? true : independentUserPreference;
+  independentToggle.checked = independent;
+  independentToggle.disabled = arms.length === 1;
+}
+
+function updateCountModeAvailability() {
+  const variableUnavailable = distributionSelect.value === "random";
+  countModeVariableOption.disabled = variableUnavailable;
+  if (variableUnavailable && countModeSelect.value === "variable") {
+    countModeSelect.value = "fixed";
+    sampleOverrides = {};
+  }
+}
+
+// ── Derived state, recomputed every render ─────────────────────────────────
+let homography = null, inverseHomography = null, canonicalSize = null, extremePointsCanonical = [];
+let samplePointsCanonical = [], samplePointsCamera = [], cutPolygonsCanonical = [];
+let orientationTipsCanonical = [], orientationTipsCamera = [];
+// Per final sample-point index: objectStackAt(i, point) -- [] when no object is assigned
+// there. Computed once per render; consumed by the marginal-overlay branch of
+// renderCameraView/renderOrthoView. Only meaningful once objects.length > 0.
+let objectStacksAtPoint = [];
+// This episode's exact simultaneous multi-object placement (computeEpisodePlacements), only
+// recomputed when previewMode === "episode" -- consumed by the episode-stepper render branch.
+let episodePlacements = [];
+let orthoScale = 1;
+let lastCanonicalSize = null; // for rescaleCanonicalShapes() -- see below
+// One entry per INACTIVE arm (null for the active one, which renders from the live globals
+// instead): { arm, extremePointsCanonical }. Full detail (sample-point preview, edit handles)
+// stays active-arm-only -- see renderCameraView/renderOrthoView -- so this only needs enough
+// to draw a light "here's roughly where this arm's circle/extreme points are" outline.
+let otherArmsRenderData = [];
+
+function rescaleCanonicalShapes(scaleX, scaleY) {
+  // canonicalSize is RE-DERIVED from the corners' own pixel distances every render
+  // (canonicalRectDims) -- so nudging a corner even slightly changes the canonical
+  // coordinate system's scale. fittedCircle/cutShapesCanonical hold ABSOLUTE canonical
+  // numbers, so without this they'd silently drift out of physical proportion to the
+  // workspace on every corner edit (symptom: "the sampled circle gets cut" more or less
+  // each time a corner moves, even a tiny amount) instead of staying visually/physically
+  // anchored to the workspace the way the grid lines already do. Applied every render, so
+  // it also tracks smoothly frame-by-frame during a live corner drag.
+  const avgScale = Math.sqrt(scaleX * scaleY);
+  // Every arm's reach circle needs this, not just the active one -- a corner edit affects the
+  // shared homography all arms are interpreted through, regardless of which is currently
+  // selected. The active arm's `fittedCircle` IS the live global (mutated directly here, same
+  // as before bimanual support); every other arm's is rescaled via its own stored copy in
+  // `arms[i]`. `fittedCircle` is purely per-arm (not a SETTINGS_FIELDS entry, never mirrored
+  // into `combinedSettings`), so there's no aliasing concern here the way there is below.
+  arms.forEach(function (arm, i) {
+    const circle = i === activeArmIndex ? fittedCircle : arm.fittedCircle;
+    if (circle) {
+      circle.center = [circle.center[0] * scaleX, circle.center[1] * scaleY];
+      circle.radius *= avgScale;
+    }
+  });
+  // sampleOverrides/extraSamplePoints are SETTINGS_FIELDS entries shared by name across
+  // combinedSettings and every arm's own settings -- but the ACTUAL array/object a given name
+  // points to can be the literal SAME reference as the live global: always when
+  // arms.length === 1 (syncActiveArmFromGlobals explicitly mirrors them together), or
+  // whenever the currently-live settings object (combinedSettings if `!independent`, else
+  // arms[activeArmIndex]) is one of them. A previous version iterated
+  // `[combinedSettings].concat(arms)` unconditionally, which scaled an aliased array/object
+  // once PER ALIAS -- e.g. with 1 arm, both `combinedSettings.extraSamplePoints` and
+  // `arms[0].extraSamplePoints` ARE the live `extraSamplePoints` array, so it got scaled
+  // twice, compounding to scale^2 ("when i scale the workspace the points do not scale
+  // proportionally," reported directly -- they were actually scaling by scale^2, not failing
+  // to scale at all). Deduplicating by reference identity fixes every arrangement (1 arm, 2+
+  // arms independent, 2+ arms combined) uniformly, with no need to reason case-by-case about
+  // which objects currently alias which.
+  const seenArrays = [], seenOverrideObjects = [];
+  function rescaleArrayOnce(arr) {
+    if (!arr || seenArrays.indexOf(arr) !== -1) return;
+    seenArrays.push(arr);
+    for (let i = 0; i < arr.length; i++) arr[i] = [arr[i][0] * scaleX, arr[i][1] * scaleY];
+  }
+  function rescaleOverridesOnce(obj) {
+    if (!obj || seenOverrideObjects.indexOf(obj) !== -1) return;
+    seenOverrideObjects.push(obj);
+    Object.keys(obj).forEach(function (key) {
+      const p = obj[key];
+      obj[key] = [p[0] * scaleX, p[1] * scaleY];
+    });
+  }
+  rescaleArrayOnce(extraSamplePoints);
+  rescaleOverridesOnce(sampleOverrides);
+  [combinedSettings].concat(arms).forEach(function (s) {
+    rescaleArrayOnce(s.extraSamplePoints);
+    rescaleOverridesOnce(s.sampleOverrides);
+  });
+  cutShapesCanonical.forEach(function (shape) {
+    if (shape.type === "circle") {
+      shape.center = [shape.center[0] * scaleX, shape.center[1] * scaleY];
+      shape.radius *= avgScale;
+    } else {
+      const verts = cutShapeVertices(shape);
+      for (let i = 0; i < verts.length; i++) verts[i] = [verts[i][0] * scaleX, verts[i][1] * scaleY];
+    }
+  });
+}
+
+function renderAll() {
+  updateIndependentAvailability(); // before syncActiveArmFromGlobals -- see its own comment
+  syncActiveArmFromGlobals(); // keep arms[activeArmIndex] fresh for export/other-arm rendering
+  orientationDetailFields.style.display = orientationToggle.checked ? "" : "none";
+  armColorLegend.style.display = arms.length > 1 ? "" : "none";
+  homography = (cameraCorners.length === 4) ? computeHomography(cameraCorners) : null;
+  inverseHomography = homography ? invertMatrix3(homography) : null;
+  canonicalSize = homography ? canonicalRectDims(cameraCorners) : null;
+  if (canonicalSize && lastCanonicalSize &&
+      (canonicalSize[0] !== lastCanonicalSize[0] || canonicalSize[1] !== lastCanonicalSize[1])) {
+    rescaleCanonicalShapes(canonicalSize[0] / lastCanonicalSize[0], canonicalSize[1] / lastCanonicalSize[1]);
+  }
+  lastCanonicalSize = canonicalSize;
+  extremePointsCanonical = inverseHomography
+    ? extremePointsCamera.map(function (p) { return toCanonical(p); })
+    : [];
+  cutPolygonsCanonical = cutShapesCanonical.map(cutShapeBoundary);
+  // Self-healing, every render, exactly like the generator's own "base" points already are --
+  // previously this only ran from a handful of specific call sites (a cut being created, a
+  // cut/circle handle drag ending, a sample drag ending), and a real report ("add points
+  // manually AND THEN add the cuts, the cuts dont affect them") suggests at least one real
+  // path was still missed. Running it unconditionally here removes the whole "did I hook
+  // every mutation path" category of bug -- ANY change that leads to a render also revalidates
+  // extraSamplePoints/sampleOverrides against the now-current cuts/circle/bounds.
+  revalidateManualPoints();
+  otherArmsRenderData = arms.map(function (arm, i) {
+    if (i === activeArmIndex) return null;
+    return {
+      arm: arm,
+      extremePointsCanonical: inverseHomography ? arm.extremePointsCamera.map(function (p) { return toCanonical(p); }) : [],
+    };
+  });
+  updateCountModeAvailability();
+  updateDistributionAvailability(); // before reading distributionSelect.value below, so a
+                                     // just-invalidated "radial" selection's fallback to
+                                     // "grid" takes effect within this same render pass
+  samplePointsCanonical = [];
+  let sampleError = null;
+  // Independent: each arm samples its OWN circle independently (today's original behavior).
+  // Combined (default): every arm's fitted circle is sampled together as their UNION, so an
+  // overlap between two arms' circles isn't double-density -- see the `independent` state
+  // comment above and CLAUDE.md. Either way, manual per-point overrides (the "Move sample
+  // points" tool) win over whatever the algorithm computed for that index, applied after
+  // generation so overriding one point can't perturb the others' computed positions.
+  if (independent) {
+    if (fittedCircle) {
+      try {
+        const steps = Math.max(1, parseInt(stepsInput.value) || 1);
+        const seed = parseInt(seedInput.value) || 0;
+        samplePointsCanonical = countModeSelect.value === "variable"
+          ? sampleSectorPointsVariable(steps, seed, distributionSelect.value)
+          : sampleSectorPoints(steps, seed, distributionSelect.value);
+        Object.keys(sampleOverrides).forEach(function (key) {
+          const idx = parseInt(key, 10);
+          if (idx >= 0 && idx < samplePointsCanonical.length) samplePointsCanonical[idx] = sampleOverrides[idx];
+        });
+      } catch (e) { sampleError = e.message; }
+    }
+  } else {
+    const circlesForUnion = arms.filter(function (a) { return a.fittedCircle; }).map(function (a) { return a.fittedCircle; });
+    if (circlesForUnion.length > 0) {
+      try {
+        const steps = Math.max(1, parseInt(stepsInput.value) || 1);
+        const seed = parseInt(seedInput.value) || 0;
+        samplePointsCanonical = sampleCombinedPoints(circlesForUnion, steps, seed, distributionSelect.value, countModeSelect.value);
+        Object.keys(sampleOverrides).forEach(function (key) {
+          const idx = parseInt(key, 10);
+          if (idx >= 0 && idx < samplePointsCanonical.length) samplePointsCanonical[idx] = sampleOverrides[idx];
+        });
+      } catch (e) { sampleError = e.message; }
+    }
+  }
+  // Manual add/remove (the "+" tool): drop removed generated indices, then append any
+  // manually-added extra points -- sampleOrigins records what each final index actually IS,
+  // so a later click on it knows whether to un-remove a base point or delete an extra one.
+  sampleOrigins = [];
+  samplePointsCanonical = samplePointsCanonical
+    .map(function (p, i) { return { p: p, origin: { kind: "base", baseIndex: i } }; })
+    .filter(function (e) { return removedSampleIndices.indexOf(e.origin.baseIndex) === -1; })
+    .concat(extraSamplePoints.map(function (p, i) { return { p: p, origin: { kind: "extra", extraIndex: i } }; }))
+    .map(function (e) { sampleOrigins.push(e.origin); return e.p; });
+  samplePointsCamera = homography
+    ? samplePointsCanonical.map(function (p) { return toPixel(p); })
+    : [];
+  actualCountLabel.textContent = countModeSelect.value === "variable"
+    ? "(" + samplePointsCanonical.length + " actual)"
+    : "";
+
+  orientationPreviewLabel.textContent = orientationPreviewLabelText();
+  // "Select first, then Assign/Unassign" -- both buttons act on the CURRENT selection, so
+  // there's nothing useful for either to do without an active object AND a non-empty
+  // selection. Recomputed every render since orientationSelectedIndices changes on nearly
+  // every click/drag, not just on an object add/remove/switch (renderObjectChips's trigger).
+  assignSelectedBtn.disabled = unassignSelectedBtn.disabled =
+    activeObjectIndex < 0 || orientationSelectedIndices.length === 0;
+  // Orientation guide arrows -- one per sample point, cycling through its own independently-
+  // sized rotation list via index % length (mirrors target_for_episode/generate_rotation_
+  // angles in pattern.py: position count and rotation count are deliberately decoupled, see
+  // CLAUDE.md). With objects defined, this legacy "one shared target for every point" preview
+  // is suppressed in favor of objectStacksAtPoint below (each point's own arrows belong to
+  // whichever object(s) are actually assigned there, not to one tool-wide setting) -- the
+  // render functions read orientationTipsCanonical/Camera only on the `objects.length === 0`
+  // path, so leaving them empty here is enough to disable that path's drawing.
+  if (objects.length === 0) {
+    const orientationSettings = currentDefaultOrientationSettings();
+    const overrides = orientationSettings.orientationOverrides || {};
+    // A point's own override (full config, set via the box-select tool) wins over the global
+    // settings; with no override it falls back to the global enabled/count/method/etc.
+    orientationTipsCanonical = samplePointsCanonical.map(function (p, i) {
+      const cfg = overrides[i] || orientationSettings;
+      if (!cfg.orientationEnabled) return [];
+      return anglesForPoint(cfg, i).map(function (a) { return orientationTipCanonical(p, a, cfg.orientationArrowLength); });
+    });
+  } else {
+    orientationTipsCanonical = samplePointsCanonical.map(function () { return []; });
+  }
+  orientationTipsCamera = homography
+    ? orientationTipsCanonical.map(function (tips) { return tips.map(function (p) { return toPixel(p); }); })
+    : [];
+
+  // Per-object preview: each final sample point's assigned objects (marginal overlay), plus
+  // this episode's exact simultaneous placement when that's the active preview mode -- see
+  // the "Objects" section above for objectStackAt/computeEpisodePlacements/maxEpisodeCount.
+  objectStacksAtPoint = objects.length > 0
+    ? samplePointsCanonical.map(function (p, i) { return objectStackAt(i, p); })
+    : [];
+  const episodeCount = maxEpisodeCount();
+  currentEpisode = Math.max(0, Math.min(currentEpisode, episodeCount - 1));
+  episodeLabel.textContent = "episode " + (currentEpisode + 1) + "/" + episodeCount;
+  episodePrevBtn.disabled = currentEpisode <= 0;
+  episodeNextBtn.disabled = currentEpisode >= episodeCount - 1;
+  if (objects.length > 0 && previewMode === "episode") {
+    const result = computeEpisodePlacements(currentEpisode);
+    episodePlacements = result.sites;
+    episodeKeepApartResidual = result.residual;
+  } else {
+    episodePlacements = [];
+    episodeKeepApartResidual = [];
+  }
+  updateCollisionWarning();
+  updateSampleCountLabel();
+
+  renderCameraView();
+  renderOrthoView();
+  updateExportText(sampleError);
+}
+
+// Scans (a bounded number of) episodes for "keep_apart" residual collisions -- objects that
+// couldn't be separated because all of their own points were already taken -- and warns BEFORE
+// an operator runs a real session that would hit the same thing (mirrors session.py's own
+// per-episode logger.warning via the identical resolveKeepApart logic, just summarized across
+// episodes up front instead of one at a time during recording).
+const KEEP_APART_SCAN_LIMIT = 50;
+function updateCollisionWarning() {
+  if (coLocation !== "keep_apart" || objects.length === 0) {
+    collisionWarning.style.display = "none";
+    return;
+  }
+  const episodeCount = Math.min(maxEpisodeCount(), KEEP_APART_SCAN_LIMIT);
+  const messages = [];
+  for (let e = 0; e < episodeCount; e++) {
+    const residual = computeEpisodePlacements(e).residual;
+    if (residual.length > 0) messages.push("episode " + (e + 1) + ": " + residual.join(" & "));
+  }
+  if (messages.length > 0) {
+    collisionWarning.textContent = "Keep-apart couldn't fully separate some objects (all of " +
+      "their own points were already taken) -- " + messages.slice(0, 5).join("; ") +
+      (messages.length > 5 ? "; ..." : "") + ". They'll render as a stack on those episodes.";
+    collisionWarning.style.display = "";
+  } else {
+    collisionWarning.style.display = "none";
+  }
+}
+
+// Breakdown-delta sample counter: BASE is the actual rendered point count
+// (samplePointsCanonical.length -- already accounts for count_mode: "variable" producing
+// fewer points than the configured `steps`, unlike that config number itself), then shows what
+// each feature ADDS on top -- object assignment (incl. stacking, when 2+ objects share a
+// point) and rotation, so it's clear how big the real sample/target set actually is.
+function updateSampleCountLabel() {
+  const basePoints = samplePointsCanonical.length;
+  let text = basePoints + " point" + (basePoints === 1 ? "" : "s");
+  if (objects.length === 0) {
+    // Legacy (no objects): one shared, tool-wide rotation setting multiplies every point.
+    const orientationSettings = currentDefaultOrientationSettings();
+    const rotCount = orientationSettings.orientationEnabled ? orientationSettings.orientationCount : 1;
+    const targets = basePoints * rotCount;
+    if (rotCount > 1) text += " · " + targets + " targets (+" + (targets - basePoints) + " from rotations)";
+    sampleCountLabel.textContent = text;
+    return;
+  }
+  // Each object contributes its own `assigned` count as a "placement" -- if 2+ objects share a
+  // point, that point is counted once per object (this IS the stacking signal: placements >
+  // basePoints can only happen via overlap, since disjoint assigned sets can sum to at most
+  // basePoints). Each placement multiplies again by that object's OWN rotation count, if set.
+  let placements = 0, targets = 0;
+  objects.forEach(function (o) {
+    const n = o.assigned.length;
+    placements += n;
+    targets += n * (o.orientationEnabled ? o.orientationCount : 1);
+  });
+  const placementDelta = placements - basePoints;
+  text += " · " + placements + " placement" + (placements === 1 ? "" : "s");
+  if (placementDelta > 0) text += " (+" + placementDelta + " stacked)";
+  else if (placementDelta < 0) text += " (" + placementDelta + " unused)";
+  const rotationDelta = targets - placements;
+  text += " · " + targets + " target" + (targets === 1 ? "" : "s");
+  if (rotationDelta > 0) text += " (+" + rotationDelta + " from rotations)";
+  sampleCountLabel.textContent = text;
+}
+
+// ── Rendering ───────────────────────────────────────────────────────────────
+function drawPolygon(ctx, vertices, fillStyle, strokeStyle, lineWidth, dash) {
+  if (vertices.length < 2) return;
+  ctx.beginPath();
+  ctx.moveTo(vertices[0][0], vertices[0][1]);
+  for (let i = 1; i < vertices.length; i++) ctx.lineTo(vertices[i][0], vertices[i][1]);
+  ctx.closePath();
+  if (fillStyle) { ctx.fillStyle = fillStyle; ctx.fill(); }
+  if (strokeStyle) {
+    ctx.setLineDash(dash || []);
+    ctx.strokeStyle = strokeStyle;
+    ctx.lineWidth = lineWidth || 2;
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+function drawArrow(ctx, tail, tip, color, lineWidth) {
+  // A line plus a small "V" arrowhead at the tip -- pure 2D drawing, no perspective math of
+  // its own (the caller already projected tail/tip into whichever space this canvas draws
+  // in: pixel for the camera view, orthoScale-scaled canonical for the orthographic view).
+  const width = lineWidth || 2;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.beginPath();
+  ctx.moveTo(tail[0], tail[1]);
+  ctx.lineTo(tip[0], tip[1]);
+  ctx.stroke();
+  const angle = Math.atan2(tip[1] - tail[1], tip[0] - tail[0]);
+  const headLen = Math.max(6, width * 4);
+  const headAngle = Math.PI / 7;
+  ctx.beginPath();
+  ctx.moveTo(tip[0], tip[1]);
+  ctx.lineTo(tip[0] - headLen * Math.cos(angle - headAngle), tip[1] - headLen * Math.sin(angle - headAngle));
+  ctx.moveTo(tip[0], tip[1]);
+  ctx.lineTo(tip[0] - headLen * Math.cos(angle + headAngle), tip[1] - headLen * Math.sin(angle + headAngle));
+  ctx.stroke();
+}
+
+function renderCutShapeCamera(ctx, shape, H, selected) {
+  const boundary = cutShapeBoundary(shape).map(function (p) { return applyHomography(H, p); });
+  drawPolygon(ctx, boundary, selected ? "rgba(248,113,113,0.35)" : "rgba(248,113,113,0.2)", "#f87171", selected ? 3 : 2, [6, 4]);
+  pixelHandlesForShape(shape, H).forEach(function (h) {
+    ctx.beginPath(); ctx.arc(h.pixelPoint[0], h.pixelPoint[1], 4, 0, 2 * Math.PI);
+    ctx.fillStyle = "#f87171"; ctx.fill();
+  });
+}
+
+function renderCameraView() {
+  const ctx = cameraCanvas.getContext("2d");
+  ctx.clearRect(0, 0, cameraCanvas.width, cameraCanvas.height);
+  const interaction = activeInteraction();
+
+  if (cameraCorners.length === 4) {
+    drawPolygon(ctx, cameraCorners, "rgba(56,189,248,0.15)", "#38bdf8", 2);
+
+    if (gridToggle.checked && homography && canonicalSize) {
+      ctx.strokeStyle = "rgba(56,189,248,0.5)";
+      ctx.lineWidth = 1;
+      const n = 8;
+      for (let i = 0; i <= n; i++) {
+        const u = canonicalSize[0] * i / n;
+        const p1 = toPixel([u, 0]);
+        const p2 = toPixel([u, canonicalSize[1]]);
+        ctx.beginPath(); ctx.moveTo(p1[0], p1[1]); ctx.lineTo(p2[0], p2[1]); ctx.stroke();
+      }
+      for (let i = 0; i <= n; i++) {
+        const v = canonicalSize[1] * i / n;
+        const p1 = toPixel([0, v]);
+        const p2 = toPixel([canonicalSize[0], v]);
+        ctx.beginPath(); ctx.moveTo(p1[0], p1[1]); ctx.lineTo(p2[0], p2[1]); ctx.stroke();
+      }
+    }
+
+    cameraCorners.forEach(function (c) {
+      ctx.beginPath();
+      ctx.arc(c[0], c[1], 7, 0, 2 * Math.PI);
+      ctx.fillStyle = cornersLocked ? "#5b6274" : "#38bdf8";
+      ctx.fill();
+      ctx.strokeStyle = "#0a0e17";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    });
+
+    if (interaction === "corners" && !cornersLocked) {
+      const c = scaleHandlePosition(cameraCorners);
+      ctx.save();
+      ctx.translate(c[0], c[1]);
+      ctx.rotate(Math.PI / 4);
+      ctx.fillStyle = "#34d399";
+      ctx.fillRect(-6, -6, 12, 12);
+      ctx.strokeStyle = "#0a0e17";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(-6, -6, 12, 12);
+      ctx.restore();
+    }
+  }
+
+  if (homography) {
+    cutShapesCanonical.forEach(function (shape, i) { renderCutShapeCamera(ctx, shape, homography, i === selectedCutIndex); });
+  }
+
+  // In-progress cut draft preview -- built in canonical space, then forward-mapped, exactly
+  // like a committed cut shape would be.
+  if (interaction === "polygon" && polyDraft.length > 0 && homography) {
+    const previewCanonical = polyHoverCanonical ? polyDraft.concat([polyHoverCanonical]) : polyDraft;
+    const previewPixel = previewCanonical.map(function (cp) { return toPixel(cp); });
+    drawPolygon(ctx, previewPixel, null, "#f87171", 2, [3, 3]);
+    polyDraft.forEach(function (v) {
+      const vp = toPixel(v);
+      ctx.beginPath(); ctx.arc(vp[0], vp[1], 4, 0, 2 * Math.PI);
+      ctx.fillStyle = "#f87171"; ctx.fill();
+    });
+  }
+  if (cutDragging && cutAnchor && cutPreview && homography) {
+    let draftShape = null;
+    if (interaction === "rectangle") {
+      draftShape = { type: "rectangle", corners: rectangleVertices(cutAnchor, cutPreview) };
+    } else if (interaction === "circle") {
+      draftShape = { type: "circle", center: cutAnchor, radius: Math.hypot(cutPreview[0] - cutAnchor[0], cutPreview[1] - cutAnchor[1]) };
+    }
+    if (draftShape) {
+      const boundary = cutShapeBoundary(draftShape).map(function (cp) { return toPixel(cp); });
+      drawPolygon(ctx, boundary, "rgba(248,113,113,0.15)", "#f87171", 2, [3, 3]);
+    } else if (interaction === "select") {
+      const boundary = rectangleVertices(cutAnchor, cutPreview).map(function (cp) { return toPixel(cp); });
+      drawPolygon(ctx, boundary, "rgba(255,255,255,0.08)", "#e7ebf3", 2, [3, 3]);
+    }
+  }
+
+  const activeColor = arms[activeArmIndex].color;
+  // Combined mode (Independent: off, the default) samples every arm together as one shared
+  // union region -- there's no single "owning" arm for the result, so every arm's own
+  // geometry renders at FULL strength (not dimmed) and the sample dots get a neutral color
+  // instead of the active arm's, so they don't look like they belong to just one arm.
+  const otherArmAlpha = independent ? 0.55 : 1;
+  const otherCircleAlpha = independent ? 0.4 : 1;
+  const sampleColor = independent ? activeColor : "#f5f5f5";
+  extremePointsCamera.forEach(function (p) {
+    ctx.beginPath();
+    ctx.arc(p[0], p[1], 5, 0, 2 * Math.PI);
+    ctx.fillStyle = activeColor;
+    ctx.fill();
+  });
+  // Other arms' extreme points -- dimmed in "Independent" mode (so the active arm's own
+  // markers read as "the one you're editing right now"), full-strength in combined mode
+  // (every arm equally contributes to the one shared pattern).
+  otherArmsRenderData.forEach(function (entry) {
+    if (!entry) return;
+    ctx.globalAlpha = otherArmAlpha;
+    entry.arm.extremePointsCamera.forEach(function (p) {
+      ctx.beginPath(); ctx.arc(p[0], p[1], 4, 0, 2 * Math.PI);
+      ctx.fillStyle = entry.arm.color; ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+  });
+
+  if (homography && cameraCorners.length === 4) {
+    // Clip to the workspace quad: the valid sampling region is the INTERSECTION of the
+    // fitted circle and the workspace, not the circle alone, so the circle should visually
+    // stop at the quad's edge instead of appearing to expand past it.
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(cameraCorners[0][0], cameraCorners[0][1]);
+    for (let i = 1; i < 4; i++) ctx.lineTo(cameraCorners[i][0], cameraCorners[i][1]);
+    ctx.closePath();
+    ctx.clip();
+
+    // Other arms' reach circle -- outline only (no sample-point preview, no edit handles;
+    // those stay active-arm-only, see the comment on otherArmsRenderData), dimmed so the
+    // active arm's own circle still reads as "the one you're editing right now."
+    otherArmsRenderData.forEach(function (entry) {
+      if (!entry || !entry.arm.fittedCircle) return;
+      const circle = entry.arm.fittedCircle;
+      ctx.globalAlpha = otherCircleAlpha;
+      ctx.strokeStyle = entry.arm.color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      const segs = 64;
+      for (let i = 0; i <= segs; i++) {
+        const theta = 2 * Math.PI * i / segs;
+        const cp = [circle.center[0] + circle.radius * Math.cos(theta), circle.center[1] + circle.radius * Math.sin(theta)];
+        const pp = toPixel(cp);
+        if (i === 0) ctx.moveTo(pp[0], pp[1]); else ctx.lineTo(pp[0], pp[1]);
+      }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    });
+
+    if (fittedCircle) {
+      ctx.strokeStyle = activeColor;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      const segs = 64;
+      for (let i = 0; i <= segs; i++) {
+        const theta = 2 * Math.PI * i / segs;
+        const cp = [
+          fittedCircle.center[0] + fittedCircle.radius * Math.cos(theta),
+          fittedCircle.center[1] + fittedCircle.radius * Math.sin(theta),
+        ];
+        const pp = toPixel(cp);
+        if (i === 0) ctx.moveTo(pp[0], pp[1]); else ctx.lineTo(pp[0], pp[1]);
+      }
+      ctx.stroke();
+
+      if (interaction === "corners") {
+        // The fitted circle is editable on the camera view too (forward-mapped handles), not
+        // just the orthographic view -- shown only while Workspace setup's "corners" tool is
+        // active, the ONLY tool that's allowed to touch it.
+        circleHandles(fittedCircle).forEach(function (h) {
+          const hp = toPixel(h.point);
+          ctx.beginPath(); ctx.arc(hp[0], hp[1], 4, 0, 2 * Math.PI);
+          ctx.fillStyle = activeColor; ctx.fill();
+        });
+      }
+    }
+
+    // Sample dots/arrows are NOT gated on the ACTIVE arm having its own circle -- in combined
+    // mode they belong to the union of every arm's circle, so they must still show even if the
+    // active arm (e.g. a just-added, not-yet-fitted one) has none. This was a real, reported
+    // bug: adding a second arm before fitting it made combined-mode sampling appear "broken"
+    // (nothing drawn), even though the union itself was valid.
+    const sampleRadius = interaction === "select" ? 5 : 3;
+    if (objects.length === 0) {
+      samplePointsCamera.forEach(function (p, i) {
+        (orientationTipsCamera[i] || []).forEach(function (tip) { drawArrow(ctx, p, tip, sampleColor, 2); });
+      });
+      samplePointsCamera.forEach(function (p, i) {
+        ctx.beginPath();
+        ctx.arc(p[0], p[1], sampleRadius, 0, 2 * Math.PI);
+        ctx.fillStyle = sampleColor;
+        ctx.fill();
+        if (orientationOverrides[i]) {
+          ctx.beginPath();
+          ctx.arc(p[0], p[1], sampleRadius + 4, 0, 2 * Math.PI);
+          ctx.strokeStyle = "#facc15";
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        }
+        if (orientationSelectedIndices.indexOf(i) !== -1) {
+          ctx.beginPath();
+          ctx.arc(p[0], p[1], sampleRadius + 7, 0, 2 * Math.PI);
+          ctx.strokeStyle = "#38bdf8";
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        }
+      });
+    } else {
+      renderObjectPlacementsCamera(ctx, sampleRadius);
+    }
+
+    ctx.restore();
+  }
+}
+
+// Draws the multi-object preview on the camera view, called from inside renderCameraView's
+// homography-clip block (so `toPixel` is always valid here). `activeObject` is the one whose
+// own per-point yellow/blue rings (orientationOverrides/orientationSelectedIndices -- which,
+// once objects exist, belong to IT specifically, see currentDefaultOrientationSettings) get
+// drawn -- every other object's dot/arrows render in its own color with no ring.
+function renderObjectPlacementsCamera(ctx, sampleRadius) {
+  const activeObject = activeObjectIndex >= 0 ? objects[activeObjectIndex] : null;
+  if (previewMode === "episode") {
+    // Faint context dots for every point not part of this episode's placement, so the
+    // operator can still see the whole cloud while focusing on the one simultaneous scene.
+    samplePointsCamera.forEach(function (p) {
+      ctx.beginPath(); ctx.arc(p[0], p[1], 2, 0, 2 * Math.PI); ctx.fillStyle = "rgba(91,98,116,0.6)"; ctx.fill();
+    });
+    episodePlacements.forEach(function (site) {
+      site.members.forEach(function (m) {
+        if (m.tip) drawArrow(ctx, toPixel(m.point), toPixel(m.tip), m.object.color, 2);
+      });
+    });
+    episodePlacements.forEach(function (site) {
+      const op = toPixel(site.point);
+      drawStackLegend(ctx, op, sampleRadius + 1, site.members.map(function (m) {
+        return { color: m.object.color, name: m.object.name, level: m.level };
+      }));
+    });
+    return;
+  }
+  // Marginal overlay: every sample point shows whichever object(s) are assigned to it (a
+  // faint neutral dot if none), with a tower legend wherever 2+ objects share one point.
+  samplePointsCanonical.forEach(function (point, i) {
+    const stack = objectStacksAtPoint[i];
+    if (stack.length === 0) {
+      const p = samplePointsCamera[i];
+      ctx.beginPath(); ctx.arc(p[0], p[1], sampleRadius, 0, 2 * Math.PI); ctx.fillStyle = "#5b6274"; ctx.fill();
+      if (orientationSelectedIndices.indexOf(i) !== -1) {
+        ctx.beginPath(); ctx.arc(p[0], p[1], sampleRadius + 7, 0, 2 * Math.PI);
+        ctx.strokeStyle = "#38bdf8"; ctx.lineWidth = 2; ctx.stroke();
+      }
+      return;
+    }
+    const op = toPixel(point);
+    stack.forEach(function (entry) {
+      entry.tips.forEach(function (tip) { drawArrow(ctx, op, toPixel(tip), entry.object.color, 2); });
+    });
+    drawStackLegend(ctx, op, sampleRadius, stack.map(function (e) {
+      return { color: e.object.color, name: e.object.name, level: e.level };
+    }));
+    stack.forEach(function (entry) {
+      if (entry.object === activeObject && orientationOverrides[i]) {
+        ctx.beginPath(); ctx.arc(op[0], op[1], sampleRadius + 4, 0, 2 * Math.PI);
+        ctx.strokeStyle = "#facc15"; ctx.lineWidth = 2; ctx.stroke();
+      }
+      if (entry.object === activeObject && orientationSelectedIndices.indexOf(i) !== -1) {
+        ctx.beginPath(); ctx.arc(op[0], op[1], sampleRadius + 7, 0, 2 * Math.PI);
+        ctx.strokeStyle = "#38bdf8"; ctx.lineWidth = 2; ctx.stroke();
+      }
+    });
+    // Selected but the ACTIVE object isn't part of this stack yet (e.g. picking points
+    // already assigned to a different object, about to Assign them to this one) -- still
+    // needs a visible ring, drawn at the point's own (shared) position.
+    if (orientationSelectedIndices.indexOf(i) !== -1 && !stack.some(function (e) { return e.object === activeObject; })) {
+      ctx.beginPath(); ctx.arc(op[0], op[1], sampleRadius + 7, 0, 2 * Math.PI);
+      ctx.strokeStyle = "#38bdf8"; ctx.lineWidth = 2; ctx.stroke();
+    }
+  });
+}
+
+function rectangleVertices(a, b) {
+  return [[a[0], a[1]], [b[0], a[1]], [b[0], b[1]], [a[0], b[1]]];
+}
+
+function getOrthoContainerWidth() {
+  return orthoCanvas.parentElement.clientWidth || 480;
+}
+
+function renderOrthoView() {
+  const ctx = orthoCanvas.getContext("2d");
+  if (!canonicalSize) {
+    orthoCanvas.width = getOrthoContainerWidth(); orthoCanvas.height = orthoCanvas.width * 0.75;
+    ctx.clearRect(0, 0, orthoCanvas.width, orthoCanvas.height);
+    return;
+  }
+  const maxW = getOrthoContainerWidth();
+  const maxH = Math.max(240, window.innerHeight * 0.55);
+  orthoScale = Math.min(maxW / canonicalSize[0], maxH / canonicalSize[1]);
+  orthoCanvas.width = canonicalSize[0] * orthoScale;
+  orthoCanvas.height = canonicalSize[1] * orthoScale;
+  ctx.clearRect(0, 0, orthoCanvas.width, orthoCanvas.height);
+
+  ctx.fillStyle = "rgba(56,189,248,0.15)";
+  ctx.fillRect(0, 0, orthoCanvas.width, orthoCanvas.height);
+  ctx.strokeStyle = "#38bdf8";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(0, 0, orthoCanvas.width, orthoCanvas.height);
+
+  if (gridToggle.checked) {
+    ctx.strokeStyle = "rgba(56,189,248,0.5)";
+    ctx.lineWidth = 1;
+    const n = 8;
+    for (let i = 1; i < n; i++) {
+      const x = orthoCanvas.width * i / n;
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, orthoCanvas.height); ctx.stroke();
+      const y = orthoCanvas.height * i / n;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(orthoCanvas.width, y); ctx.stroke();
+    }
+  }
+
+  cutPolygonsCanonical.forEach(function (poly, i) {
+    const scaled = poly.map(function (p) { return [p[0] * orthoScale, p[1] * orthoScale]; });
+    const selected = i === selectedCutIndex;
+    drawPolygon(ctx, scaled, selected ? "rgba(248,113,113,0.35)" : "rgba(248,113,113,0.2)", "#f87171", selected ? 3 : 2, [6, 4]);
+  });
+  cutShapesCanonical.forEach(function (shape) {
+    getCutHandles(shape).forEach(function (h) {
+      ctx.beginPath(); ctx.arc(h.point[0] * orthoScale, h.point[1] * orthoScale, 4, 0, 2 * Math.PI);
+      ctx.fillStyle = "#f87171"; ctx.fill();
+    });
+  });
+
+  const activeColorOrtho = arms[activeArmIndex].color;
+  const otherArmAlphaOrtho = independent ? 0.55 : 1;
+  const sampleColorOrtho = independent ? activeColorOrtho : "#f5f5f5";
+  extremePointsCanonical.forEach(function (p) {
+    ctx.beginPath();
+    ctx.arc(p[0] * orthoScale, p[1] * orthoScale, 5, 0, 2 * Math.PI);
+    ctx.fillStyle = activeColorOrtho;
+    ctx.fill();
+  });
+  otherArmsRenderData.forEach(function (entry) {
+    if (!entry) return;
+    ctx.globalAlpha = otherArmAlphaOrtho;
+    entry.extremePointsCanonical.forEach(function (p) {
+      ctx.beginPath(); ctx.arc(p[0] * orthoScale, p[1] * orthoScale, 4, 0, 2 * Math.PI);
+      ctx.fillStyle = entry.arm.color; ctx.fill();
+    });
+    if (entry.arm.fittedCircle) {
+      const circle = entry.arm.fittedCircle;
+      ctx.beginPath();
+      ctx.arc(circle.center[0] * orthoScale, circle.center[1] * orthoScale, circle.radius * orthoScale, 0, 2 * Math.PI);
+      ctx.strokeStyle = entry.arm.color;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  });
+
+  if (fittedCircle) {
+    ctx.beginPath();
+    ctx.arc(fittedCircle.center[0] * orthoScale, fittedCircle.center[1] * orthoScale, fittedCircle.radius * orthoScale, 0, 2 * Math.PI);
+    ctx.strokeStyle = activeColorOrtho;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    if (tool === "corners") {
+      circleHandles(fittedCircle).forEach(function (h) {
+        ctx.beginPath();
+        ctx.arc(h.point[0] * orthoScale, h.point[1] * orthoScale, 4, 0, 2 * Math.PI);
+        ctx.fillStyle = activeColorOrtho;
+        ctx.fill();
+      });
+    }
+  }
+
+  const orthoSampleRadius = tool === "select" ? 5 : 3;
+  if (objects.length === 0) {
+    samplePointsCanonical.forEach(function (p, i) {
+      const tailScaled = [p[0] * orthoScale, p[1] * orthoScale];
+      (orientationTipsCanonical[i] || []).forEach(function (tip) {
+        drawArrow(ctx, tailScaled, [tip[0] * orthoScale, tip[1] * orthoScale], sampleColorOrtho, 2);
+      });
+    });
+    samplePointsCanonical.forEach(function (p, i) {
+      ctx.beginPath();
+      ctx.arc(p[0] * orthoScale, p[1] * orthoScale, orthoSampleRadius, 0, 2 * Math.PI);
+      ctx.fillStyle = sampleColorOrtho;
+      ctx.fill();
+      if (orientationOverrides[i]) {
+        ctx.beginPath();
+        ctx.arc(p[0] * orthoScale, p[1] * orthoScale, orthoSampleRadius + 4, 0, 2 * Math.PI);
+        ctx.strokeStyle = "#facc15";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+      if (orientationSelectedIndices.indexOf(i) !== -1) {
+        ctx.beginPath();
+        ctx.arc(p[0] * orthoScale, p[1] * orthoScale, orthoSampleRadius + 7, 0, 2 * Math.PI);
+        ctx.strokeStyle = "#38bdf8";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+    });
+  } else {
+    renderObjectPlacementsOrtho(ctx, orthoSampleRadius);
+  }
+
+  // In-progress cut draft preview -- same draft state as the camera view's, just scaled
+  // directly by orthoScale instead of forward-mapped through the homography.
+  const interaction = activeInteraction();
+  if (interaction === "polygon" && polyDraft.length > 0) {
+    const previewCanonical = polyHoverCanonical ? polyDraft.concat([polyHoverCanonical]) : polyDraft;
+    const previewScaled = previewCanonical.map(function (cp) { return [cp[0] * orthoScale, cp[1] * orthoScale]; });
+    drawPolygon(ctx, previewScaled, null, "#f87171", 2, [3, 3]);
+    polyDraft.forEach(function (v) {
+      ctx.beginPath(); ctx.arc(v[0] * orthoScale, v[1] * orthoScale, 4, 0, 2 * Math.PI);
+      ctx.fillStyle = "#f87171"; ctx.fill();
+    });
+  }
+  if (cutDragging && cutAnchor && cutPreview) {
+    let draftShape = null;
+    if (interaction === "rectangle") {
+      draftShape = { type: "rectangle", corners: rectangleVertices(cutAnchor, cutPreview) };
+    } else if (interaction === "circle") {
+      draftShape = { type: "circle", center: cutAnchor, radius: Math.hypot(cutPreview[0] - cutAnchor[0], cutPreview[1] - cutAnchor[1]) };
+    }
+    if (draftShape) {
+      const boundary = cutShapeBoundary(draftShape).map(function (cp) { return [cp[0] * orthoScale, cp[1] * orthoScale]; });
+      drawPolygon(ctx, boundary, "rgba(248,113,113,0.15)", "#f87171", 2, [3, 3]);
+    } else if (interaction === "select") {
+      const boundary = rectangleVertices(cutAnchor, cutPreview).map(function (cp) { return [cp[0] * orthoScale, cp[1] * orthoScale]; });
+      drawPolygon(ctx, boundary, "rgba(255,255,255,0.08)", "#e7ebf3", 2, [3, 3]);
+    }
+  }
+}
+
+// Ortho-view counterpart of renderObjectPlacementsCamera -- identical structure, just scaling
+// canonical coordinates by orthoScale directly instead of forward-mapping through toPixel.
+function renderObjectPlacementsOrtho(ctx, sampleRadius) {
+  const activeObject = activeObjectIndex >= 0 ? objects[activeObjectIndex] : null;
+  function scaled(p) { return [p[0] * orthoScale, p[1] * orthoScale]; }
+  if (previewMode === "episode") {
+    samplePointsCanonical.forEach(function (p) {
+      const sp = scaled(p);
+      ctx.beginPath(); ctx.arc(sp[0], sp[1], 2, 0, 2 * Math.PI); ctx.fillStyle = "rgba(91,98,116,0.6)"; ctx.fill();
+    });
+    episodePlacements.forEach(function (site) {
+      site.members.forEach(function (m) {
+        if (m.tip) drawArrow(ctx, scaled(m.point), scaled(m.tip), m.object.color, 2);
+      });
+    });
+    episodePlacements.forEach(function (site) {
+      const sp = scaled(site.point);
+      drawStackLegend(ctx, sp, sampleRadius + 1, site.members.map(function (m) {
+        return { color: m.object.color, name: m.object.name, level: m.level };
+      }));
+    });
+    return;
+  }
+  samplePointsCanonical.forEach(function (point, i) {
+    const stack = objectStacksAtPoint[i];
+    if (stack.length === 0) {
+      const sp = scaled(point);
+      ctx.beginPath(); ctx.arc(sp[0], sp[1], sampleRadius, 0, 2 * Math.PI); ctx.fillStyle = "#5b6274"; ctx.fill();
+      if (orientationSelectedIndices.indexOf(i) !== -1) {
+        ctx.beginPath(); ctx.arc(sp[0], sp[1], sampleRadius + 7, 0, 2 * Math.PI);
+        ctx.strokeStyle = "#38bdf8"; ctx.lineWidth = 2; ctx.stroke();
+      }
+      return;
+    }
+    const sp = scaled(point);
+    stack.forEach(function (entry) {
+      entry.tips.forEach(function (tip) { drawArrow(ctx, sp, scaled(tip), entry.object.color, 2); });
+    });
+    drawStackLegend(ctx, sp, sampleRadius, stack.map(function (e) {
+      return { color: e.object.color, name: e.object.name, level: e.level };
+    }));
+    stack.forEach(function (entry) {
+      if (entry.object === activeObject && orientationOverrides[i]) {
+        ctx.beginPath(); ctx.arc(sp[0], sp[1], sampleRadius + 4, 0, 2 * Math.PI);
+        ctx.strokeStyle = "#facc15"; ctx.lineWidth = 2; ctx.stroke();
+      }
+      if (entry.object === activeObject && orientationSelectedIndices.indexOf(i) !== -1) {
+        ctx.beginPath(); ctx.arc(sp[0], sp[1], sampleRadius + 7, 0, 2 * Math.PI);
+        ctx.strokeStyle = "#38bdf8"; ctx.lineWidth = 2; ctx.stroke();
+      }
+    });
+    if (orientationSelectedIndices.indexOf(i) !== -1 && !stack.some(function (e) { return e.object === activeObject; })) {
+      ctx.beginPath(); ctx.arc(sp[0], sp[1], sampleRadius + 7, 0, 2 * Math.PI);
+      ctx.strokeStyle = "#38bdf8"; ctx.lineWidth = 2; ctx.stroke();
+    }
+  });
+}
+
+// ── Export ──────────────────────────────────────────────────────────────────
+function hexToRgbaArrayString(hex) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return "[" + r + ", " + g + ", " + b + ", 255]";
+}
+
+function orientationExportBlock(settings) {
+  // Mirrors config.py's OrientationConfig field-for-field. Only emitted when enabled -- an
+  // object without this block is unaffected (no arrow), exactly today's pre-orientation
+  // export for every config that doesn't opt in.
+  if (!settings.orientationEnabled) return "";
+  let block = "orientation:\n";
+  block += "  count: " + settings.orientationCount + "\n";
+  block += "  method: " + settings.orientationMethod + "\n";
+  block += "  angle_start_deg: " + settings.orientationAngleStart + "\n";
+  block += "  angle_end_deg: " + settings.orientationAngleEnd + "\n";
+  block += "  seed: " + settings.orientationSeed + "\n";
+  block += "  arrow_length: " + settings.orientationArrowLength + "\n";
+  block += "  initial_angle_deg: " + settings.orientationInitialAngle + "\n";
+  return block;
+}
+
+function indentLines(text, prefix) {
+  return text.split("\n").filter(function (l) { return l.length > 0; }).map(function (l) { return prefix + l; }).join("\n") + "\n";
+}
+
+// Exports the Objects card's assignments as a top-level `objects:` list -- `shape: points` is
+// real, engine-supported config.py syntax (see CLAUDE.md), so this output is directly runnable
+// by vizaudit-overlay, not just an authoring aid. Each object's positions are its own
+// `assigned` indices (sorted for determinism), forward-mapped through the current homography
+// into pixel space -- the same space every other pattern/exclude_zones block in this file
+// already exports in. There's no `levels:` to export: stacking order is always DERIVED at
+// runtime from which objects' points happen to coincide (session.py groups by resolved-
+// position equality and computes level via `level_order`), never authored. Gated entirely on
+// `objects.length > 0`/`homography` by the caller, so a no-objects session never reaches here.
+function objectsExportBlock() {
+  let body = "\n# Each entry below is a SEPARATE top-level object (not a `pattern:` snippet to\n";
+  body += "# paste into one).\n";
+  body += "objects:\n";
+  objects.forEach(function (o) {
+    const sortedIdx = o.assigned.slice().sort(function (a, b) { return a - b; }).filter(function (i) { return !!samplePointsCanonical[i]; });
+    const pixelPoints = sortedIdx.map(function (i) { return toPixel(samplePointsCanonical[i]); });
+    body += "  - name: " + JSON.stringify(o.name) + "\n";
+    body += "    variable: true\n";
+    body += "    marker:\n      color_rgba: " + hexToRgbaArrayString(o.color) + "\n";
+    body += "    pattern:\n";
+    body += "      shape: points\n";
+    body += "      points: [" +
+      pixelPoints.map(function (p) { return "[" + Math.round(p[0]) + ", " + Math.round(p[1]) + "]"; }).join(", ") +
+      "]\n";
+    // Only emitted when non-default, so an object that never touched these knobs exports
+    // exactly as it did before they existed.
+    if (o.seed) body += "      seed: " + o.seed + "\n";
+    if (o.sequencing && o.sequencing !== "lockstep") body += "    sequencing: " + o.sequencing + "\n";
+    if (o.orientationEnabled) body += indentLines(orientationExportBlock(o), "    ");
+  });
+  body += sceneLevelExportBlock();
+  return body;
+}
+
+// SCENE-LEVEL (sibling to `objects:`, not nested under it -- matches config.py's
+// OverlayConfig.episode_targets/co_location/level_strategy/level_seed exactly). Stacking is
+// read directly off which objects' `pattern: {shape: points}` lists happen to share a
+// coordinate -- there's no separate authored-site block to export. Only emitted when
+// non-default, so a session that never touched these exports byte-identically to before they
+// existed.
+function sceneLevelExportBlock() {
+  let body = "";
+  if (episodeTargets !== "all") body += "episode_targets: " + episodeTargets + "\n";
+  if (combinationCount) body += "combination_count: " + combinationCount + "\n";
+  if (combinationMode !== "systematic") body += "combination_mode: " + combinationMode + "\n";
+  if (combinationSeed) body += "combination_seed: " + combinationSeed + "\n";
+  if (coLocation !== "stack") body += "co_location: " + coLocation + "\n";
+  if (stackLevelStrategy !== "fixed") body += "level_strategy: " + stackLevelStrategy + "\n";
+  if (stackLevelSeed) body += "level_seed: " + stackLevelSeed + "\n";
+  return body;
+}
+
+function updateExportText(sampleError) {
+  const cornersStr = cameraCorners
+    .map(function (c) { return "[" + Math.round(c[0]) + ", " + Math.round(c[1]) + "]"; })
+    .join(", ");
+  let body = "surface_calibration:\n  corners: [" + cornersStr + "]\n";
+  // With objects defined, they're the authoritative description of what's placed -- the
+  // legacy single-implied-object pattern block below would just be a redundant, ambiguous
+  // "paste this somewhere" snippet once there are several explicit, named objects. Skipping
+  // it entirely here (rather than emitting both) is also what keeps a no-objects session's
+  // export byte-for-byte unchanged: this whole branch is untouched dead code unless
+  // objects.length > 0, which is never true for a session that never used this feature.
+  if (objects.length > 0) {
+    body += homography ? objectsExportBlock() : "";
+  } else if (independent) {
+    // One pattern (+ marker color override) block per arm that has a fitted circle -- a
+    // single-arm session (still the common case) emits exactly what this tool always
+    // emitted, byte for byte; a bimanual one emits one block per arm, each meant for a
+    // SEPARATE object, with a distinct marker color so the two simultaneous targets stay
+    // tell-apart-able (see config.py's per-object `marker:` override). `arm.fittedCircle`/
+    // `arm.seed`/etc. are used uniformly for every arm, including the active one --
+    // renderAll() already synced arms[activeArmIndex] from the live globals/form fields
+    // before this function runs, so there's no need to special-case "the currently active
+    // arm" here.
+    arms.forEach(function (arm) {
+      if (!arm.fittedCircle) return;
+      const target = arms.length > 1 ? "the \"" + arm.name + "\"" : "the relevant";
+      body += "\n# paste into " + target + " object's pattern:\n";
+      body += "pattern:\n";
+      body += "  shape: sector\n";
+      body += "  center: [" + arm.fittedCircle.center[0].toFixed(1) + ", " + arm.fittedCircle.center[1].toFixed(1) + "]\n";
+      body += "  radius: " + arm.fittedCircle.radius.toFixed(1) + "\n";
+      body += "  inner_radius: 0\n";
+      body += "  angle_start_deg: 0\n";
+      body += "  angle_end_deg: 360\n";
+      body += "  seed: " + arm.seed + "\n";
+      body += "  distribution: " + arm.distribution + "\n";
+      body += "  border_width: " + arm.borderWidth + "\n";
+      if (arm.countMode === "variable") body += "  count_mode: variable\n";
+      body += "# set this object's count to: " + arm.steps + "\n";
+      body += orientationExportBlock(arm);
+      if (arms.length > 1) {
+        body += "# distinct color so this arm's target is tell-apart-able from the other arm(s):\n";
+        body += "marker:\n";
+        body += "  color_rgba: " + hexToRgbaArrayString(arm.color) + "\n";
+      }
+    });
+  } else {
+    // Combined (default): every arm's circle goes into ONE pattern, sampled as their shared
+    // UNION (see sampleUnionPoints/generate_union_points) -- there's no per-arm marker color
+    // here, since this is meant for ONE object, not one per arm. With exactly one circle
+    // (the common single-arm case), `shape: union` would be numerically equivalent but is
+    // needlessly the newer, less-established shape for what's just a plain circle -- export
+    // the original, long-tested `shape: sector` instead, so a single-arm session's export
+    // stays byte-for-byte identical to what this tool emitted before this feature existed.
+    const circlesForExport = arms.filter(function (a) { return a.fittedCircle; });
+    if (circlesForExport.length === 1) {
+      const circle = circlesForExport[0].fittedCircle;
+      body += "\n# paste into the relevant object's pattern:\n";
+      body += "pattern:\n";
+      body += "  shape: sector\n";
+      body += "  center: [" + circle.center[0].toFixed(1) + ", " + circle.center[1].toFixed(1) + "]\n";
+      body += "  radius: " + circle.radius.toFixed(1) + "\n";
+      body += "  inner_radius: 0\n";
+      body += "  angle_start_deg: 0\n";
+      body += "  angle_end_deg: 360\n";
+      body += "  seed: " + combinedSettings.seed + "\n";
+      body += "  distribution: " + combinedSettings.distribution + "\n";
+      body += "  border_width: " + combinedSettings.borderWidth + "\n";
+      if (combinedSettings.countMode === "variable") body += "  count_mode: variable\n";
+      body += "# set this object's count to: " + combinedSettings.steps + "\n";
+      body += orientationExportBlock(combinedSettings);
+    } else if (circlesForExport.length > 1) {
+      body += "\n# paste into the relevant object's pattern:\n";
+      body += "pattern:\n";
+      body += "  shape: union\n";
+      body += "  circles:\n";
+      circlesForExport.forEach(function (arm) {
+        body += "    - center: [" + arm.fittedCircle.center[0].toFixed(1) + ", " + arm.fittedCircle.center[1].toFixed(1) + "]\n";
+        body += "      radius: " + arm.fittedCircle.radius.toFixed(1) + "\n";
+      });
+      body += "  seed: " + combinedSettings.seed + "\n";
+      body += "  distribution: " + combinedSettings.distribution + "\n";
+      body += "  border_width: " + combinedSettings.borderWidth + "\n";
+      body += "# set this object's count to: " + combinedSettings.steps + "\n";
+      body += orientationExportBlock(combinedSettings);
+    }
+  }
+  if (cutShapesCanonical.length > 0 && homography) {
+    // exclude_zones in the YAML are always pixel-space facts about the image (see
+    // pattern.py) -- forward-map each canonical cut through the current homography here.
+    // A canonical circle maps to an ellipse under perspective, and config.py's exclude_zone
+    // schema has no ellipse shape, so every cut exports as `shape: polygon` (a circle's
+    // forward-mapped boundary approximation), never `shape: circle` -- that would otherwise
+    // be a second, redundant, lossy circle approximation on top of this one.
+    body += "\nexclude_zones:\n";
+    cutShapesCanonical.forEach(function (shape, i) {
+      body += "  - name: cut_" + (i + 1) + "\n";
+      const verts = cutShapeBoundary(shape)
+        .map(function (cp) { return toPixel(cp); })
+        .map(function (p) { return "[" + Math.round(p[0]) + ", " + Math.round(p[1]) + "]"; })
+        .join(", ");
+      body += "    shape: polygon\n";
+      body += "    vertices: [" + verts + "]\n";
+    });
+  }
+  if (sampleError) {
+    body += "\n# WARNING: could not generate a valid preview with current settings:\n# " + sampleError + "\n";
+  }
+  yamlOut.value = body;
+}
+
+// ── Save ────────────────────────────────────────────────────────────────────
+async function saveConfigToFile() {
+  const content = yamlOut.value;
+  if (!content) { return; }
+  // Primary path: POST to our own local server (vizaudit-calibrate's --save-to path) --
+  // this is what makes saving land in a predictable, reusable location automatically, with
+  // no dialog and not the browser's generic downloads folder. Only falls back to a native
+  // save dialog or a plain download if there's no server to talk to (e.g. --no-serve).
+  try {
+    const response = await fetch("/save", { method: "POST", body: content });
+    if (response.ok) {
+      saveStatus.textContent = await response.text();
+      return;
+    }
+  } catch (err) {
+    console.warn("POST /save failed, falling back:", err);
+  }
+  if (window.showSaveFilePicker) {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: "vizaudit_calibration.yaml",
+        types: [{ description: "YAML", accept: { "text/yaml": [".yaml", ".yml"] } }],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(content);
+      await writable.close();
+      saveStatus.textContent = "Saved.";
+      return;
+    } catch (err) {
+      if (err.name === "AbortError") { return; }
+      console.warn("showSaveFilePicker failed, falling back to a plain download:", err);
+    }
+  }
+  const blob = new Blob([content], { type: "text/yaml" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "vizaudit_calibration.yaml";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  saveStatus.textContent = "Saved to your downloads folder.";
+}
+
+saveConfigBtn.addEventListener("click", function () {
+  saveStatus.textContent = "";
+  saveConfigToFile();
+});
+
+// ── Interaction ───────────────────────────────────────────────────────────
+function getCanvasPoint(canvas, evt) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  return [(evt.clientX - rect.left) * scaleX, (evt.clientY - rect.top) * scaleY];
+}
+
+function resetCutDraftState() {
+  polyDraft = [];
+  polyHoverCanonical = null;
+  cutDragging = false; cutAnchor = null; cutPreview = null;
+}
+
+function updateToolUI() {
+  toolExtreme.classList.toggle("active", tool === "extreme");
+  toolCorners.classList.toggle("active", tool === "corners");
+  toolSelect.classList.toggle("active", tool === "select");
+  toolAddRemovePoint.classList.toggle("active", tool === "addRemovePoint");
+  toolRect.classList.toggle("active", tool === "rectangle");
+  toolCircle.classList.toggle("active", tool === "circle");
+  toolPolygon.classList.toggle("active", tool === "polygon");
+  updateCursors();
+}
+
+function updateCursors() {
+  cameraCanvas.classList.remove("cut-cursor", "edit-cursor");
+  orthoCanvas.classList.remove("cut-cursor", "edit-cursor");
+  if (tool === "rectangle" || tool === "circle" || tool === "polygon") {
+    cameraCanvas.classList.add("cut-cursor");
+    orthoCanvas.classList.add("cut-cursor");
+  } else if (tool === "corners" || tool === "select") {
+    cameraCanvas.classList.add("edit-cursor");
+    orthoCanvas.classList.add("edit-cursor");
+  }
+}
+
+function setTool(newTool) {
+  tool = newTool;
+  resetCutDraftState();
+  updateToolUI();
+  renderAll();
+}
+toolExtreme.addEventListener("click", function () { setTool("extreme"); });
+toolCorners.addEventListener("click", function () { setTool("corners"); });
+toolSelect.addEventListener("click", function () { setTool("select"); });
+toolAddRemovePoint.addEventListener("click", function () { setTool("addRemovePoint"); });
+toolRect.addEventListener("click", function () { setTool("rectangle"); });
+toolCircle.addEventListener("click", function () { setTool("circle"); });
+toolPolygon.addEventListener("click", function () { setTool("polygon"); });
+toolbarToggleBtn.addEventListener("click", function () {
+  const expanded = floatingToolbarTools.style.display !== "none";
+  floatingToolbarTools.style.display = expanded ? "none" : "flex";
+  toolbarToggleBtn.classList.toggle("active", !expanded);
+});
+
+lockCornersBtn.addEventListener("click", function () {
+  // Deliberately NOT undo-tracked -- this is a UI guard, not a geometry edit (see the
+  // undo/redo scoping note above the snapshot/restore functions).
+  cornersLocked = !cornersLocked;
+  lockCornersBtn.classList.toggle("active", cornersLocked);
+  lockCornersBtn.innerHTML = cornersLocked ? "&#x1F512;" : "&#x1F513;";
+  resetCornersBtn.disabled = cornersLocked;
+  renderAll();
+});
+resetCornersBtn.addEventListener("click", function () { recordUndo(); resetCorners(); renderAll(); });
+lockCircleBtn.addEventListener("click", function () {
+  circleLocked = !circleLocked;
+  lockCircleBtn.classList.toggle("active", circleLocked);
+  lockCircleBtn.innerHTML = circleLocked ? "&#x1F512;" : "&#x1F513;";
+  renderAll();
+});
+lockPatternBtn.addEventListener("click", function () {
+  patternLocked = !patternLocked;
+  lockPatternBtn.classList.toggle("active", patternLocked);
+  lockPatternBtn.innerHTML = patternLocked ? "&#x1F512;" : "&#x1F513;";
+  [stepsInput, seedInput, distributionSelect, borderWidthInput, countModeSelect].forEach(function (el) {
+    el.disabled = patternLocked;
+  });
+  renderAll();
+});
+
+document.addEventListener("keydown", function (e) {
+  if (e.key === "Escape" && polyDraft.length > 0) {
+    resetCutDraftState();
+    renderAll();
+    return;
+  }
+  // Ignore inside a form field -- number inputs etc. have their own native undo, and
+  // hijacking Ctrl+Z there would fight the browser's own text-editing behavior.
+  const tag = (e.target && e.target.tagName) || "";
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+  if (e.key === "Delete" || e.key === "Backspace") {
+    if (selectedCutIndex >= 0) {
+      recordUndo();
+      cutShapesCanonical.splice(selectedCutIndex, 1);
+      selectedCutIndex = -1;
+      renderAll();
+      return;
+    }
+    if (orientationSelectedIndices.length > 0 && !patternLocked) {
+      deleteSelectedSamples();
+      return;
+    }
+  }
+  const key = e.key.toLowerCase();
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && key === "z") {
+    e.preventDefault();
+    undo();
+  } else if ((e.ctrlKey || e.metaKey) && (key === "y" || (e.shiftKey && key === "z"))) {
+    e.preventDefault();
+    redo();
+  }
+});
+
+// Shared by both canvases -- cutAnchor/cutPreview/polyDraft are canonical regardless of which
+// canvas started the gesture, so "finish a polygon" and "add an extreme point" need exactly
+// one implementation each, not one per canvas.
+// A manually-added point can land inside a cut (or outside the circle/bounds) -- previously
+// it was pushed as-is, so it never adapted to cut-outs the way the generator's own points do
+// (reported directly). Relocates it with the same closed-form-clamp-then-radial-search used
+// everywhere else in this engine, falling back to the original point if no nearby valid spot
+// exists at all (e.g. a cut covering the whole reachable area).
+function relocateNewPointIfInvalid(candidateCanonical) {
+  if (!fittedCircle || isValidCandidate(candidateCanonical)) return candidateCanonical;
+  const borderWidth = Math.max(0, parseFloat(borderWidthInput.value) || 0);
+  const cx = fittedCircle.center[0], cy = fittedCircle.center[1];
+  const effectiveOuter = fittedCircle.radius - borderWidth;
+  const clamp = function (c) { return clampToRegion(c, cx, cy, effectiveOuter, canonicalSize, borderWidth); };
+  try {
+    return relocateIfInvalid(candidateCanonical, isValidCandidate, clamp, Math.random,
+      Math.max(5, fittedCircle.radius * 0.05), "manually-added", -1, cx, cy, effectiveOuter);
+  } catch (e) {
+    return candidateCanonical;
+  }
+}
+
+function isInsideAnyCut(candidateCanonical) {
+  const borderWidth = Math.max(0, parseFloat(borderWidthInput.value) || 0);
+  for (let i = 0; i < cutPolygonsCanonical.length; i++) {
+    if (pointNearPolygon(candidateCanonical, cutPolygonsCanonical[i], borderWidth)) return true;
+  }
+  return false;
+}
+
+// A dragged-point override (sampleOverrides) is deliberately allowed OUTSIDE the circle/
+// bounds -- an operator nudging a specific point can put it exactly where they want,
+// including past the circle's edge (see the existing "override survives borderWidth change"
+// test, which sets one well outside the fitted circle on purpose) -- so this only ever
+// checks/escapes CUTS, unlike relocateNewPointIfInvalid's full circle+bounds+cuts check for
+// brand-new points. No circle reference is needed at all, so this works even with no
+// fittedCircle.
+function relocateOverrideIfInCut(candidateCanonical) {
+  if (!isInsideAnyCut(candidateCanonical)) return candidateCanonical;
+  const searchScale = canonicalSize ? Math.max(5, Math.min(canonicalSize[0], canonicalSize[1]) * 0.05) : 10;
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const radius = searchScale * (0.5 + 0.25 * Math.floor(attempt / 3));
+    const probe = [candidateCanonical[0] + (Math.random() * 2 - 1) * radius, candidateCanonical[1] + (Math.random() * 2 - 1) * radius];
+    if (!isInsideAnyCut(probe)) return probe;
+  }
+  return candidateCanonical;
+}
+
+// Manually-added points (extraSamplePoints) and dragged-point overrides (sampleOverrides)
+// are fixed, absolute coordinates that the generator never re-derives -- so unlike the
+// generator's own points (which are recomputed fresh every render against the CURRENT cuts),
+// drawing a new cut over one of these did nothing at all (reported directly: "if i create a
+// cutout over added points they still remain there", and again as "add points manually AND
+// THEN add the cuts, the cuts dont affect them" after an earlier, narrower fix attempt missed
+// this exact path). Called unconditionally at the top of every render (see renderAll), the
+// same way the generator's own points already self-heal every render -- removes the entire
+// "did I hook every mutation path" category of bug that the earlier, call-site-specific
+// version was prone to.
+function revalidateManualPoints() {
+  if (fittedCircle) {
+    extraSamplePoints = extraSamplePoints.map(function (p) { return relocateNewPointIfInvalid(p); });
+  }
+  Object.keys(sampleOverrides).forEach(function (k) {
+    sampleOverrides[k] = relocateOverrideIfInCut(sampleOverrides[k]);
+  });
+}
+
+function addRemoveSamplePointAt(canonicalPoint, hitIndex) {
+  recordUndo();
+  if (hitIndex !== null) {
+    // A removal shifts every LATER final index down by one -- object assignments survive via
+    // a precise remap (see remapObjectAssignmentsForBatchRemoval's own comment for why this
+    // gets the more careful treatment orientationOverrides/orientationSelectedIndices below
+    // don't bother with).
+    remapObjectAssignmentsForBatchRemoval([hitIndex]);
+    const origin = sampleOrigins[hitIndex];
+    if (origin.kind === "base") removedSampleIndices.push(origin.baseIndex);
+    else extraSamplePoints.splice(origin.extraIndex, 1);
+  } else {
+    // A pure append never shifts any EXISTING index, so no object assignment can go stale --
+    // nothing to remap here.
+    extraSamplePoints.push(relocateNewPointIfInvalid(canonicalPoint));
+  }
+  // Adding/removing a point shifts every LATER index in the final array -- a selection (or
+  // an override) keyed by the OLD indices would silently end up pointing at different points
+  // afterward ("the selection shifts to the next 2 points", reported directly), so both are
+  // invalidated here exactly like a steps/seed/distribution change already does.
+  orientationSelectedIndices = [];
+  Object.keys(orientationOverrides).forEach(function (k) { delete orientationOverrides[k]; });
+  renderAll();
+}
+
+// Delete/Backspace with the "select" tool's box-selection non-empty: removes every selected
+// sample point in one action. Extra (manually-added) points must be spliced out highest-index
+// first -- removing several in ascending order would invalidate the later sampleOrigins
+// extraIndex values the loop already captured (the classic "delete multiple array indices"
+// pitfall: removing index 2 first shifts what used to be index 5 down to index 4).
+function deleteSelectedSamples() {
+  if (orientationSelectedIndices.length === 0) return;
+  recordUndo();
+  remapObjectAssignmentsForBatchRemoval(orientationSelectedIndices.slice());
+  const extraIndices = [];
+  orientationSelectedIndices.forEach(function (i) {
+    const origin = sampleOrigins[i];
+    if (!origin) return;
+    if (origin.kind === "base") removedSampleIndices.push(origin.baseIndex);
+    else extraIndices.push(origin.extraIndex);
+  });
+  extraIndices.sort(function (a, b) { return b - a; }).forEach(function (idx) { extraSamplePoints.splice(idx, 1); });
+  orientationSelectedIndices = [];
+  Object.keys(orientationOverrides).forEach(function (k) { delete orientationOverrides[k]; });
+  renderAll();
+}
+
+function pushExtremePoint(pixelPoint) {
+  recordUndo();
+  extremePointsCamera.push(pixelPoint);
+  fitCircleBtn.disabled = extremePointsCamera.length < 3 || circleLocked;
+  renderAll();
+}
+function finishPolygonDraft() {
+  if (polyDraft.length < 3) return;
+  recordUndo();
+  cutShapesCanonical.push({ type: "polygon", vertices: polyDraft });
+  resetCutDraftState();
+  renderAll();
+}
+
+// "select" tool, shared by both canvases: a hit on a sample point either moves the WHOLE
+// current selection together (if that point is one of 2+ selected points) or just that one
+// point (today's original "Move sample points" behavior) -- otherwise the caller falls back
+// to starting a box-select drag. Returns true if a drag was started.
+function startSelectDrag(target, canonicalAnchor) {
+  if (!target || patternLocked) return false;
+  recordUndo();
+  if (orientationSelectedIndices.length > 1 && orientationSelectedIndices.indexOf(target.index) !== -1) {
+    activeDrag = {
+      kind: "sampleGroup",
+      anchorCanonical: canonicalAnchor,
+      indices: orientationSelectedIndices.slice(),
+      originals: orientationSelectedIndices.map(function (i) { return samplePointsCanonical[i].slice(); }),
+    };
+  } else {
+    // startCanonical lets mouseup tell a real drag apart from a plain click (see the
+    // "select" tool's mouseup handler) -- a plain click on a point deletes it instead of
+    // requiring box-select + Delete/Backspace every time (requested directly).
+    activeDrag = Object.assign({}, target, { startCanonical: samplePointsCanonical[target.index].slice() });
+  }
+  return true;
+}
+
+cameraCanvas.addEventListener("mousedown", function (e) {
+  const p = getCanvasPoint(cameraCanvas, e);
+  const interaction = activeInteraction();
+  if (interaction === "corners") {
+    const target = findCameraCornersTarget(p);
+    if (target) { recordUndo(); activeDrag = target; }
+  } else if (interaction === "select") {
+    const cutTarget = findCameraEditTarget(p);
+    if (cutTarget) {
+      recordUndo();
+      activeDrag = cutTarget;
+    } else if (!startSelectDrag(findCameraSampleTarget(p), inverseHomography ? toCanonical(p) : p) && inverseHomography) {
+      const cp = toCanonical(p);
+      const hitCut = cutShapesCanonical.findIndex(function (s) { return pointInCutShape(cp, s); });
+      if (hitCut !== -1) {
+        selectedCutIndex = hitCut;
+        renderAll();
+      } else {
+        cutAnchor = cp; cutPreview = cp; cutDragging = true;
+      }
+    }
+  } else if (interaction === "extreme") {
+    pushExtremePoint(p);
+  } else if (interaction === "addRemovePoint") {
+    if (!inverseHomography || patternLocked) return;
+    let hit = null, bestD = 12;
+    samplePointsCamera.forEach(function (sp, i) {
+      const d = Math.hypot(sp[0] - p[0], sp[1] - p[1]);
+      if (d < bestD) { bestD = d; hit = i; }
+    });
+    addRemoveSamplePointAt(toCanonical(p), hit);
+  } else if (interaction === "rectangle" || interaction === "circle") {
+    if (!inverseHomography) return;
+    const cp = toCanonical(p);
+    cutAnchor = cp; cutPreview = cp; cutDragging = true;
+  } else if (interaction === "polygon") {
+    if (!inverseHomography) return;
+    polyDraft.push(toCanonical(p));
+    renderAll();
+  }
+});
+cameraCanvas.addEventListener("dblclick", finishPolygonDraft);
+cameraCanvas.addEventListener("mousemove", function (e) {
+  const p = getCanvasPoint(cameraCanvas, e);
+  if (activeDrag) {
+    if (activeDrag.kind === "corner") {
+      cameraCorners[activeDrag.index] = p;
+      renderAll();
+    } else if (activeDrag.kind === "edge") {
+      const i = activeDrag.index, j = (i + 1) % 4;
+      const a = cameraCorners[i], b = cameraCorners[j];
+      const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+      // Axis-locked: a vertical (left/right) edge only ever changes x, a horizontal
+      // (top/bottom) edge only ever changes y -- otherwise a side could drift off-axis while
+      // "scaling" (reported directly).
+      const dx = activeDrag.isVertical ? p[0] - mid[0] : 0;
+      const dy = activeDrag.isVertical ? 0 : p[1] - mid[1];
+      cameraCorners[i] = [a[0] + dx, a[1] + dy];
+      cameraCorners[j] = [b[0] + dx, b[1] + dy];
+      renderAll();
+    } else if (activeDrag.kind === "scaleAll") {
+      const d = Math.hypot(p[0] - activeDrag.centroid[0], p[1] - activeDrag.centroid[1]);
+      const scale = Math.max(0.05, 1 + (d - activeDrag.restDist) / activeDrag.baseDist);
+      const c = activeDrag.centroid;
+      cameraCorners = activeDrag.corners.map(function (orig) {
+        return [c[0] + (orig[0] - c[0]) * scale, c[1] + (orig[1] - c[1]) * scale];
+      });
+      renderAll();
+    } else if (activeDrag.kind === "extreme") {
+      extremePointsCamera[activeDrag.index] = p;
+      renderAll();
+    } else if (inverseHomography && activeDrag.kind === "shape") {
+      activeDrag.handle.onDrag(toCanonical(p));
+      renderAll();
+    } else if (inverseHomography && activeDrag.kind === "sample") {
+      sampleOverrides[activeDrag.index] = toCanonical(p);
+      renderAll();
+    } else if (inverseHomography && activeDrag.kind === "sampleGroup") {
+      const cp = toCanonical(p);
+      const dx = cp[0] - activeDrag.anchorCanonical[0], dy = cp[1] - activeDrag.anchorCanonical[1];
+      activeDrag.indices.forEach(function (idx, k) {
+        sampleOverrides[idx] = [activeDrag.originals[k][0] + dx, activeDrag.originals[k][1] + dy];
+      });
+      renderAll();
+    }
+  } else if (cutDragging) {
+    if (inverseHomography) { cutPreview = toCanonical(p); renderAll(); }
+  } else if (activeInteraction() === "polygon" && polyDraft.length > 0) {
+    if (inverseHomography) polyHoverCanonical = toCanonical(p);
+    renderAll();
+  }
+});
+clearCutsBtn.addEventListener("click", function () {
+  recordUndo();
+  cutShapesCanonical = [];
+  renderAll();
+});
+
+orthoCanvas.addEventListener("mousedown", function (e) {
+  if (!canonicalSize) return;
+  const p = getCanvasPoint(orthoCanvas, e);
+  const cp = [p[0] / orthoScale, p[1] / orthoScale];
+  const interaction = activeInteraction();
+  if (interaction === "corners") {
+    const target = findOrthoCornersTarget(cp);
+    if (target) { recordUndo(); activeDrag = target; }
+  } else if (interaction === "select") {
+    const cutTarget = findOrthoEditTarget(cp);
+    if (cutTarget) {
+      recordUndo();
+      activeDrag = cutTarget;
+    } else if (!startSelectDrag(findOrthoSampleTarget(cp), cp)) {
+      const hitCut = cutShapesCanonical.findIndex(function (s) { return pointInCutShape(cp, s); });
+      if (hitCut !== -1) {
+        selectedCutIndex = hitCut;
+        renderAll();
+      } else {
+        cutAnchor = cp; cutPreview = cp; cutDragging = true;
+      }
+    }
+  } else if (interaction === "extreme") {
+    // Adding a NEW extreme point from the orthographic view has no live arm feed underneath
+    // it (unlike the camera view) -- still useful for fine-tuning an existing fit by eye
+    // against the undistorted surface, with the camera view open alongside to cross-check.
+    pushExtremePoint(toPixel(cp));
+  } else if (interaction === "addRemovePoint") {
+    if (patternLocked) return;
+    let hit = null, bestD = 12 / orthoScale;
+    samplePointsCanonical.forEach(function (sp, i) {
+      const d = Math.hypot(sp[0] - cp[0], sp[1] - cp[1]);
+      if (d < bestD) { bestD = d; hit = i; }
+    });
+    addRemoveSamplePointAt(cp, hit);
+  } else if (interaction === "rectangle" || interaction === "circle") {
+    cutAnchor = cp; cutPreview = cp; cutDragging = true;
+  } else if (interaction === "polygon") {
+    polyDraft.push(cp);
+    renderAll();
+  }
+});
+orthoCanvas.addEventListener("dblclick", finishPolygonDraft);
+orthoCanvas.addEventListener("mousemove", function (e) {
+  const p = getCanvasPoint(orthoCanvas, e);
+  const cp = [p[0] / orthoScale, p[1] / orthoScale];
+  if (activeDrag) {
+    if (activeDrag.kind === "shape") {
+      activeDrag.handle.onDrag(cp);
+      renderAll();
+    } else if (activeDrag.kind === "extreme") {
+      if (homography) { extremePointsCamera[activeDrag.index] = toPixel(cp); renderAll(); }
+    } else if (activeDrag.kind === "sample") {
+      sampleOverrides[activeDrag.index] = cp;
+      renderAll();
+    } else if (activeDrag.kind === "sampleGroup") {
+      const dx = cp[0] - activeDrag.anchorCanonical[0], dy = cp[1] - activeDrag.anchorCanonical[1];
+      activeDrag.indices.forEach(function (idx, k) {
+        sampleOverrides[idx] = [activeDrag.originals[k][0] + dx, activeDrag.originals[k][1] + dy];
+      });
+      renderAll();
+    }
+  } else if (cutDragging) {
+    cutPreview = cp;
+    renderAll();
+  } else if (activeInteraction() === "polygon" && polyDraft.length > 0) {
+    polyHoverCanonical = cp;
+    renderAll();
+  }
+});
+window.addEventListener("mouseup", function () {
+  const endedDrag = activeDrag;
+  activeDrag = null;
+  // A plain click (no real drag) on a single sample point toggles its SELECTION -- the same
+  // membership-toggle the box-select drag below already does, just for one point at a time
+  // by clicking it directly instead of having to drag a box around it ("i just want to be
+  // able to select the points...by just clicking on them nothing more to add"). A real drag
+  // (movement over the threshold) is unaffected and still just moves the point -- this only
+  // fires when nothing actually moved.
+  if (endedDrag && endedDrag.kind === "sample" && endedDrag.startCanonical) {
+    const current = sampleOverrides[endedDrag.index] || endedDrag.startCanonical;
+    if (Math.hypot(current[0] - endedDrag.startCanonical[0], current[1] - endedDrag.startCanonical[1]) < 2) {
+      const pos = orientationSelectedIndices.indexOf(endedDrag.index);
+      if (pos === -1) orientationSelectedIndices.push(endedDrag.index);
+      else orientationSelectedIndices.splice(pos, 1);
+      populateOrientationInputsFrom(
+        orientationSelectedIndices.length > 0
+          ? (orientationOverrides[orientationSelectedIndices[0]] || currentDefaultOrientationSettings())
+          : currentDefaultOrientationSettings()
+      );
+      renderAll();
+    }
+  }
+  if (cutDragging && cutAnchor && cutPreview) {
+    const interaction = activeInteraction();
+    recordUndo();
+    if (interaction === "rectangle") {
+      cutShapesCanonical.push({ type: "rectangle", corners: rectangleVertices(cutAnchor, cutPreview) });
+    } else if (interaction === "circle") {
+      const r = Math.hypot(cutPreview[0] - cutAnchor[0], cutPreview[1] - cutAnchor[1]);
+      cutShapesCanonical.push({ type: "circle", center: cutAnchor, radius: r });
+    } else if (interaction === "select") {
+      const xLo = Math.min(cutAnchor[0], cutPreview[0]), xHi = Math.max(cutAnchor[0], cutPreview[0]);
+      const yLo = Math.min(cutAnchor[1], cutPreview[1]), yHi = Math.max(cutAnchor[1], cutPreview[1]);
+      if (xHi - xLo < 2 && yHi - yLo < 2) {
+        // A plain click (no real drag) on empty space just DESELECTS -- it must NOT also
+        // clear overrides. An earlier version did clear them here too (so the yellow rings
+        // wouldn't linger), but that made clicking away from a selection silently destroy
+        // whatever direction config was just dialed in for those points -- reported directly
+        // ("whenever i select some points to edit their direction config it doesnt get
+        // saved... it just goes back to the general config" the moment you click elsewhere).
+        // Deselecting is supposed to be a safe, reversible action; only the explicit "Reset
+        // to default" button actually deletes override data now.
+        orientationSelectedIndices = [];
+        populateOrientationInputsFrom(currentDefaultOrientationSettings());
+        cutDragging = false; cutAnchor = null; cutPreview = null;
+        renderAll();
+        return;
+      }
+      // Toggle each enclosed point's SELECTION (not its override) -- the panel below is now
+      // an inspector bound to this selection, so further edits to count/method/angles/etc.
+      // apply only to these points, leaving everything else untouched. See
+      // orientationSelectedIndices' own comment for why this replaced "stamp on drag."
+      samplePointsCanonical.forEach(function (p, i) {
+        if (p[0] >= xLo && p[0] <= xHi && p[1] >= yLo && p[1] <= yHi) {
+          const pos = orientationSelectedIndices.indexOf(i);
+          if (pos === -1) orientationSelectedIndices.push(i);
+          else orientationSelectedIndices.splice(pos, 1);
+        }
+      });
+      populateOrientationInputsFrom(
+        orientationSelectedIndices.length > 0
+          ? (orientationOverrides[orientationSelectedIndices[0]] || currentDefaultOrientationSettings())
+          : currentDefaultOrientationSettings()
+      );
+    }
+    cutDragging = false; cutAnchor = null; cutPreview = null;
+    renderAll();
+  }
+});
+
+fitCircleBtn.addEventListener("click", function () {
+  if (extremePointsCanonical.length < 3 || circleLocked) return;
+  recordUndo();
+  fittedCircle = fitCircleLeastSquares(extremePointsCanonical);
+  renderAll();
+});
+clearExtremeBtn.addEventListener("click", function () {
+  recordUndo();
+  extremePointsCamera = [];
+  fittedCircle = null;
+  fitCircleBtn.disabled = true;
+  renderAll();
+});
+gridToggle.addEventListener("change", renderAll);
+// steps/seed/distribution change the generated point set's size or its underlying algorithm,
+// so an index-keyed manual override could otherwise silently misapply to an unrelated point
+// (see the sampleOverrides declaration above) -- clear it here, but NOT on borderWidthInput,
+// which is treated as continuous fine-tuning an override should survive. Not undo-tracked,
+// for the same reason no other plain form-field change is (see the undo/redo scoping note).
+// The position cloud itself is being regenerated at a different size/algorithm -- every
+// object's `assigned`/orientationOverrides (index-keyed into that same cloud) is just as
+// stale here as sampleOverrides/orientationOverrides already are, so it's cleared the same
+// (wholesale, not remapped) way -- there's no sensible remap for "a different algorithm
+// produced a different point set entirely," unlike a plain add/remove of one point (see
+// remapObjectAssignmentsForBatchRemoval).
+function clearStaleSampleDerivedState() {
+  sampleOverrides = {}; orientationOverrides = {}; removedSampleIndices = []; orientationSelectedIndices = [];
+  objects.forEach(function (o) { o.assigned = []; o.orientationOverrides = {}; });
+  populateOrientationInputsFrom(currentDefaultOrientationSettings());
+}
+stepsInput.addEventListener("input", function () { clearStaleSampleDerivedState(); renderAll(); });
+seedInput.addEventListener("input", function () { clearStaleSampleDerivedState(); renderAll(); });
+distributionSelect.addEventListener("change", function () { clearStaleSampleDerivedState(); renderAll(); });
+countModeSelect.addEventListener("change", function () { clearStaleSampleDerivedState(); renderAll(); });
+borderWidthInput.addEventListener("input", renderAll);
+// Orientation fields never affect the POSITION sample set's size/algorithm (only steps/seed/
+// distribution do, above), so none of these need to clear sampleOverrides.
+orientationToggle.addEventListener("change", renderAll);
+orientationCountInput.addEventListener("input", renderAll);
+orientationMethodSelect.addEventListener("change", renderAll);
+orientationInitialAngleInput.addEventListener("input", renderAll);
+orientationAngleStartInput.addEventListener("input", renderAll);
+orientationAngleEndInput.addEventListener("input", renderAll);
+orientationSeedInput.addEventListener("input", renderAll);
+orientationArrowLengthInput.addEventListener("input", renderAll);
+resetOrientationBtn.addEventListener("click", function () {
+  // Selected points: clear just their own override, reverting to the default. Nothing
+  // selected: clear every override -- the only bulk "start over" action, now that a plain
+  // click with the box-select tool means "deselect" (not "delete"), not the other way round.
+  // Must ALSO clear the selection: syncActiveArmFromGlobals() re-stamps every selected
+  // point's override from the live panel fields on every render, so leaving the just-reset
+  // points selected would silently recreate the override on the very next renderAll().
+  const targets = orientationSelectedIndices.length > 0 ? orientationSelectedIndices : Object.keys(orientationOverrides).map(Number);
+  targets.forEach(function (idx) { delete orientationOverrides[idx]; });
+  orientationSelectedIndices = [];
+  populateOrientationInputsFrom(currentDefaultOrientationSettings());
+  renderAll();
+});
+
+loadActiveArmIntoGlobals(); // seeds armNameInput/armColorInput (and steps/seed/etc, redundant
+                            // with their HTML defaults but harmless) from arms[0]
+updateToolUI();
+updateUndoRedoUI();
+renderArmChips();
+renderObjectChips();
+renderAll();

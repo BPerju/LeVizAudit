@@ -1,0 +1,156 @@
+/* VizAudit calibration page styles -- extracted from calibrate.html so the markup, styles,
+   and logic (calibrate.js) can each be edited independently. No behavior change from the
+   extraction itself; see calibrate.js for a section index of the logic this styles. */
+
+  :root {
+    --bg: #0a0e17;
+    --surface-0: #0d1220;
+    --surface-1: #11172a;
+    --surface-2: #151c33;
+    --border-subtle: rgba(255,255,255,0.05);
+    --border-strong: rgba(255,255,255,0.1);
+    --text-primary: #e7ebf3;
+    --text-muted: #9aa3b5;
+    --text-faint: #5b6274;
+    --accent: #38bdf8;
+    --accent-soft: rgba(56,189,248,0.18);
+    --cut: #f87171;
+    --radius: 6px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text-primary);
+    font-family: -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
+    margin: 0;
+    padding: 24px;
+    -webkit-font-smoothing: antialiased;
+  }
+  h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 4px; }
+  h2 { font-size: 0.85rem; font-weight: 600; color: var(--text-muted); margin: 0 0 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .subtitle { color: var(--text-muted); font-size: 0.85rem; max-width: 860px; margin: 0 0 18px; }
+  .note { color: var(--text-faint); font-size: 0.78rem; max-width: 860px; }
+  code { background: var(--surface-2); border-radius: 4px; padding: 1px 5px; font-size: 0.85em; }
+
+  .panel {
+    border-radius: var(--radius);
+    border: 1px solid var(--border-subtle);
+    background: rgba(255,255,255,0.02);
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+
+  .toolbar-group { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .toolbar-group-inner { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+  /* A thin separator between functional sub-clusters of buttons that share one toolbar-group
+     (the "Edit" group accreted many distinct tools over time -- geometry editing, point
+     add/remove, selection, cut drawing -- with nothing visually distinguishing them beyond
+     being adjacent). Same idiom as Figma/Photoshop's segmented toolbars. */
+  .toolbar-divider { width: 1px; height: 20px; background: var(--border-strong); margin: 0 2px; }
+  /* A labeled subsection within a card -- e.g. "Camera"/"Arms"/"Workspace edit tools" inside
+     one panel -- giving each cluster of controls its own breathing room and a border between
+     them, instead of every row in a card running directly into the next (reported directly
+     as "cramped"). The label is deliberately quieter (text-faint, smaller) than the card's
+     own <h2> title, so the visual hierarchy stays card > subsection, not two equal headings. */
+  .subsection-label {
+    font-size: 0.68rem; font-weight: 600; color: var(--text-faint);
+    text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px;
+  }
+  .subsection + .subsection { border-top: 1px solid var(--border-subtle); margin-top: 16px; padding-top: 16px; }
+  /* The Setup card's 3 subsections (Camera/Arms/Workspace edit tools) sit side by side as
+     columns, not stacked rows -- requested directly. Overrides the stacked-subsection rule
+     above with a vertical rule between columns instead of a horizontal one above each;
+     wraps to stacked rows on a narrow viewport, same as every other flex-wrap group here. */
+  .setup-columns { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
+  .setup-columns > .subsection { flex: 1 1 220px; border-top: none; margin-top: 0; padding-top: 0; }
+  .setup-columns > .subsection + .subsection { border-left: 1px solid var(--border-subtle); padding-left: 24px; }
+
+  button, select, input[type="number"] {
+    background: var(--surface-1);
+    color: var(--text-primary);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    padding: 6px 10px;
+    font-size: 0.82rem;
+    font-family: inherit;
+  }
+  button { cursor: pointer; transition: border-color 0.15s, color 0.15s, background 0.15s; }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button.danger:hover:not(:disabled) { border-color: var(--cut); color: var(--cut); }
+  button.icon-btn { font-size: 1rem; padding: 6px 9px; line-height: 1; }
+  button.icon-btn svg { display: block; }
+  button.active { border-color: var(--cut); color: var(--cut); background: rgba(248,113,113,0.12); }
+  button.active:hover:not(:disabled) { border-color: var(--cut); color: var(--cut); }
+  input[type="number"] { width: 64px; }
+  label { font-size: 0.82rem; color: var(--text-muted); display: flex; align-items: center; gap: 5px; }
+  input[type="checkbox"] { accent-color: var(--accent); }
+
+  .views { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+  .view-panel { flex: 1 1 380px; min-width: 320px; }
+  .view-header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .view-header h2 { margin: 0; }
+  .card-header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .card-header h2 { margin: 0; }
+  /* Lives in the camera view's own header row (right-aligned via margin-left:auto on its
+     wrapper), right above the canvas it edits -- not a page-corner overlay, so it can't drift
+     away from "the actual edit space" or collide with the cards/other view's own header
+     controls. Collapsed to a single toggle button by default. */
+  .floating-toolbar { display: flex; align-items: center; gap: 6px; }
+  #floatingToolbarTools { display: flex; align-items: center; gap: 6px; }
+  .video-wrap { position: relative; width: 100%; line-height: 0; }
+  video, #cameraCanvas {
+    width: 100%;
+    height: auto;
+    border-radius: var(--radius);
+    background: var(--surface-0);
+    display: block;
+  }
+  #orthoCanvas {
+    width: 100%;
+    height: auto;
+    border-radius: var(--radius);
+    background: var(--surface-0);
+    display: block;
+  }
+  /* #cameraCanvas is a transparent overlay on top of the live <video> -- it must NOT
+     inherit an opaque background, or it paints over and hides the feed. */
+  #cameraCanvas { position: absolute; top: 0; left: 0; cursor: crosshair; background: transparent; }
+  #orthoCanvas { cursor: crosshair; }
+  /* A knife cursor while a cut-drawing tool is active, requested explicitly so the cut
+     tool reads as "cut" rather than the generic crosshair used for every other mode. The
+     ", crosshair" fallback covers browsers that can't parse the inline-SVG cursor.
+     This used to render the actual knife emoji via an SVG <text> element, with a
+     hand-picked hotspot (2, 26) guessed to land on the blade's visual tip -- a real,
+     reported bug: an emoji glyph's rendered shape (and therefore where its "tip" actually
+     falls within the image) varies by font/platform/browser, so a hotspot tuned by eye on
+     one system reliably looks offset on another. Replaced with a plain vector wedge drawn
+     with explicit coordinates, so the tip is a known point (2, 2) -- not a guess about
+     glyph metrics -- and the hotspot is set to that exact point. */
+  #cameraCanvas.cut-cursor, #orthoCanvas.cut-cursor {
+    cursor: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22"><polygon points="2,2 20,8 8,20" fill="white" stroke="black" stroke-width="1.5" stroke-linejoin="round"/></svg>') 2 2, crosshair;
+  }
+  #cameraCanvas.edit-cursor, #orthoCanvas.edit-cursor { cursor: grab; }
+
+  textarea {
+    width: 100%;
+    height: 180px;
+    background: var(--surface-0);
+    color: var(--text-primary);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    font-family: "SF Mono", Consolas, monospace;
+    font-size: 0.82rem;
+    padding: 10px;
+  }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 0.78rem; color: var(--text-muted); margin-top: 8px; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  /* Arm chips: deliberately NOT using the shared button.active rule (that's for which TOOL
+     is selected, a different concept from which ARM is active) -- each chip's border/text
+     color is set inline to that arm's own color when active, so the chip itself doubles as
+     a legend for the color used everywhere else that arm's geometry is drawn. */
+  button.arm-chip { display: inline-flex; align-items: center; gap: 6px; }
+  button.arm-chip .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  button.arm-chip.active { background: rgba(255,255,255,0.06); }

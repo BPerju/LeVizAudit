@@ -1539,6 +1539,851 @@ still pre-implementation — see `research_report.md` §3/§5/§7 for that desig
   The dataset-visualizer's panels are pure frontend (parquet via `hyparquet`) — the heavy
   Python computation has to happen ahead of time and get written next to the dataset, not be
   invoked on page load.
+- **`calibrate.html`'s inline `<style>`/`<script>` were extracted into sibling
+  `calibrate.css`/`calibrate.js` files (linked by relative path), with a section-index comment
+  banner added to the top of `calibrate.js`.** Requested directly, ahead of adding the
+  multi-object feature below, specifically so a ~3000-line single file would be easier for a
+  human or an agent to navigate and edit going forward — pure extraction, byte-identical
+  content otherwise (verified directly: `diff` against the original inline blocks before any
+  further edits landed, plus the Node harness's full pre-existing assertion set re-run
+  unchanged against the extracted file). `calibrate.py`'s `write_calibration_html` now copies
+  both sibling files alongside the HTML (`_STATIC_SIBLINGS`), since `serve_and_open` only ever
+  served `output_path.parent` — without this, the page would 404 on its own CSS/JS the moment
+  `--output` pointed somewhere other than this source tree.
+- **The calibration tool gained a multi-OBJECT layer — named, colored things placed onto
+  subsets of the existing sample-point cloud — deliberately NOT a rename/generalization of
+  "arms."** Investigated and rejected merging the two concepts: arms describe independently-
+  calibrated REACH REGIONS that feed the shared sample cloud (the existing per-arm circle/
+  extreme-points/pattern machinery, untouched by this feature); objects describe WHAT GETS
+  PLACED on points already in that cloud. The two counts are unrelated by design — a bimanual
+  rig might have 2 arms and 2 objects (one per gripper) with no relation between the numbers,
+  or 1 arm and 3 objects (three things placed within one arm's reach across different
+  episodes). `makeObject()` (`calibrate.js`, new "Objects" section) is structurally a
+  stripped-down arm: same `orientationEnabled/orientationCount/.../orientationInitialAngle`
+  field names and its own `orientationOverrides` (so it plugs directly into the EXISTING
+  `captureOrientationInputsAsConfig`/`populateOrientationInputsFrom`/`orientationExportBlock`/
+  `generateRotationAngles` with zero adapter code), plus `assigned` (sample-point indices into
+  `samplePointsCanonical` — many-to-many: one point can hold several objects, one object can
+  occupy many points). `currentDefaultOrientationSettings()` — what the Rotation card and its
+  per-point box-select overrides actually edit — now resolves to the ACTIVE OBJECT once any
+  object exists, falling back to the pre-existing arm/combinedSettings target otherwise;
+  `loadOrientationTargetIntoGlobals()` (factored out of `loadActiveArmIntoGlobals()`) repoints
+  the live `orientationOverrides` global and the form fields at whatever that resolves to,
+  called on every arm switch (as before) AND on every active-OBJECT switch (new) — one seam,
+  not two parallel ones.
+- **No manual `level` field anywhere — stacking order at a shared point is derived
+  automatically from ASSIGNMENT ORDER, not hand-typed.** The first version of this feature
+  gave each object a manual integer `level`; reported directly as backwards ("the level
+  should get automatically assigned to a point if more objects use it not manually"): an
+  operator stacking blocks shouldn't have to invent and keep consistent a numbering scheme
+  across however many objects/points happen to share a spot. Fix: `makeObject()` has no
+  `level` field at all, only `assignedSeq` (an object → point map of `nextAssignmentSeq`'s
+  value at the moment that assignment was made; `nextAssignmentSeq` is one monotonically
+  increasing module-level counter). `objectStackAt`/`computeEpisodePlacements` sort the
+  objects sharing a point by `assignedSeq[thatPoint]` ascending and hand back each one's
+  0-based rank in that sorted order AS its `level` (first assigned = 0 = bottom) — there is
+  deliberately no single "this object's level," only "this object's rank wherever it happens
+  to be stacked," since the SAME object can rank differently at two different shared points
+  depending on assignment order there. Un-assigning and re-assigning issues a fresh seq, so an
+  object moved off and back onto a stack lands back on top, not wherever it originally was.
+  `nextAssignmentSeq` is included in undo snapshots and restored via `Math.max` (never
+  decreasing across a restore), so an undo/redo round-trip can't make a future assignment's
+  seq collide with or sort before one already on the restored objects.
+- **Assignment is "select first with the general tool, THEN click Assign/Unassign" — not a
+  dedicated drag-to-assign tool.** The first version added a separate "Assign object" tool
+  (`toolAssign`) an operator had to switch into before they could even see what they were
+  selecting; reported directly as backwards ("first select using the general tool then assign
+  for the object"). Fix: removed `toolAssign`/`assignBoxToggle`/the `"assignObject"`
+  interaction branches entirely. The Objects card instead has two buttons,
+  `assignSelectedBtn`/`unassignSelectedBtn`, that act on whatever `orientationSelectedIndices`
+  currently holds — the EXACT SAME selection state the pre-existing "select" tool's box-select/
+  click-to-select already populates for scoping the Rotation card's per-point overrides.
+  Assigning is now just another action over that one selection, not a second, parallel
+  selection mechanism — select with "select" (box-drag, or click one point), then Assign/
+  Unassign. Two distinct buttons rather than one toggle, deliberately: a toggle's meaning is
+  ambiguous the instant the selection is a MIX of already-assigned and not-yet-assigned
+  points, which is the common case once an operator selects by region rather than one point
+  at a time. `toggleObjectAssignment(pointIndex)` (issues/clears the `assignedSeq` entry) is
+  the shared primitive both buttons call per selected index; unlike
+  `orientationSelectedIndices` itself (deliberately NOT undo-tracked, pure UI focus), an
+  Assign/Unassign click IS pushed through `recordUndo()` — this feature's actual deliverable,
+  not a selection.
+- **Episode model: each object sweeps its OWN sorted `assigned` list independently
+  (`sortedAssigned[episodeIndex % length]`), the same `target_for_episode` index-modulo idiom
+  `session.py`/this tool's own rotation-angle cycling already use** — decoupled per object on
+  purpose, exactly like position-count and rotation-count are already deliberately decoupled
+  elsewhere in this engine (see the rotation-arrow bullets above). Two or more objects whose
+  *current* episode index resolves to the same point index stack (sorted by the automatic
+  assignment-order rank above, bottom to top), fanned out by a small fixed canonical offset
+  (`OBJECT_STACK_FAN_RADIUS`, `stackOffsetPosition`) so stacked dots/arrows render as visually
+  distinct rather than exactly overlapping — purely cosmetic; the exported position is always
+  the point's own un-fanned coordinate. Deliberately **even marginals only** (the user's
+  explicit call): no joint decorrelation/collision solver across objects — each object's
+  `assigned` subset is whatever the operator chose, and nothing here re-balances one object
+  against another's choices.
+- **Preview is BOTH an episode stepper and a marginal overlay, picked via a `previewMode`
+  dropdown in the Objects card** — the marginal overlay (default) renders every object's full
+  `assigned` cloud simultaneously, closest to this tool's pre-existing always-on preview
+  style, for verifying overall coverage; the episode stepper (`computeEpisodePlacements`)
+  renders the exact simultaneous multi-object scene for one specific episode index (with the
+  rest of the cloud shown faint, for spatial context), for verifying the real recording
+  sequence object-by-object. `maxEpisodeCount()` is the longest of any one object's own
+  `assigned` list (shorter lists just cycle back to their own start sooner, never an error).
+  With zero objects, the legacy single-target orientation preview (`orientationTipsCanonical`
+  built from one shared arm/combinedSettings config, drawing every configured angle from every
+  point uniformly) is completely untouched; with 1+ objects it's suppressed in favor of
+  `objectStacksAtPoint`/`computeEpisodePlacements` instead, since "draw one tool-wide arrow
+  set from every point" stops making sense the moment different points can hold different,
+  independently-configured objects. `renderObjectPlacementsCamera`/`renderObjectPlacementsOrtho`
+  are the camera/ortho-specific render functions (forward-mapping via the homography vs.
+  scaling directly by `orthoScale`, mirroring every other dual-view render path in this file).
+- **Index invalidation gets the PRECISE fix here, not the wholesale "just clear it" the
+  pattern-level `orientationOverrides`/`orientationSelectedIndices` already settled on for the
+  analogous hazard** — a deliberate departure, because object assignment is this feature's
+  main deliverable (losing it on every single point add/remove would be a real regression,
+  unlike losing a point's rotation override). A pure append (`extraSamplePoints.push`, the
+  "+" tool's add case) never shifts any EXISTING final index, so no remap is needed at all; a
+  removal (the "+" tool's remove case, or `deleteSelectedSamples`'s batch delete) calls
+  `remapObjectAssignmentsForBatchRemoval(removedIndices)` first, which drops every object's
+  reference to a removed index and renumbers every surviving reference — `assigned`, its
+  `orientationOverrides`, AND its `assignedSeq` (a point's automatic level is meaningless once
+  its index changes, so the seq recorded against it must follow the same renumbering) — down
+  by however many removed indices preceded it, computed directly from the batch (correct
+  regardless of removal order), not via repeated single-index shifts. A structural
+  regeneration (steps/seed/distribution/count-mode changing — a genuinely different point set,
+  where no remap is meaningful) still wholesale-clears every object's `assigned`/
+  `orientationOverrides`, exactly like the pre-existing pattern-level fields, via the new
+  shared `clearStaleSampleDerivedState()` (factoring out 4 previously near-duplicated listener
+  bodies in the same pass).
+- **Export: with 1+ objects defined, the legacy single-implied-object `pattern:`/`marker:`
+  block is suppressed entirely in favor of a top-level `objects:` list (`objectsExportBlock`)
+  — one entry per object with explicit, homography-forward-mapped pixel-space `points:`
+  (`shape: points`, sorted-assigned order), a marker color, and the SAME
+  `orientationExportBlock(o)` every arm/combinedSettings export already used.** Manual
+  per-point assignment can't be expressed as an analytic pattern the way `sector`/`union` are,
+  so it's exported as the explicit point list directly. **At the time this bullet was first
+  written, engine support for `shape: points` (and a parallel per-point `levels:` array this
+  export originally also emitted) was a documented follow-up, not built yet — that follow-up
+  has since landed, but NOT as a `levels:` array; see the "Behavioral randomization knobs"
+  entry below for why that array was dropped in favor of a top-level `stacks:` mechanism
+  instead, and for the real `shape: points`/`sequencing`/`jitter_px`/`presence` schema that
+  actually shipped.** With ZERO objects (every session before this feature, and the default
+  for a new one), the `objects:` branch is unreached — the pre-existing independent/combined
+  `pattern:` export code is byte-for-byte untouched, verified directly via a Node-harness
+  assertion that removes every object after exercising the feature and confirms the export
+  reverts to exactly `shape: sector` with no `objects:` block.
+  - Verified via an ad-hoc Node harness (this project's established, not-committed-to-the-repo
+    convention for `calibrate.js` — see the harness-based verification notes throughout this
+    file): object add/remove isolation and palette-color distinctness; automatic level
+    derivation (the FIRST-assigned object at a shared point ranks 0/bottom, the second ranks
+    1/on top, purely from assignment order, with re-assigning moving an object back to the top
+    of that point's order) and distinct fanned positions; `computeEpisodePlacements`'
+    independent per-object cycling at two different episode indices;
+    `remapObjectAssignmentsForBatchRemoval`'s index-drop/shift correctness across `assigned`,
+    `orientationOverrides`, AND `assignedSeq` together; export gating in both directions
+    (objects present → `objects:`/`shape: points`/no legacy block; objects removed → reverts
+    to byte-identical `shape: sector`); undo/redo round-tripping an assignment with
+    `nextAssignmentSeq` never decreasing across the restore; and, driving the REAL `mousedown`/
+    `mousemove`/`mouseup`/button-`click` listeners end-to-end (not the underlying functions in
+    isolation): a real box-drag with the EXISTING "select" tool populating
+    `orientationSelectedIndices`, confirming selecting alone does NOT assign anything, then a
+    real click on the Assign button assigning every selected point, then Unassign clearing it.
+    The full pre-existing 14-assertion suite (Part-A extraction correctness) was re-run
+    alongside these and stayed green throughout.
+- **Behavioral randomization knobs (sequencing, positional jitter, presence/dropout, and
+  randomized stack levels) — requested as a follow-up brainstorm on "what, besides marginal
+  and episode preview, makes multi-object data collection more sample-efficient," with the
+  explicit framing of "even marginals over MORE axes than position": each object should land
+  on each of its own points, AND each level of a stack it's part of, roughly equally across a
+  session — the data-collection analog of domain randomization (a policy that only ever sees
+  red-on-blue never learns blue-on-red).** All four knobs are REAL `config.py`/`pattern.py`/
+  `session.py` fields the live overlay consumes — not preview-only — and all four default to
+  today's EXACT prior behavior when unset (lockstep cycling, no jitter, always present,
+  declaration-order levels), so every config written before this feature is byte-for-byte
+  unaffected.
+  - **`pattern.py` gained `sequence_index(episode_index, length, mode, object_ordinal,
+    num_objects, seed)`**, replacing the bare `episode_index % length` lockstep cycle
+    `target_for_episode` always used for position, with two decorrelation alternatives —
+    `"phase"` (a fixed, evenly-spaced offset per object — cheapest, no randomness) and
+    `"shuffled"` (each object visits its own points in its own seeded-random order — still a
+    permutation, so the even-marginal guarantee holds exactly) — because two objects with
+    EQUAL-length patterns moving in lockstep always pair the same way (objA-here always means
+    objB-there) — exactly the spatial correlation this whole project audits against, just at
+    the object-pairing level instead of single-object position. `ObjectConfig.sequencing: str
+    = "lockstep"` selects the mode; `seed` is read from the object's own `PatternConfig.seed`
+    (see the `shape: "points"` bullet below for why that field had to be widened to accept
+    one). A THIRD mode, `"stratified"` (striding by an integer coprime with `length`, distinct
+    per object), shipped briefly in this same pass and was removed before ever reaching a
+    release — see the dedicated bullet below for why, and for two real bugs (one a genuine
+    JS/Python parity break, not just a design question) found while re-examining `"phase"` in
+    response to that same review.
+  - **`pattern.py` gained `apply_jitter(point, jitter_px, seed, episode_index,
+    object_ordinal)`** — seeded sub-cell positional noise (area-uniform within a disk, the
+    same squared-uniform-radius trick `generate_sector_points` already relies on), applied
+    fresh every episode so a policy doesn't overfit to the exact pixel a target sits at. The
+    single highest-value, lowest-effort knob of the four, and fully independent of the other
+    three. `ObjectConfig.jitter_px: float = 0.0` (no-op default).
+  - **`pattern.py` gained `is_present(episode_index, presence)`** — whether an object is shown
+    at all this episode, true for only a configurable fraction (`presence` in `[0, 1]`) of
+    episodes, for clutter/distractor robustness training. Evenly spread via a running-total
+    (Bresenham-style) test (`floor((i+1)*presence) - floor(i*presence) == 1`) rather than an
+    independent per-episode coin flip — unbiased in aggregate, but a coin flip can still streak
+    many consecutive absences by chance, which the running-total test can't. Needs no total
+    episode count up front, matching the session's own "runs until interrupted" model.
+    `ObjectConfig.presence: float = 1.0` (always present, the default).
+  - **`pattern.py` gained `level_order(stack_size, episode_index, strategy, seed)`** — the
+    displayed level (z-order, `0` = bottom) for each declaration/assignment-order slot in a
+    stack this episode, the level-axis equivalent of `sequence_index` above. `"fixed"`
+    (default) is today's exact behavior (identity — order never changes). `"cycle"`/
+    `"balanced"` are both Latin squares (any one slot visits all `stack_size` levels, all
+    distinct, every `stack_size` episodes) — `"cycle"` rotates the identity ordering (no
+    randomness), `"balanced"` rotates a SEEDED ordering instead, so which level an object
+    starts at is itself randomized, not always slot `i` starting at level `i`. `"shuffle"` is a
+    plain independent seeded permutation per episode — evenly distributed in aggregate, but
+    without the Latin square's per-window guarantee.
+  - **All four knobs share one small, deliberately portable seeded PRNG, `_mulberry32` in
+    `pattern.py` / `mulberry32` in `calibrate.js` — NOT stdlib `random.Random` (Mersenne
+    Twister), which has no portable JS equivalent.** The calibration tool's episode-stepper
+    preview has to show EXACTLY what a real session would record for these seeded knobs, and
+    this project's established way of guaranteeing that is porting the SAME algorithm into
+    both languages and verifying the outputs match bit-for-bit, not just "looks equivalent."
+    `calibrate.js` already HAD a `mulberry32` (used for the `"random"` sampling distribution
+    and the radial spiral's rotation offset) — reused as-is rather than adding a second,
+    duplicate implementation, after explicitly verifying it's bit-for-bit identical to the new
+    Python `_mulberry32` by running both with seed `0` and diffing the first two draws
+    (`0.26642920868471265`, `0.0003297457005828619` — identical to 15+ significant digits).
+    `_combine_seed`/`combineSeed` (a masked multiply-accumulate hash) folds several integers
+    (seed, episode index, object ordinal) into one 32-bit seed for these functions, masked at
+    EVERY step rather than only the final result — needed because an unmasked multiply-
+    accumulate can exceed JS float64's exact-integer range for large inputs, which would
+    silently desync the two languages' outputs without that discipline.
+  - **Stacks come into existence two ways — AUTHORED sites (`OverlayConfig.stacks:
+    list[StackConfig]`, a fixed `point` + named `objects` + `level_strategy`/`seed`) and
+    EMERGENT coincidence (two objects' independently-sequenced positions happening to land on
+    the same point this episode, needing no config entry at all) — because they serve
+    different dataset shapes.** An authored site guarantees a stack/tower exists every episode
+    (a 3-block assembly task needs this); emergent stacking falls out for free from the
+    Objects-layer's pre-existing "assign multiple objects to overlapping points across their
+    own independent multi-point patterns" authoring model, with no new schema needed for it.
+    `session.py`'s `show_targets` computes every present object's BASE (pre-jitter) position
+    first (an authored-stack member's position is its stack's fixed `point`, full stop,
+    overriding its own pattern entirely; everyone else uses `sequence_index` against their own
+    pattern), GROUPS objects by exact base-position equality (this is what finds emergent
+    stacks), THEN runs `level_order` per group (authored → its own `level_strategy`/`seed`;
+    emergent → always `"fixed"`, since there's no `StackConfig` to read a strategy from), and
+    only THEN applies `apply_jitter` per member. Grouping deliberately happens on the
+    PRE-jitter position: jitter is independent per-member cosmetic noise, not part of what
+    makes a group a group — grouping on POST-jitter positions (as an earlier wording of this
+    feature's own plan literally said) would make emergent stacks vanish almost the instant
+    any member has `jitter_px > 0`, since two independent continuous offsets essentially never
+    land on the exact same point; recognized and deliberately overridden during implementation,
+    not an oversight carried through from the plan.
+  - **`rerun_client.py`'s `log_target` gained `level`/`stack_size` parameters, fanning a
+    stacked marker out by a small fixed radius keyed on `level` (not declaration-order RANK) —
+    mirroring the calibration tool's pre-existing `OBJECT_STACK_FAN_RADIUS`/
+    `stackOffsetPosition` formula exactly (`STACK_FAN_RADIUS = 7.0`,
+    `_stack_offset_position`).** Keying the fan angle on the (possibly randomized) LEVEL rather
+    than the stable rank means a stacked marker visibly moves to a different fan slot whenever
+    its level changes episode to episode — the intended visual confirmation that the stacking
+    order actually changed, not an accident of using whichever value was more convenient. An
+    absent object (`is_present` false) calls the new `clear_target` (a recursive `rr.Clear`)
+    instead of skipping the call entirely — skipping would leave the PREVIOUS episode's marker
+    visibly stuck on screen, since re-logging-replaces-prior-data only works when something
+    actually re-logs.
+  - **`config.py` gained `shape: "points"` on `PatternConfig`** (`points: list[Point]`,
+    explicit/manually-authored positions, returned as-is by `build_pattern` with no sampling —
+    what the calibration tool's per-object point assignment exports) **and `StackConfig`**
+    (`point`, `objects: list[str]` validated to exist and be `variable: true`, `level_strategy:
+    str = "fixed"`, `seed: int = 0`) **on a new `OverlayConfig.stacks: list[StackConfig]`.**
+    `shape: "points"` also accepts an optional `seed: int = 0` — NOT used for sampling (there's
+    nothing to sample) but as the seed `sequence_index`'s `"shuffled"` mode and `apply_jitter`
+    draw from for that object, found as a real gap mid-implementation: every other shape
+    already had a `seed` field for its own sampling, so reusing `PatternConfig.seed` for the
+    NEW per-object randomization knobs was free for them, but `shape: points` had never had a
+    reason to accept `seed` at all until these knobs existed for it to feed.
+  - **The calibration tool's Objects card gained per-object `Sequencing`/`Jitter px`/
+    `Presence`/`Seed` fields (synced via the same `renderObjectChips`/switch-object pattern
+    `objectColorInput`/`objectNameInput` already used) and one GLOBAL (not per-object, this
+    pass — per-stack override deferred) `Stack level strategy`/`Stack seed` pair, plus an
+    Animate/Play button on the episode stepper (a plain `setInterval` advancing
+    `currentEpisode`, the one pure-preview addition in this whole feature — it has no engine
+    counterpart because "auto-advance the local preview" has no recording-time analog).** The
+    MARGINAL overlay's level badge deliberately stays the plain assignment-order rank
+    regardless of the new strategy setting — there's no single "this episode" for a static,
+    always-on view to vary it across — only the EPISODE STEPPER's `computeEpisodePlacements`
+    actually applies `sequenceIndex`/`isPresent`/`applyJitter`/`levelOrder`, mirroring
+    `session.py`'s own grouping order (group on pre-jitter base position, THEN jitter each
+    member) exactly.
+  - **Export: `objectsExportBlock` emits each non-default knob (`sequencing`, `jitter_px`,
+    `presence`, the pattern's own `seed`) only when it differs from the default, so an object
+    that never touched these fields exports byte-identically to before they existed — and the
+    OLD parallel `levels:` array this function used to emit (back when engine support was
+    still a documented follow-up, see above) is gone entirely, replaced by a NEW
+    `stacksExportBlock`.** That function only emits an authored `stacks:` entry for a group of
+    2+ objects whose ENTIRE `assigned` list is exactly one shared point — a deliberately
+    NARROWER case than everything the calibration tool's per-object multi-point assignment can
+    represent. An object assigned to several points that only INCIDENTALLY overlaps another
+    object's point at some episodes is left to the engine's own emergent stacking instead
+    (no config entry, "fixed" level only): exporting an authored pin for that case would
+    incorrectly force the two objects together EVERY episode, not just the ones where their
+    independent per-object cycles actually happen to coincide — a real correctness trap
+    identified and deliberately avoided while designing the export, not found via a test
+    failure.
+  - Verified via ~68 new Python tests across `test_pattern.py` (the four new functions plus
+    their private helpers — `_mulberry32`/`_combine_seed`/`_seeded_permutation`/
+    `_coprime_stride` — covering determinism, the even-marginal/Latin-square guarantees, and a
+    pinned exact-value regression test against the algorithm itself), `test_config.py`
+    (`shape: points`/`seed`, the three `ObjectConfig` knobs, and `StackConfig`/`stacks:`
+    parsing/validation), and new `test_session.py`/`test_rerun_client.py` files (default-knobs
+    back-compat byte-for-byte; presence emitting `clear_target` on absent episodes; jitter
+    matching `apply_jitter` called directly; an authored stack's shared point/levels; a
+    `"balanced"` strategy actually varying across episodes; an EMERGENT stack forming only once
+    two independent patterns coincide; a stacked object's orientation cycling every episode
+    rather than once per its own pattern length; the fan-by-level offset and recursive-clear
+    behavior in isolation) — 285 Python tests total (`pytest tests/ -q`). JS side verified via
+    58 new ad-hoc Node-harness assertions (same
+    convention as the rest of this file): bit-for-bit parity of every ported function against
+    the Python outputs above; `computeEpisodePlacements` wiring for sequencing/presence/jitter/
+    levels including the Latin-square check and the jitter-doesn't-break-grouping case; export
+    gating in both directions for the new per-object lines AND the pinned-vs-incidental
+    `stacks:` distinction; real DOM-event wiring for every new input/select/button, including
+    Play/Pause toggling and an active-object switch correctly reloading its own knobs back into
+    the form. `examples/stacking.example.yaml` (a 3-block authored stack with `balanced`
+    levels plus an independently-swept distractor exercising all three remaining knobs) is the
+    new example config for this feature, and was run through `load_config` plus a live
+    `run_session` smoke (mocking only the dataset/Rerun I/O) to confirm the documented behavior
+    end-to-end, not just unit-level.
+- **`"stratified"` sequencing was removed, and `"phase"` got a real correctness fix plus
+  eager validation, after being asked directly "what is the point of anything but the shuffle
+  sequencer" — a fair challenge that, on honest re-examination, exposed one weak design choice
+  and two real, independent bugs (one of them a genuine cross-language correctness break, not
+  just a missing nice-to-have).**
+  - **`"stratified"`'s own justification didn't hold up:** its claimed benefit (decorrelated
+    visit order without needing the RNG, in the same spirit as the radial pattern's golden-
+    angle choice) is something `"shuffled"` already does at least as well — and unlike a true
+    random permutation, a FIXED coprime stride is pure modular arithmetic, so it risks
+    resonating with whatever periodic structure the underlying point grid already has, which
+    randomness can't. It was added because the original brainstorm proposed it, not because it
+    solved something `"shuffled"` didn't. Removed entirely: `pattern.py`'s `_coprime_stride`
+    and the `"stratified"` branch of `sequence_index`, `config.py`'s `_SEQUENCING_MODES` entry,
+    and `calibrate.js`'s `coprimeStride`/`gcd` and its `sequenceIndex` branch and HTML
+    `<option>`. `ObjectConfig.sequencing`'s allowed values are now just `"lockstep"`/`"phase"`/
+    `"shuffled"`.
+  - **`"phase"`'s actual, defensible reason to exist: unlike `"shuffled"`, it gives a
+    GUARANTEED, not probabilistic, non-collision property** — two objects of the same
+    `length` with distinct offsets will NEVER share an index, for as long as the session runs,
+    whereas two independently-shuffled equal-length objects still coincide on roughly
+    `1/length` of episodes in expectation (by chance, possibly worse for an unlucky seed).
+    That's the right tool specifically when coincidence is a hard constraint (e.g. a literal
+    collision-safety requirement between two simultaneously-active targets), not just a
+    coverage nicety where `"shuffled"` is the better general default.
+  - **Bug 1 (a real correctness gap, found while writing the justification above, not from a
+    test failure): the offset formula's guarantee was CONDITIONAL, not automatic, and nothing
+    enforced the condition.** `offset(o) = round(o * length / num_objects)` maps `num_objects`
+    ordinals into only `length` possible values — if `num_objects > length`, the pigeonhole
+    principle FORCES at least two ordinals to share an offset, and those two objects would then
+    collide every single episode, forever: the exact opposite of what `"phase"` exists to
+    prevent, and silently so. Fixed by adding `pattern.py`'s `find_phase_offset_collisions
+    (length, ordinals, num_objects)` (pure pigeonhole arithmetic, no `episode_index` involved,
+    since the offset never changes across a session) and calling it eagerly from a new
+    `session.py` `_validate_phase_sequencing`, right after `patterns` is built (the first point
+    real per-object lengths are known) and before connecting to Rerun — grouping every
+    `"phase"`-sequenced object by its pattern's length, and raising a `ValueError` naming the
+    first colliding pair the moment any group's offsets aren't pairwise distinct. Consistent
+    with this project's existing "a conflict in something deterministic is a config error: fail
+    loudly, name the offending thing" rule (see the arc/line-vs-exclude_zones bullet earlier in
+    this file) — a guaranteed-forever collision should never just happen silently.
+    `calibrate.js` got the identical check (`findPhaseOffsetCollisions`/`phaseOffset`, sharing
+    the same JS/Python parity discipline as everything else in this section) wired to a new
+    `phaseWarning` note in the Objects card, updated every `renderAll()` — so the calibration
+    tool warns an operator BEFORE they ever run a session that would hit this, not just after.
+  - **Bug 2 (a genuine JS/Python PARITY break, found by actually testing the claim rather than
+    assuming `round()`/`Math.round()` are equivalent): Python's builtin `round()` uses
+    round-half-to-EVEN ("banker's rounding"), while JavaScript's `Math.round()` always rounds
+    half AWAY FROM ZERO — confirmed disagreeing, not just theoretically different:
+    `round(2.5) == 2` in Python vs `Math.round(2.5) === 3` in JS; same for `0.5`→`0` vs `1` and
+    `4.5`→`4` vs `5`.** The phase-offset formula (`o * length / num_objects`) lands on an exact
+    `.5` boundary for ordinary, non-adversarial combinations (e.g. `length=3, num_objects=2`
+    gives `1.5` for `o=1`) — meaning the calibration tool's preview could show a DIFFERENT
+    offset than the live session would actually use for the identical config, silently, for
+    perfectly normal inputs, not just edge cases. This is exactly the class of bug this
+    project's "verified bit-for-bit, not just looks equivalent" parity discipline exists to
+    catch — found here by actually running both languages' rounding on the same values and
+    diffing, not by assuming the port was faithful. Fixed with `pattern.py`'s
+    `_round_half_up(x) = math.floor(x + 0.5)`, which is mathematically identical to
+    `Math.round()` for the non-negative values this formula ever produces — `calibrate.js`
+    needed NO equivalent helper at all, since its native `Math.round()` already behaves the way
+    Python had to special-case to match it (confirmed directly, not assumed: `Math.floor(2.5 +
+    0.5) === Math.round(2.5)`, etc.). `_phase_offset`/`phaseOffset` (the one place this
+    formula is computed) are the shared, single source of truth `sequence_index`/
+    `find_phase_offset_collisions` and their JS twins all route through, so the fix and the
+    validation above can never drift apart from what's actually used to place a target.
+  - Verified via 5 new `test_pattern.py` tests (the `_round_half_up`/`Math.round`
+    disagreement pinned directly with the exact values above; `_phase_offset` distinctness for
+    a safe case; `find_phase_offset_collisions` returning empty for distinct offsets and a
+    real pigeonhole pair for a forced-collision case) and 3 new `test_session.py` tests (a
+    safe `"phase"` config running cleanly end-to-end; a forced-collision config raising a
+    `ValueError` naming both objects; confirming two DIFFERENT pattern lengths are never
+    compared against each other, since only same-length objects can possibly collide on a
+    shared offset), net of removing every `"stratified"`-specific test — 289 Python tests
+    total. JS side re-verified with 6 new Node-harness assertions (`phaseOffset`/
+    `findPhaseOffsetCollisions` matching Python exactly, INCLUDING at the exact-half rounding
+    boundary that would have exposed Bug 2 had it not been fixed; the `phaseWarning` note
+    correctly appearing for a forced-collision scene and staying hidden for a safe one), net
+    of removing the `"stratified"`-specific ones — 62 JS assertions total, all passing.
+- **`"phase"` sequencing was removed entirely, and the authored `stacks:` config block was
+  replaced with a SCENE-LEVEL `co_location` toggle, after a direct report that the feature
+  conflated two genuinely different intents: "2+ objects in the same place at the SAME
+  episode" (a real stack) vs. "2+ objects in the same place at DIFFERENT episodes" (a shared
+  point used at different times, where same-episode coincidence is an accident to avoid, not a
+  stack) — `"phase"`'s per-object guarantee and the authored single-site `stacks:` block each
+  only ever addressed one narrow corner of this, not the actual ambiguity.**
+  - **Stacking is no longer authored.** `config.StackConfig`/`OverlayConfig.stacks` are gone.
+    A stack is now ALWAYS derived directly from 2+ objects' own `pattern: {shape: points}`
+    lists sharing a literal coordinate — exactly what `vizaudit-calibrate`'s per-object point
+    assignment already produces when two objects are assigned the same point, so authoring a
+    *separate* `stacks:` block for the common case (an object pinned to exactly one shared
+    site) was redundant with what the tool already exports naturally. The previous design's
+    real gap wasn't the lack of an authored block — it was that *coincidental* multi-object
+    sharing had no way to express "keep these apart instead," covered by the next point.
+  - **New scene-level `OverlayConfig.co_location: "stack" | "keep_apart"`** (default
+    `"stack"` — today's prior coincidence-stacking behavior, byte-for-byte). `"keep_apart"`
+    actively avoids same-episode co-occupancy: `pattern.py` gained
+    `resolve_keep_apart(natural_indices, assigned_lists, episode_index) ->
+    (resolved_indices, residual_collision_ordinals)` — a pure, deterministic, RNG-free
+    greedy resolver. In DECLARATION order, the first object wanting a point keeps it; each
+    later object wanting an already-taken point advances through its OWN assigned points
+    (cyclically, starting at `episode_index % length`, so it doesn't always retry the same
+    alternate first) to the first currently-free one; if none of its own points are free, it
+    keeps its natural (colliding) index and is reported as a RESIDUAL collision rather than
+    silently overlapping. Objects with disjoint assigned-point sets (the common case) are
+    mathematically untouched — nothing here perturbs an object that never collides with
+    anyone. `session.py`'s `show_targets` calls this once per episode (only when
+    `co_location == "keep_apart"`), then runs the SAME coincidence-grouping it always did on
+    the (possibly nudged) resolved positions — a residual collision therefore gracefully
+    DEGRADES to rendering as a visible, leveled stack (not a silent, indistinguishable
+    overlap), and `logger.warning(...)` names the colliding objects and episode.
+  - **`OverlayConfig.level_strategy`/`level_seed` moved from per-`StackConfig` to SCENE-LEVEL**
+    (one setting for the whole session, matching the calibration tool's pre-existing global
+    controls) — used whenever 2+ objects coincide, whether that's a "stack"-mode coincidence
+    or a "keep_apart"-mode residual fallback. Per-stack override remains a possible future
+    refinement, not built.
+  - **`"phase"` sequencing is gone from `sequence_index`** (`_SEQUENCING_MODES` is now just
+    `"lockstep"`/`"shuffled"`) — along with `_round_half_up`/`_phase_offset`/
+    `find_phase_offset_collisions` and `_validate_phase_sequencing` in `session.py`. Its one
+    real justification (a guaranteed, not probabilistic, non-collision property between two
+    *separate* objects' independent sweeps) conflated object-PAIR decorrelation with the
+    distinct, scene-level "should co-located objects ever coincide at all" question that
+    `co_location` now answers directly and unconditionally — `"phase"`'s guarantee was also
+    only ever conditional (pigeonhole-breakable once `num_objects > length`, the bug fixed
+    earlier the same day this redesign happened), whereas `resolve_keep_apart` has no such
+    failure mode: it always reports rather than silently violating its contract.
+  - **Calibration tool**: `coLocationSelect` (Stack / Keep apart) replaces the per-object
+    "Phase offset" `<option>`; toggling to `"keep_apart"` disables the (still scene-level)
+    stack-level-strategy/seed controls, since they only apply to an actual stack or a residual
+    fallback. `computeEpisodePlacements` was restructured to return `{sites, residual}` —
+    `sites` is `[{point, members}]`, ONE entry per occupied point (never per member: a stack of
+    3 is one site with 3 members, not 3 separate placements) — mirroring `show_targets`
+    exactly: natural `sequenceIndex` per object, then the SAME `coLocation` branch (`"keep_
+    apart"` → `resolveKeepApart`, ported bit-for-bit; `"stack"` → untouched), THEN grouped by
+    exact resolved-position equality pre-jitter (jitter stays per-member, applied after
+    grouping, same reasoning as before). `objectStackAt` (the marginal-overlay's per-point
+    data, INTENTIONALLY unaffected by `coLocation` — it's a static "every point this object
+    could occupy" view with no per-episode dynamics to branch on) also dropped its own
+    fan-out math for the same reason as the render change below. A bounded scan
+    (`KEEP_APART_SCAN_LIMIT = 50` episodes) feeds `updateCollisionWarning()`, the renamed/
+    repurposed warning note (was `phaseWarning`), so an operator sees residual collisions
+    before ever recording, not just via `session.py`'s per-episode log line.
+  - **Tower-legend rendering replaces the fan-ring**, directly per a report that a scattered
+    ring of identical-looking same-color-coded dots a fixed radius apart didn't make "which
+    object is on top" legible. `stackOffsetPosition`/`OBJECT_STACK_FAN_RADIUS` are gone
+    entirely — every stack member now shares the literal SAME render point (no fan), and a new
+    `drawStackLegend(ctx, point, sampleRadius, members)` draws exactly one dot (colored by the
+    TOP/highest-level member, so "what's visually on top" matches the real-world stacking)
+    plus, for 2+ members, a small `×N` badge and a compact vertical legend beside the dot
+    (connected by a thin line) listing every member top→bottom with a color swatch, name, and
+    explicit level number — unambiguous regardless of stack height, applied identically in the
+    marginal overlay and the episode stepper, on both the camera and orthographic views.
+  - **Sample/target counter** (`updateSampleCountLabel`, a new `sampleCountLabel` note in the
+    Objects card) — requested directly, since stacking/rotation can both inflate the real
+    number of targets a session shows beyond the configured pattern size. BASE is
+    `samplePointsCanonical.length` — the ACTUAL rendered point count, not the configured
+    `steps` value, since `count_mode: "variable"` can render fewer points than configured (the
+    one explicit correctness requirement given: "count the variable amount if its not a fixed
+    sample size... the amount of points in the scene not in config"). With objects defined:
+    `placements = Σ object.assigned.length` (counted once per object-point ASSIGNMENT, so
+    `placements > basePoints` can only happen via 2+ objects sharing a point — this IS the
+    stacking signal, surfaced as "+N stacked"; `placements < basePoints` surfaces as "N
+    unused"), and `targets = Σ assigned.length × (orientationCount if enabled else 1)`,
+    surfaced as "+N from rotations" on top of placements. With no objects (legacy path): a
+    single shared tool-wide rotation setting multiplies `basePoints` directly.
+  - Verified via 5 new `resolve_keep_apart` Python tests (disjoint sets untouched; overlapping
+    sets separated onto a free point; residual reported when no alternative exists; absent
+    objects skipped; deterministic given a fixed `episode_index`) plus 4 new `test_config.py`
+    tests (`co_location`/`level_strategy`/`level_seed` default/parse/validate) and 4 rewritten
+    `test_session.py` tests (stack-forms-from-coincidence and scene-level `level_strategy`
+    replacing the old authored-`StackConfig` tests verbatim in behavior; `keep_apart`
+    separating objects with an alternative; `keep_apart`'s residual collision degrading to a
+    visible stack AND logging a warning naming the object) — 285 Python tests total (every
+    `"phase"`/`"stratified"`/`StackConfig` test removed, net). JS side: 86 Node-harness
+    assertions (up from 62) — `resolveKeepApart` bit-for-bit parity vs. `resolve_keep_apart`
+    (including the residual and disjoint-untouched cases); `computeEpisodePlacements`'s new
+    `{sites, residual}` shape (one site per coincidence, not per member; `keep_apart`
+    separating/falling-back correctly); `objectStackAt` sharing one unfanned point across
+    members; export gating for the new scene-level fields and the ABSENCE of any `stacks:`
+    block; the co-location toggle's UI wiring (including disabling the level controls);
+    `updateCollisionWarning`'s scan in both directions; and the sample-counter's disjoint/
+    stacked/rotation-delta math. `examples/stacking.example.yaml` was rewritten to match (the
+    3 stacked blocks' shared coordinate now implies the stack with no `stacks:` block at all;
+    `level_strategy`/`level_seed` moved to top-level scene fields) and re-verified end-to-end
+    via the same `load_config` + mocked `run_session` smoke as before — identical recorded
+    behavior to the pre-redesign version, confirming the new derived-stacking mechanism is a
+    faithful replacement, not just a differently-shaped config.
+- **A second ambiguity in the same area, found by the same user one pass later: "stack vs.
+  keep_apart" only ever disambiguated what happens AT a shared point — it said nothing about
+  how many distinct points/stacks are visible AT ONCE, every episode.** Verbatim report: "there
+  can be multiple stacks per episode and a single stack as a point per episode same as there
+  could be one object per episode or multiple objects per episode, account for that in a
+  separate setting." Until this point, every variable object was shown EVERY episode,
+  unconditionally (modulo the now-removed `presence` knob, see below) — there was no way to say
+  "show only one object, or one coincidentally-bonded group of objects, per episode, rotating
+  round-robin across the session" (the tool's original UC1: "place one object at a time at the
+  designated spot"). Fixed with a new scene-level `OverlayConfig.episode_targets: "all" | "one"`
+  (default `"all"`, today's exact behavior — every existing config is byte-for-byte unaffected).
+  - **Getting the rotation UNIT right took three attempts — the first two each broke a
+    different, directly-reported real scenario, and the eventual fix abandoned the entire
+    "pre-compute a static partition of objects" framing rather than patching either bonding
+    rule.** Attempt 1: `pattern.partition_rotation_groups`, a union-find merging any two
+    objects whose CONFIGURED pattern point lists shared at least one coordinate. Reported
+    broken ("i set up 3 objects ... no difference between the modes"): with several objects
+    each sweeping multiple points, pairwise/transitive overlaps merged ALL of them into one
+    ever-present mega-group, so `"one"` showed that one group every episode — visually
+    identical to `"all"`. Attempt 2: tightened the bonding rule to require IDENTICAL point
+    SETS (not just any overlap), reasoning that only a deliberately-pinned stack should bond.
+    Reported broken immediately after ("instead of a stack it displays each point of the stack
+    separately one by one"): a real stack whose members sweep mostly-different points and only
+    SOMETIMES coincide (an emergent stack, the normal case via `co_location: "stack"`) has
+    non-identical full point sets, so it no longer bonded at all — it split into separate
+    single-object turns, never showing together. The actual fix: DELETE
+    `partition_rotation_groups` entirely (Python AND its JS twin
+    `calibrate.js`'s `partitionRotationGroups`) — there is no static, pre-computed grouping
+    that's right for both "always coincide" and "sometimes coincide" stacks, because whether
+    objects coincide is fundamentally a PER-EPISODE runtime fact (this is exactly what the
+    pre-existing, unrelated stack-detection logic already computes for `"all"` mode — grouping
+    by exact resolved-position equality). So `episode_targets == "one"` doesn't pre-classify
+    objects into groups at all: it lets EVERY object compute its own natural point exactly like
+    `"all"` mode (against the raw `episode_index`, with no special-casing), groups them into
+    this episode's actual SITES via that same existing logic, and only THEN picks exactly one
+    of those sites to keep — round-robin, ordered by each site's earliest-declared member.
+    Whatever coincides this episode (a permanent stack, an emergent one, or nothing) becomes
+    one rotation unit by construction, with no separate notion of "bonded" needed at all.
+  - **`session.py`'s `show_targets`: an object's own sweep/orientation/level ALWAYS use the
+    raw `episode_index`, identically to `"all"` mode — `episode_targets` only filters WHICH
+    resulting site gets shown, never how an individual object's own cadence advances.** An
+    earlier version of the fix (alongside attempt 1/2 above) introduced a `group_turn`
+    (`episode_index // num_groups`) so a group only active 1-in-N episodes wouldn't visually
+    freeze at its first point — but `group_turn` depended on the now-deleted static group
+    count, so it had to go too. Its absence has one known, accepted tradeoff: if an object's
+    own pattern length evenly divides the rotation period (commonly: the object count, in the
+    no-coincidence case), that object can resonate and keep landing on the same point every
+    time it's shown. Not fixed here — a narrower, lower-priority issue than the two concrete
+    bugs above, and avoidable today by picking a pattern length that doesn't divide evenly
+    into the object count.
+  - **The calibration tool's episode stepper's `maxEpisodeCount()` no longer multiplies by a
+    precomputed group count (deleted along with `partitionRotationGroups`) — it multiplies the
+    base period by the live object count instead, a soft UX bound, not an exact period** (the
+    true period can vary once coincidence is involved, since the number of sites itself then
+    varies episode to episode — exactness was never the goal, just "let the stepper run far
+    enough to preview a second visit"). `computeEpisodePlacements` mirrors `show_targets`
+    exactly: compute every object's natural point against the raw `episodeIndex`, group by
+    resolved-position equality (recomputed fresh every call), then under `episodeTargets ===
+    "one"` keep only `entries[episodeIndex % entries.length]` after sorting sites by earliest-
+    declared member. A new `episodeTargetsSelect` (Objects card, beside `coLocationSelect`)
+    drives the scene-level toggle; export (`sceneLevelExportBlock`, renamed from
+    `sceneLevelCoLocationExportBlock` now that it covers more than co-location) emits
+    `episode_targets: one` only when non-default.
+  - **`episode_targets` is ONLY visible in the calibration tool's EPISODE preview, never the
+    marginal one — and selecting `"one"` now auto-engages that episode preview, because not
+    doing so made the toggle appear completely inert (reported directly: "does not work at all,
+    there is no difference between the modes").** Root cause: `computeEpisodePlacements` (the
+    only consumer of `episodeTargets`) only feeds the render when `previewMode === "episode"`;
+    the default `previewMode` is `"marginal"`, whose whole job is to draw EVERY assigned point of
+    EVERY object at once (a coverage check across all episodes) — so by construction it cannot
+    express "one site per episode," and toggling `episodeTargets` while in it changed nothing on
+    screen. Fix is in the `episodeTargetsSelect` change handler: selecting `"one"` (with objects
+    present) flips `previewMode`/`previewModeSelect`/`episodeStepper` to the episode view so the
+    rotation is immediately visible; selecting `"all"` leaves the current preview untouched
+    (marginal stays perfectly meaningful there — it's the pre-existing default). Deliberately a
+    one-shot auto-switch in the handler, NOT a per-render guard, so a later DELIBERATE switch back
+    to marginal (a legitimate coverage check even under `"one"`) isn't fought. Note this means a
+    scene where every object always coincides into a single site (or there's only one object
+    total) shows no `all`-vs-`one` difference at all even in episode mode — correct, not a bug:
+    there's only ever one site to rotate through.
+- **In the same pass, both remaining per-object knobs from the original "behavioral
+  randomization" brainstorm — `jitter_px` (per-episode positional noise) and `presence`
+  (probabilistic per-episode absence) — were removed outright, per a direct question ("why do
+  we need the jitter and presence, remove that") rather than a redesign.** Neither survived
+  scrutiny once `episode_targets`/`co_location` existed to handle the *structural* presence/
+  absence questions they were partially trying to approximate: `presence` was a blunt,
+  probabilistic way to make an object sometimes invisible, which `episode_targets: "one"` now
+  does deterministically and meaningfully (an object is absent exactly when it's not part of
+  this episode's active site, not at random); `jitter_px` added sub-pixel positional noise with
+  no analogous structural justification at all once examined directly — removed as dead weight
+  rather than defended. Removed entirely, not deprecated/defaulted-off: `pattern.py`'s
+  `apply_jitter`/`is_present` functions, `ObjectConfig.jitter_px`/`presence` fields (and their
+  `config.py` parsing/validation/allowed-keys entries), `calibrate.js`'s `applyJitter`/
+  `isPresent` and the `jitterPx`/`presence` fields on `makeObject()`, the
+  `objectJitterInput`/`objectPresenceInput` calibration-page controls, and every export line
+  for both. `session.py`'s `show_targets` is simpler for it: every object always has a real
+  natural index now (no `None` from a `presence` check), and `apply_jitter` is gone from the
+  final per-object loop entirely (`point = base_positions[obj.name]` directly, no per-member
+  noise step). `examples/stacking.example.yaml`'s distractor-cube object lost its
+  `jitter_px`/`presence` lines (kept `sequencing: shuffled`, its one remaining real per-object
+  knob) and gained a commented `# episode_targets: all` alongside the existing commented
+  `# co_location: stack`, explaining the two settings' distinct scopes directly in the example.
+  - Verified via 3 new `test_config.py` tests (`episode_targets` default/parse/invalid)
+    replacing the removed `jitter_px`/`presence` validation tests; 4 new `test_session.py`
+    tests (`episode_targets="one"` rotating independent objects round-robin; keeping a
+    permanently-coincident stack together as one site while an independent object alternates
+    with it; an object's own sweep using the raw `episode_index` directly, not a per-turn
+    counter; and the core fix's regression guard — an EMERGENT stack that only coincides on
+    SOME episodes still shows together exactly when it coincides, with the site count/rotation
+    period itself varying episode to episode) replacing the removed `jitter`/`presence` session
+    tests and the abandoned `partition_rotation_groups` tests — 281 Python tests total (net
+    down, since the deleted static-partition function's own tests outnumbered its replacement,
+    which needed none — there's no longer a separate pure function to unit-test, only
+    `show_targets`' existing per-episode grouping, already covered). JS side: 95 Node-harness
+    assertions — the same scenarios as the Python session tests run directly through
+    `computeEpisodePlacements`, `maxEpisodeCount`'s object-count multiplier, export gating for
+    `episode_targets` in both directions, and the `episodeTargetsSelect` UI wiring (including
+    the auto-engage-episode-preview behavior) — net of every `applyJitter`/`isPresent`/
+    `jitterPx`/`presence`/`partitionRotationGroups` assertion removed.
+- **`episode_targets: "one"`'s per-episode DYNAMIC-coincidence design (the previous bullet)
+  turned out to be the wrong fix for what it was built to solve, reported directly: out of 60
+  episodes (expected 20) only 3 stacked, and not even fully (2 of 3 objects) — replaced with a
+  STATIC, point-driven model where assignment to the same point IS a guaranteed stack, not a
+  coincidence that has to line up.** Root cause: that design computed each object's position
+  via its own independent `sequence_index` sweep EVERY episode, and only formed a stack when
+  two objects' sweeps *happened* to land on the same point THAT episode — exactly the same
+  rare-coincidence failure mode the very first "Bimanual" stacking bullet earlier in this file
+  already diagnosed and fixed for the position-PATTERN engine (`co_location`/`resolve_keep_apart`
+  exist precisely because independent sweeps rarely coincide), but `episode_targets: "one"`
+  had reintroduced an equivalent dependency on coincidence one layer up, at the SITE-selection
+  level. Separately, `calibrate.js`'s `maxEpisodeCount` multiplied the base period by the
+  object count (`base * numObjects`) as a soft UX bound for this same per-episode-coincidence
+  uncertainty — 20 points × 3 objects gave 60, not 20, independent of whether anything actually
+  stacked.
+  - **Fix: `pattern.occupied_sites(object_points)` / `calibrate.js`'s `occupiedSites()`** —
+    a pure, `episode_index`-FREE structural function over the STATIC union of every object's
+    own assigned points, grouped by exact coordinate (Python: float-tuple equality, the same
+    equality `show_targets`'s "all"-mode coincidence grouping already used; JS: shared
+    `samplePointsCanonical` index equality, simpler since two objects "sharing a point" there
+    are always the literal same array index already). Each returned site carries every
+    object's ordinal present at that exact point — 2+ ordinals there is now a PERMANENT,
+    guaranteed stack, full stop, never a per-episode maybe. Sites are ordered by the smallest
+    `(object_ordinal, point_index_within_that_object's_own_pattern)` among their members, for
+    a deterministic round-robin. `session.py`'s `show_targets` and `calibrate.js`'s
+    `computeEpisodePlacements`/`maxEpisodeCount` now branch early on `episode_targets == "one"`
+    into this entirely separate, `sequence_index`/`co_location`-free code path: episode
+    `episode_index % len(sites)` shows exactly that site's full membership (leveled via the
+    existing `level_order`/`stackLevelStrategy`, which DOES still apply unconditionally here —
+    every multi-member site is a real stack), clearing every other object. `#episodes` is
+    therefore exactly `len(occupied_sites(...))` — the number of DISTINCT occupied points, full
+    stop — not multiplied by object count, and not dependent on any sweep. An object with
+    several assigned points gets one dedicated turn per point (not a single "active turn" that
+    sweeps across them), which is also the fix for "only 2 of 3 objects" in the stack: a stack
+    member is never dropped because its own independent sweep happened to wander elsewhere that
+    episode — there is no sweep to wander, the site's membership is fixed by assignment alone.
+    `co_location`/`sequencing` are documented as having no effect under `episode_targets: "one"`
+    (`config.py`'s field docstrings updated accordingly) — co-location there is exactly the
+    static fact `occupied_sites` already encodes, not a per-episode choice to make.
+  - **Confirmed end-to-end against `examples/stacking.example.yaml`** (mocked dataset/Rerun,
+    real `run_session`): under `episode_targets: one`, the 3-block stack (all sharing one
+    point) now shows as ONE site with all 3 members EVERY time its turn comes — never partial —
+    while the distractor cube's 3 own (unshared) points each become their OWN separate site,
+    for 4 total sites/episodes on this exact config, rather than the "2 groups" the old design's
+    own example comment claimed (that comment was itself wrong about the new model and has been
+    corrected).
+  - **A second, separate, requested feature landed alongside the bug fix: `episode_targets:
+    "all"` gained scene-level `combination_count: int | None`, decoupling the number of
+    distinct SIMULTANEOUS multi-object combinations from any one object's own pattern length** —
+    reported directly: "if i have 3 objects and 20 steps the combinations are limited to the
+    nr of steps." Root cause: "all" mode's lockstep `sequence_index` is `episode_index %
+    length`, so the distinct combination count can never exceed the longest object's own
+    length, with no knob to ask for more. Fix: `pattern.combination_index(combination_i,
+    length, object_ordinal, num_combinations)` (+ `calibrate.js`'s `combinationIndex`) — a
+    "systematic spread": `combination_i` maps onto `[0, length)` by simple proportion
+    (`combination_i * length // num_combinations`, pure integer floor division — deliberately
+    NOT `round()`/`Math.round()`, whose half-rounding divergence between Python
+    (round-half-to-even) and JS (always away from zero) was a real, separately-found bug in
+    the now-removed "phase" sequencing mode this otherwise resembles), then phase-shifted by
+    `object_ordinal` (a plain integer offset) so equal-length objects don't always pair the
+    same way. `show_targets`/`computeEpisodePlacements` use `combination_index(episode_index %
+    combination_count, ...)` per object instead of `sequence_index` whenever
+    `config.combination_count`/`combinationCount` is set, leaving every other code path
+    (`co_location`/grouping/stacking) completely unchanged downstream — `combination_count`
+    only changes WHICH index each object resolves to, not what happens once they're resolved.
+    `None`/`0` (default) is an exact byte-for-byte no-op, falling back to today's lockstep.
+    Scoped to `episode_targets: "all"` only — `"one"` has no notion of "combination" at all
+    (its sites are a static structural fact, not a per-episode index choice), so
+    `combination_count` is documented as ignored there, not validated against it (setting both
+    is harmless, just inert). Other spread strategies (seeded-random draws, coprime striding,
+    the full Cartesian product of every object's points, or running exactly
+    `LCM(length, ...)` combinations so every lockstep pairing appears once) were explicitly
+    requested as future options but deliberately not built now — only the systematic spread
+    shipped, since it alone already fully decouples the combination count from the step count.
+  - The calibration tool's Objects card gained a `Combinations` number input
+    (`combinationCountInput`, "all" mode only — disabled, alongside `coLocationSelect`, the
+    instant `episodeTargetsSelect` is switched to "one"; `stackLevelStrategySelect`/
+    `stackLevelSeedInput` stay enabled in BOTH modes, since level strategy applies
+    unconditionally under "one" and only when `coLocation === "stack"` under "all" — a
+    separate availability check, not tied to `episodeTargets` alone).
+    `sceneLevelExportBlock`/export emits `combination_count: N` only when non-zero, sibling to
+    the existing `episode_targets`/`co_location`/`level_strategy`/`level_seed` lines.
+  - Verified via 7 new `pattern.py` tests for `combination_index` (range bounds, even spread,
+    decoupling from `length`, phase-shift decorrelation, an exact integer-boundary check
+    standing in for the round()/Math.round() divergence this formula deliberately avoids) and 6
+    for `occupied_sites` (disjoint/shared/ordering/empty cases); rewrote the 2 `test_session.py`
+    tests that had encoded the OLD dynamic-coincidence semantics for `episode_targets: "one"`
+    into tests of the new static, point-driven rotation (an object's several own points each
+    get a dedicated turn; objects sharing ANY point in their own lists ALWAYS stack together on
+    that site's turn, not just on episodes where independent sweeps happen to coincide) plus 2
+    new tests for `combination_count` (decoupling verified directly against
+    `combination_index`; unset falls back to byte-identical lockstep) — 299 Python tests total.
+    JS side verified via a 26-assertion ad-hoc Node harness (this project's established,
+    not-committed convention) covering `combinationIndex`/`occupiedSites` parity against the
+    Python values/properties above, `maxEpisodeCount` no longer multiplying by object count
+    under "one" (the exact reported 60-vs-20 scenario, reproduced directly), `computeEpisodePlacements`
+    for both modes, the new `combinationCountInput`/`episodeTargetsSelect`/`coLocationSelect`
+    availability wiring driven through their REAL registered listeners (not called in
+    isolation), export gating, and an end-to-end real-Assign-button-click scenario confirming
+    two objects assigned to the same point via the actual UI flow form a guaranteed 2-member
+    site. `examples/stacking.example.yaml`'s `episode_targets`/`co_location` comment block was
+    corrected to describe the new 4-site (not 2-group) rotation, and gained a commented
+    `combination_count` explanation.
+- **`combination_count`'s "systematic spread" had a real, reported bug — "combinations repeat
+  themselves if i set a number higher than the sample count" — and a deeper mathematical limit
+  underneath it that the bug fix alone couldn't solve, which is why `combination_mode` now
+  offers 4 additional strategies (`"random"`, `"coprime"`, `"cartesian"`, `"lcm"`), each from
+  the TODO list the previous bullet deferred.** Root cause of the reported bug:
+  `combination_index`'s proportional formula (`combination_i * length // num_combinations`)
+  was applied UNCONDITIONALLY, even when `num_combinations > length` (oversampling) — the step
+  size (`length / num_combinations`) then drops below 1, so many consecutive `combination_i`
+  values floor to the SAME index before advancing (e.g. `length=4, num_combinations=20`
+  repeated index 0 for `combination_i in [0, 5)`, then index 1 for `[5, 10)`, etc.) — correct
+  in AGGREGATE count per index, but each index visibly "stalled" for several consecutive
+  episodes instead of cycling. Fixed by branching: undersampling
+  (`num_combinations <= length`) keeps the proportional spread (each combination lands on a
+  DIFFERENT, evenly-spaced index); oversampling switches to plain `combination_i % length`
+  cycling, which never repeats two consecutive episodes (for `length > 1`) and still visits
+  each index `num_combinations // length` or one more times overall.
+  - **The deeper limit, found while writing this fix's own justification (not from a test
+    failure): when every object shares the SAME pattern length `L`, NO purely-deterministic
+    function of `combination_i` ALONE, applied independently per object, can ever produce more
+    than `L` distinct JOINT (multi-object) combinations — confirmed numerically, not just
+    argued: 3 objects of length 5, `combination_count=50`, still only 5 distinct joint tuples
+    appeared across all 50 episodes.** The reason: every object's index is `f(combination_i mod
+    L)` for some periodic `f` — phase-shifting by `object_ordinal` (the existing decorrelation
+    mechanism) changes WHICH point each object lands on, but never increases how many DISTINCT
+    `combination_i mod L` values exist, so the joint state, being a deterministic function of
+    that one shared value, is capped at `L` regardless of how the per-object mapping is phased
+    or strided. This is exactly why the original bug report's "3 objects, 20 steps" scenario
+    needed a structurally different mechanism, not just a bigger `combination_count` — escaping
+    the cap needs either randomness (independent draws don't all derive from one shared `i mod
+    L`) or a genuinely joint, multi-object formula (the Cartesian product, whose period is the
+    PRODUCT of lengths, not any single one).
+  - **`OverlayConfig.combination_mode: str = "systematic"`** (+ `combination_seed: int = 0` for
+    `"random"`) selects among 5 strategies, implemented in `pattern.py`'s `combination_index`
+    (the 3 PER-OBJECT modes — `"systematic"`/`"random"`/`"coprime"`, each only needing this
+    object's own length/ordinal) and a new `resolve_combination_indices`/`combination_period`
+    (the top-level dispatcher `session.py` actually calls, handling `"cartesian"`/`"lcm"` too,
+    which need every object's length JOINTLY and can't go through the per-object function at
+    all):
+    - **`"random"`**: an independent seeded draw per `(combination_i, object_ordinal)` via the
+      shared `_mulberry32` PRNG (the same one `level_order`/`sequence_index`'s `"shuffled"`
+      mode already use, for JS/Python parity) — `int(rng() * length)`. The joint space is up to
+      `length_1 * length_2 * ... * length_n`, escaping the per-object cap, at the cost of
+      losing the even-coverage/no-repeat guarantee (a short run can revisit a draw by chance).
+    - **`"coprime"`**: a deterministic, no-RNG alternative to `sequence_index`'s `"shuffled"`
+      mode (re-added after the structurally similar `"stratified"` sequencing mode was removed
+      for a DIFFERENT axis — see the much earlier "phase"/"stratified" bullets — revisited here
+      deliberately, per direct request, since this is a different problem: combination spread,
+      not per-object visit order). `_coprime_stride_for(length, object_ordinal)` finds a stride
+      coprime to `length` (search starts from a per-ordinal offset, walks forward — `gcd(1,
+      length) == 1` always, so it never fails to terminate); `(combination_i * stride +
+      object_ordinal) % length` then visits all `length` points exactly once per period, like
+      `"shuffled"` achieves via an actual seeded shuffle. Same per-object cap as
+      `"systematic"` — it does NOT escape it, just offers a deterministic alternative.
+    - **`"cartesian"`**: `_cartesian_indices` — a standard mixed-radix decomposition of
+      `combination_i` into one index per object, with each object's own `length` as that
+      digit's base. As `combination_i` ranges over `[0, prod(lengths))`, EVERY possible
+      simultaneous combination appears EXACTLY once — the only mode that's both fully
+      deterministic AND escapes the per-object cap. `combination_period` derives this natural
+      product automatically when `combination_count` is left unset (the whole convenience of a
+      named mode instead of requiring the operator to compute `length_1 * length_2 * ...` by
+      hand); if `combination_count` IS set, it caps the natural product
+      (`min(combination_count, natural)`) — the documented "can get very large, may need a
+      cap" from the TODO list.
+    - **`"lcm"`**: plain `combination_i % length` per object, deliberately with NO phase shift
+      (unlike `"systematic"`) — this mode's entire point is exposing the TRUE periodicity of
+      VANILLA lockstep cycling itself, not adding decorrelation on top of it. `combination_period`
+      derives `lcm(every object's own length)` automatically when unset — "every lockstep
+      pairing appears once" means every combination plain per-object lockstep naturally
+      produces (NOT every possible combination — that's `"cartesian"`; the two only coincide
+      when every length is pairwise coprime, since only then does `lcm(lengths) ==
+      prod(lengths)`). This also fixes a related, smaller pre-existing gap: before this mode
+      existed, NOTHING in this engine computed/reported the true LCM-based period for
+      differing-length objects under plain lockstep at all — `maxEpisodeCount`'s legacy
+      fallback (untouched, still default) only ever reports the LONGEST object's length, not
+      the LCM, so a differing-length scene's true joint period was always under-reported unless
+      `"lcm"` mode is explicitly selected.
+  - **Validation**: `combination_mode` must be one of the 5 values; `"random"`/`"coprime"`
+    have no natural period of their own and REQUIRE `combination_count` to be set (`ConfigError`
+    at load time if not — consistent with this project's "a conflict in something deterministic
+    is a config error: fail loudly" rule); `"cartesian"`/`"lcm"` tolerate it being unset (derive
+    their own natural period) and `"systematic"` (the default) tolerates it being unset too
+    (meaning the WHOLE combination subsystem stays inert — see `combination_active` in
+    `session.py`, unchanged from the previous bullet: active whenever `combination_count is not
+    None or combination_mode != "systematic"`).
+  - **The calibration tool's `combinationSubsystemActive()` deliberately diverges from
+    `session.py`'s `combination_active` for live-preview robustness**: Python's config is
+    validated eagerly at load time, so `"random"`/`"coprime"` without a count can never reach
+    `show_targets` — but `calibrate.js`'s dropdown/number-input can transiently be in exactly
+    that invalid state while the operator is mid-edit (e.g. just switched to "Random" before
+    typing a count), and `combinationPeriod()` throws for it. Rather than crash `renderAll()` on
+    every keystroke, `"random"`/`"coprime"` only activate once a count is actually set in the
+    JS preview specifically; `"cartesian"`/`"lcm"` are always active regardless, matching
+    Python exactly (they tolerate an absent count by design, not just transiently).
+  - Added a `Combination mode` dropdown + `Combination seed` number input to the calibration
+    tool's Objects card, beside the existing `Combinations` count field — `combinationSeedInput`
+    is disabled unless `combinationMode === "random"`; both `combinationModeSelect`/
+    `combinationSeedInput` (like `combinationCountInput`/`coLocationSelect`) are disabled
+    whenever `episodeTargets === "one"`, which has no notion of "combination" at all.
+    `sceneLevelExportBlock` emits `combination_mode`/`combination_seed` only when non-default.
+  - Verified via 27 new `pattern.py` tests (`combination_index`'s oversampling-no-longer-stalls
+    regression directly reproducing the report; the undersampling branch's evenly-spread/no-
+    duplicates property; `"random"`'s determinism-given-seed and full-range coverage;
+    `_coprime_stride_for`'s actual coprimality across a battery of lengths/ordinals and
+    `"coprime"`'s permutation/determinism properties; `_cartesian_indices`'s full-product
+    enumeration and wraparound; `resolve_combination_indices`'s per-mode dispatch and required-
+    count validation; `combination_period`'s natural-period derivation and capping for
+    `"cartesian"`/`"lcm"`) and 5 rewritten ones (the old proportional-only expected values
+    replaced with the new branch's correct ones) — 371 Python tests total. 5 new
+    `test_config.py` tests (`combination_mode` default/parse/invalid, the
+    `"random"`/`"coprime"`-require-`combination_count` validation in both directions) and 5
+    new `test_session.py` end-to-end tests (the oversampling-stalling regression reproduced
+    through `run_session` itself; `"random"` escaping the per-object cap with 3 equal-length
+    objects measured directly; `"coprime"`'s determinism and same cap as systematic;
+    `"cartesian"`'s full 9-combination product for 2 length-3 objects, including the
+    period-wraps-correctly check; `"lcm"`'s exact 12-episode period for lengths 4 and 6 — not
+    6, not 24). JS side: 30 new ad-hoc Node-harness assertions (the oversampling-bug regression
+    reproduced directly in JS; bit-for-bit parity of every new function against the Python
+    values/properties above; `"random"`/`"cartesian"`/`"lcm"` end-to-end through
+    `computeEpisodePlacements`/`maxEpisodeCount`; the random/coprime-without-a-count
+    non-crashing fallback; the new dropdown/input's real listener wiring and export gating) —
+    56 JS assertions total. `examples/stacking.example.yaml`'s `combination_count` comment
+    block was extended to describe all 5 modes, with `combination_mode`/`combination_seed`
+    added as further commented-out fields.
 
 ## Environment
 

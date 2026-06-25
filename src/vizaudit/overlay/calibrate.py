@@ -17,7 +17,12 @@ import shutil
 import webbrowser
 from pathlib import Path
 
-_STATIC_HTML = Path(__file__).parent / "static" / "calibrate.html"
+_STATIC_DIR = Path(__file__).parent / "static"
+_STATIC_HTML = _STATIC_DIR / "calibrate.html"
+# calibrate.html no longer inlines its <style>/<script> -- it links these two sibling files
+# (calibrate.css/calibrate.js, in the same static/ dir) by relative path, so they must be
+# copied alongside it wherever the HTML goes, not just the HTML itself.
+_STATIC_SIBLINGS = ["calibrate.css", "calibrate.js"]
 
 # Shared convention with `overlay/cli.py`: vizaudit-calibrate's "Save to file..." button
 # writes here by default, and vizaudit-overlay's --config reads from here by default -- so
@@ -30,6 +35,8 @@ DEFAULT_SAVE_PATH = "vizaudit_calibration.yaml"
 def write_calibration_html(output_path: Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy(_STATIC_HTML, output_path)
+    for name in _STATIC_SIBLINGS:
+        shutil.copy(_STATIC_DIR / name, output_path.parent / name)
     return output_path
 
 

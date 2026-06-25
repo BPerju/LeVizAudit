@@ -1675,6 +1675,13 @@ def build_pattern(
             bounds=bounds,
             count_mode=pattern_config.count_mode or "fixed",
         )
+    if pattern_config.shape == "points":
+        # Explicit, manually-authored positions (the calibration tool's "assign objects to
+        # specific sample points" flow) -- returned as-is, no sampling/relocation/validation
+        # against exclude_zones at all: the operator placed these points deliberately, on top
+        # of an already-validated sample cloud, so re-validating here would be redundant at
+        # best and could silently relocate a point the operator chose on purpose at worst.
+        return list(pattern_config.points)
     raise ValueError(f"Unknown pattern shape: {pattern_config.shape!r}")
 
 
@@ -1687,6 +1694,426 @@ def target_for_episode(points: list[T], episode_index: int) -> T:
     if not points:
         raise ValueError("points must be non-empty")
     return points[episode_index % len(points)]
+
+
+# ===== Multi-object behavioral randomization (sequencing / levels) =====
+#
+# Even marginals over MORE axes than position: each object should land on each of its own
+# assigned points, AND each level of a stack it's part of, roughly equally across a session --
+# the data-collection analog of domain randomization (a policy that only ever sees red-on-blue
+# never learns blue-on-red). Two earlier knobs here, `jitter_px` (per-episode positional noise)
+# and `presence` (probabilistic per-episode absence), were removed after a direct report that
+# they didn't pull their weight against the rest of this feature's complexity -- see CLAUDE.md.
+# Both remaining knobs below default to today's exact behavior when unset (lockstep cycling,
+# declaration-order levels).
+#
+# Parity: the calibration tool's episode-stepper preview must show EXACTLY what the live
+# session will record for these seeded knobs, and this project verifies JS<->Python parity by
+# porting assertions across both implementations (see CLAUDE.md). Python's `random.Random`
+# (Mersenne Twister) has no portable JS equivalent, so every seeded knob here draws from
+# `_mulberry32` -- a minimal 32-bit PRNG ported bit-for-bit into `calibrate.js`'s own
+# `mulberry32` -- instead of stdlib `random`. `state` is masked to 32 bits after every
+# increment (a stricter variant than some reference mulberry32 gists, which only mask via the
+# bitwise ops triggered downstream) specifically so Python's arbitrary-precision ints and JS's
+# float64 closure variable can never silently diverge after many calls.
+_MASK32 = 0xFFFFFFFF
+
+
+def _mulberry32(seed: int) -> Callable[[], float]:
+    state = seed & _MASK32
+
+    def next_float() -> float:
+        nonlocal state
+        state = (state + 0x6D2B79F5) & _MASK32
+        t = state
+        t = ((t ^ (t >> 15)) * (t | 1)) & _MASK32
+        t = (t ^ ((t + ((t ^ (t >> 7)) * (t | 61)) & _MASK32))) & _MASK32
+        return ((t ^ (t >> 14)) & _MASK32) / 4294967296.0
+
+    return next_float
+
+
+def _combine_seed(*parts: int) -> int:
+    """Deterministically folds several integers (seed, episode index, object ordinal, ...)
+    into one 32-bit seed for `_mulberry32` -- masked at every step (not just the final result)
+    so the same combination produces an identical 32-bit value in JS, where an unmasked
+    multiply-accumulate could exceed float64's exact-integer range for large inputs."""
+    h = 0
+    for p in parts:
+        h = ((h * 1000003) + (p & _MASK32)) & _MASK32
+    return h
+
+
+def _seeded_permutation(length: int, seed: int) -> list[int]:
+    """A seeded Fisher-Yates shuffle of ``range(length)``."""
+    rng = _mulberry32(seed)
+    perm = list(range(length))
+    for i in range(length - 1, 0, -1):
+        j = int(rng() * (i + 1))
+        perm[i], perm[j] = perm[j], perm[i]
+    return perm
+
+
+_SEQUENCING_MODES = {"lockstep", "shuffled"}
+
+
+def sequence_index(
+    episode_index: int,
+    length: int,
+    mode: str = "lockstep",
+    object_ordinal: int = 0,
+    num_objects: int = 1,
+    seed: int = 0,
+) -> int:
+    """Which of an object's own ``length`` assigned points to show this episode -- replaces
+    the bare ``episode_index % length`` lockstep cycle ``target_for_episode`` already does.
+
+    - ``"lockstep"`` (default): ``episode_index % length`` -- today's exact behavior.
+    - ``"shuffled"``: each object visits its own points in its own seeded-random order
+      (independent per ``object_ordinal``) -- still a permutation, so marginals stay exact.
+      Decorrelates two objects of equal-length patterns from always pairing the same way
+      (objA-here-always-pairs-with-objB-there) -- exactly the spatial correlation this whole
+      project audits against, just at the object-pairing level instead of single-object
+      position.
+
+    A third mode, ``"phase"`` (a fixed, evenly-spaced offset per object), shipped briefly and
+    was removed: it conflated "decorrelate two SEPARATE objects' sweeps" with "keep two objects
+    that share a point from ever co-occupying it," which is a distinct, scene-level concern now
+    handled explicitly by ``OverlayConfig.co_location: "keep_apart"`` + ``resolve_keep_apart``
+    below, not by which object happens to use which sequencing mode. See CLAUDE.md.
+    """
+    if length < 1:
+        raise ValueError(f"length must be >= 1, got {length}")
+    if mode == "lockstep":
+        return episode_index % length
+    if mode == "shuffled":
+        perm = _seeded_permutation(length, _combine_seed(seed, object_ordinal))
+        return perm[episode_index % length]
+    raise ValueError(f"Unknown sequencing mode: {mode!r} (allowed: {sorted(_SEQUENCING_MODES)})")
+
+
+_COMBINATION_MODES = {"systematic", "random", "coprime", "cartesian", "lcm"}
+_PER_OBJECT_COMBINATION_MODES = {"systematic", "random", "coprime"}  # need only this object's
+                                                                       # own length -- cartesian/
+                                                                       # lcm need every object's
+                                                                       # length jointly, see
+                                                                       # resolve_combination_indices
+
+
+def combination_index(
+    combination_i: int,
+    length: int,
+    object_ordinal: int,
+    num_combinations: int,
+    mode: str = "systematic",
+    seed: int = 0,
+) -> int:
+    """``OverlayConfig.episode_targets == "all"`` + ``OverlayConfig.combination_count`` set:
+    which of an object's own ``length`` assigned points to show for combination
+    ``combination_i`` out of ``num_combinations`` total -- decoupling the number of distinct
+    SIMULTANEOUS multi-object combinations from any one object's own pattern length.
+    Previously, "all" mode's lockstep ``sequence_index`` forced the visible combination count
+    to never exceed the longest object's own length -- reported directly: "if i have 3 objects
+    and 20 steps the combinations are limited to the nr of steps."
+
+    Handles the three modes that only need THIS object's own ``length``/``object_ordinal``
+    (``"systematic"``, ``"random"``, ``"coprime"``) -- ``"cartesian"``/``"lcm"`` need every
+    object's length jointly and are computed by ``resolve_combination_indices`` instead, never
+    through this function (see ``_PER_OBJECT_COMBINATION_MODES``).
+
+    ``"systematic"`` (default): a deterministic spread, branching on whether
+    ``num_combinations`` under- or over-samples this object's own ``length``:
+
+    - Undersampling (``num_combinations <= length``): ``combination_i`` maps onto ``[0,
+      length)`` by simple proportion (``combination_i * length // num_combinations``), so
+      across ``num_combinations`` combinations this object's ``length`` points are each
+      visited at most once, evenly spread (skipping some) rather than clustered.
+    - Oversampling (``num_combinations > length``): plain ``combination_i % length`` cycling.
+      A real, reported bug lived here: the proportional formula above, applied unconditionally
+      even when ``num_combinations > length``, maps MANY consecutive ``combination_i`` values
+      onto the SAME index before advancing (e.g. ``length=4, num_combinations=20`` repeated
+      index 0 for ``combination_i in [0, 5)``, then index 1 for ``[5, 10)``, etc.) -- correct
+      in AGGREGATE count per index, but each index visibly "stalled" for several consecutive
+      episodes in a row instead of cycling, reported directly as "combinations repeat
+      themselves if i set a number higher than the sample count." Plain modulo never repeats
+      two consecutive episodes (for ``length > 1``) and revisits each index exactly
+      ``num_combinations // length`` or one more times, evenly spread across the whole run --
+      the best ANY purely-deterministic, this-object-alone function of ``combination_i`` can
+      do, since this object only HAS ``length`` distinct points to begin with (see the
+      "cartesian"/"random" modes below for how to escape that cap at the JOINT,
+      multi-object level instead).
+
+    Both branches are then phase-shifted by ``object_ordinal`` (a plain integer offset, no
+    rounding involved) so two objects of EQUAL length don't always land on the same
+    proportional point at the same combination, which would always pair them the same way.
+    Pure integer arithmetic throughout (``//`` is floor division for non-negative operands in
+    both Python and JS's ``Math.floor`` -- no ``round()``/``Math.round()`` half-rounding
+    divergence to guard against here, unlike the earlier, removed "phase" sequencing mode --
+    see CLAUDE.md).
+
+    ``"random"``: an independent seeded draw per ``(combination_i, object_ordinal)`` via the
+    shared ``_mulberry32`` PRNG (the same one ``level_order``/``sequence_index``'s "shuffled"
+    mode already use, for JS/Python parity) -- ``int(rng() * length)``. Unlike
+    ``"systematic"``/``"coprime"``, the JOINT multi-object combination space this produces is
+    up to ``length_1 * length_2 * ... * length_n`` (one independent draw per object), not
+    capped at any single object's own ``length`` -- this is the practical way to get more
+    distinct joint combinations than ``"systematic"``/``"coprime"`` can when every object
+    shares the same (or a similar) pattern length, at the cost of losing determinism/even
+    coverage guarantees (a short run can revisit the same draw by chance).
+
+    ``"coprime"``: a deterministic alternative to ``sequence_index``'s "shuffled" mode (no
+    RNG at all) -- visits this object's own ``length`` points via a fixed stride coprime to
+    ``length`` (``_coprime_stride_for``), giving a full permutation with no repeats within one
+    period, same as "shuffled" achieves via a seeded shuffle. Re-added deliberately after an
+    earlier, structurally similar "stratified" sequencing mode was removed (see CLAUDE.md) for
+    a different axis (per-object visit ORDER, not combination spread) -- here it exists
+    specifically as the no-randomness option among these 5 modes. Like "systematic", it does
+    NOT lift the per-object ``length`` cap on the joint combination space -- only "cartesian"
+    and "random" do that (see ``resolve_combination_indices``)."""
+    if length < 1:
+        raise ValueError(f"length must be >= 1, got {length}")
+    if num_combinations < 1:
+        raise ValueError(f"num_combinations must be >= 1, got {num_combinations}")
+    if mode not in _PER_OBJECT_COMBINATION_MODES:
+        raise ValueError(
+            f"combination_index only handles {sorted(_PER_OBJECT_COMBINATION_MODES)} -- "
+            f"{mode!r} needs every object's length jointly, use resolve_combination_indices"
+        )
+    if mode == "systematic":
+        if num_combinations <= length:
+            raw = (combination_i * length) // num_combinations
+        else:
+            raw = combination_i % length
+        return (raw + object_ordinal) % length
+    if mode == "random":
+        rng = _mulberry32(_combine_seed(seed, combination_i, object_ordinal))
+        return min(length - 1, int(rng() * length))
+    # mode == "coprime"
+    stride = _coprime_stride_for(length, object_ordinal)
+    return (combination_i * stride + object_ordinal) % length
+
+
+def _gcd(a: int, b: int) -> int:
+    while b:
+        a, b = b, a % b
+    return a
+
+
+def _coprime_stride_for(length: int, object_ordinal: int) -> int:
+    """A stride coprime to ``length``, varying deterministically by ``object_ordinal`` --
+    starts searching from a per-ordinal offset so different objects get different strides
+    where possible, then walks forward until one actually coprime to ``length`` is found
+    (``gcd(1, length) == 1`` always, so this never fails to terminate)."""
+    if length <= 2:
+        return 1
+    candidate = 1 + (object_ordinal % (length - 1))
+    for _ in range(length):
+        if _gcd(candidate, length) == 1:
+            return candidate
+        candidate = (candidate % (length - 1)) + 1
+    return 1
+
+
+def _cartesian_indices(combination_i: int, lengths: list[int]) -> list[int]:
+    """Standard mixed-radix decomposition of ``combination_i`` into one index per object, with
+    ``lengths`` as the (varying) base of each digit -- as ``combination_i`` ranges over ``[0,
+    prod(lengths))``, every possible simultaneous combination of object positions appears
+    EXACTLY once (the full Cartesian product), the only one of these 5 modes that's both fully
+    deterministic AND escapes the per-object ``length`` cap on the joint combination space.
+    Wraps ``combination_i`` via ``% total`` first, so a caller running more episodes than the
+    full product just repeats it from the start rather than indexing out of range."""
+    total = 1
+    for length in lengths:
+        total *= length
+    i = combination_i % total if total > 0 else 0
+    indices = []
+    for length in lengths:
+        indices.append(i % length)
+        i //= length
+    return indices
+
+
+def resolve_combination_indices(
+    combination_i: int,
+    lengths: list[int],
+    mode: str = "systematic",
+    num_combinations: int | None = None,
+    seed: int = 0,
+) -> list[int]:
+    """Top-level dispatcher ``session.py`` calls for ``episode_targets == "all"`` +
+    ``combination_count``/``combination_mode`` -- one index per object (by position in
+    ``lengths``), for ANY of the 5 ``_COMBINATION_MODES``, including ``"cartesian"``/``"lcm"``
+    which need every object's length jointly and can't go through the per-object
+    ``combination_index`` above.
+
+    ``"cartesian"``: every object's index via ``_cartesian_indices`` -- see there.
+
+    ``"lcm"``: plain ``combination_i % length`` per object, deliberately with NO phase shift
+    (unlike ``"systematic"``) -- this mode's entire point is exposing the TRUE periodicity of
+    vanilla lockstep cycling itself, not adding decorrelation on top of it: as
+    ``combination_i`` ranges over ``[0, lcm(lengths))`` (see ``combination_period``), the
+    tuple ``(i % length_1, i % length_2, ...)`` visits every combination that plain
+    per-object lockstep naturally produces exactly once before repeating -- "every lockstep
+    pairing appears once," not every POSSIBLE combination (that's "cartesian"; the two only
+    coincide when every length is pairwise coprime, since only then does
+    ``lcm(lengths) == prod(lengths)``).
+
+    ``"systematic"``/``"random"``/``"coprime"``: delegates to ``combination_index`` per
+    object, passing ``num_combinations`` (required -- see ``combination_period``)."""
+    if mode == "cartesian":
+        return _cartesian_indices(combination_i, lengths)
+    if mode == "lcm":
+        return [combination_i % length for length in lengths]
+    if num_combinations is None:
+        raise ValueError(f"combination_mode={mode!r} requires combination_count to be set")
+    return [
+        combination_index(combination_i, length, ordinal, num_combinations, mode=mode, seed=seed)
+        for ordinal, length in enumerate(lengths)
+    ]
+
+
+def combination_period(lengths: list[int], mode: str = "systematic", combination_count: int | None = None) -> int:
+    """The effective number of distinct combinations to cycle through for
+    ``episode_targets == "all"`` -- ``episode_index % combination_period(...)`` is what
+    ``session.py`` actually feeds as ``combination_i`` into ``resolve_combination_indices``.
+
+    ``"cartesian"``/``"lcm"`` derive their own NATURAL period (the product, or the LCM, of
+    every object's own length) when ``combination_count`` is unset -- the whole convenience of
+    a named mode instead of requiring the operator to compute that number by hand. When
+    ``combination_count`` IS set, it caps the natural period (``min(combination_count,
+    natural)``) -- e.g. "cartesian" of three 20-point objects has a natural period of 8000;
+    ``combination_count: 500`` runs only the first 500 of those 8000 combinations, never all
+    of them (the documented "may need a cap" for a product that can get very large).
+
+    ``"systematic"``/``"random"``/``"coprime"`` have no natural period of their own
+    (``"systematic"``/``"coprime"`` are bounded by whichever object's own length, which varies
+    per object rather than being one scene-wide number; ``"random"`` has no period at all) --
+    ``combination_count`` is REQUIRED for these three."""
+    if mode not in _COMBINATION_MODES:
+        raise ValueError(f"Unknown combination_mode: {mode!r} (allowed: {sorted(_COMBINATION_MODES)})")
+    if mode == "cartesian":
+        natural = 1
+        for length in lengths:
+            natural *= length
+        return min(combination_count, natural) if combination_count is not None else natural
+    if mode == "lcm":
+        natural = math.lcm(*lengths) if lengths else 1
+        return min(combination_count, natural) if combination_count is not None else natural
+    if combination_count is None:
+        raise ValueError(f"combination_mode={mode!r} requires combination_count to be set")
+    return combination_count
+
+
+def occupied_sites(object_points: list[list[Point]]) -> list[tuple[Point, list[int]]]:
+    """``OverlayConfig.episode_targets == "one"``: every distinct point at least one object is
+    assigned to, across ALL of that object's own pattern points (``object_points[ordinal]`` is
+    that object's full, static ``points`` pattern) -- grouped by exact coordinate, the same
+    equality the "all"-mode coincidence grouping already uses. Each entry's second element is
+    every object's ordinal (index into ``object_points``, i.e. declaration order) that has
+    this exact point anywhere in its own pattern -- 2+ ordinals at one site mean those objects
+    are a REAL, GUARANTEED stack there: assignment to the same point now IS co-location, full
+    stop, never a per-episode coincidence that only sometimes happens to line up (see
+    CLAUDE.md for why this replaced the previous dynamic-coincidence design for this mode --
+    that design made stacks rare and partial, since it required independent objects'
+    per-episode sweeps to land on the same point by chance).
+
+    Sites are ordered by the smallest ``(object_ordinal, point_index_within_that_object's_own_
+    pattern)`` among their members, so the rotation visits whichever object/point was declared
+    earliest first -- deterministic and stable across calls, with no dependency on
+    ``episode_index`` at all (this is a static structural fact about the scene, not a
+    per-episode computation)."""
+    members_by_point: dict[Point, list[int]] = {}
+    order_key: dict[Point, tuple[int, int]] = {}
+    for ordinal, points in enumerate(object_points):
+        for point_index, point in enumerate(points):
+            members = members_by_point.setdefault(point, [])
+            if ordinal not in members:
+                members.append(ordinal)
+            key = (ordinal, point_index)
+            if point not in order_key or key < order_key[point]:
+                order_key[point] = key
+    ordered_points = sorted(members_by_point.keys(), key=lambda p: order_key[p])
+    return [(p, members_by_point[p]) for p in ordered_points]
+
+
+def resolve_keep_apart(
+    natural_indices: list[int | None],
+    assigned_lists: list[list[int]],
+    episode_index: int,
+) -> tuple[list[int | None], list[int]]:
+    """For ``OverlayConfig.co_location == "keep_apart"``: given each object's NATURAL
+    (already-``sequence_index``-resolved) point index this episode -- ``None`` entries (if any)
+    are left untouched and skipped -- greedily resolves same-episode collisions in DECLARATION
+    order (list order == object ordinal): the
+    first object wanting a point keeps it; each later object wanting an already-taken point
+    advances through its OWN ``assigned_lists`` entry (cyclically, starting at ``episode_index %
+    length`` so it doesn't always retry the same alternate first) to the first currently-free
+    point among its own assigned points. If none of its own points are free, it keeps its
+    natural (colliding) index, and its ordinal is reported in the second return value -- a
+    residual, unavoidable overlap to surface as a warning rather than silently producing a
+    stuck-together pair in a mode whose whole point is avoiding that.
+
+    Returns ``(resolved_indices, residual_collision_ordinals)`` -- ``resolved_indices`` is the
+    same length/order as ``natural_indices``. Objects with disjoint assigned-point sets (the
+    common case: each has its own private positions) are mathematically untouched -- nothing
+    here perturbs an object that never collides with anyone, since its natural index is never
+    already in ``taken`` when its turn comes."""
+    resolved: list[int | None] = [None] * len(natural_indices)
+    taken: set[int] = set()
+    residual: list[int] = []
+    for i, natural in enumerate(natural_indices):
+        if natural is None:
+            continue
+        if natural not in taken:
+            resolved[i] = natural
+            taken.add(natural)
+            continue
+        length = len(assigned_lists[i])
+        start = episode_index % length
+        found = None
+        for k in range(length):
+            candidate = assigned_lists[i][(start + k) % length]
+            if candidate not in taken:
+                found = candidate
+                break
+        if found is not None:
+            resolved[i] = found
+            taken.add(found)
+        else:
+            resolved[i] = natural
+            residual.append(i)
+    return resolved, residual
+
+
+_LEVEL_STRATEGIES = {"fixed", "shuffle", "cycle", "balanced"}
+
+
+def level_order(stack_size: int, episode_index: int, strategy: str = "fixed", seed: int = 0) -> list[int]:
+    """The displayed level (``0`` = bottom) for each declaration/assignment-order slot in a
+    stack of ``stack_size`` objects, this episode -- the randomizable half of "stacking order
+    should be even across a session, not always the same" (the position-pattern equivalent of
+    ``sequence_index`` above, but over the level axis instead). Default ``"fixed"`` is today's
+    exact behavior (identity -- declaration/assignment order never changes). ``"cycle"`` and
+    ``"balanced"`` are both LATIN SQUARES: for any one fixed slot, the ``stack_size`` levels it
+    visits across episodes ``0..stack_size-1`` are all distinct, so every object hits every
+    level exactly once per ``stack_size`` episodes -- ``"cycle"`` rotates the identity
+    ordering (no randomness), ``"balanced"`` rotates a seeded random ordering instead, so which
+    level an object starts at is itself randomized rather than always slot ``i`` starting at
+    level ``i``. ``"shuffle"`` is a plain independent seeded permutation each episode -- evenly
+    distributed in aggregate, but without the Latin square's per-``stack_size``-window
+    guarantee."""
+    if stack_size < 1:
+        raise ValueError(f"stack_size must be >= 1, got {stack_size}")
+    if strategy == "fixed":
+        return list(range(stack_size))
+    if strategy == "shuffle":
+        return _seeded_permutation(stack_size, _combine_seed(seed, episode_index))
+    if strategy == "cycle":
+        return [(i + episode_index) % stack_size for i in range(stack_size)]
+    if strategy == "balanced":
+        base = _seeded_permutation(stack_size, seed)
+        return [base[(i + episode_index) % stack_size] for i in range(stack_size)]
+    raise ValueError(f"Unknown level strategy: {strategy!r} (allowed: {sorted(_LEVEL_STRATEGIES)})")
 
 
 def generate_rotation_angles(

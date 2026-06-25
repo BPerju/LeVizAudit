@@ -564,3 +564,254 @@ def test_orientation_on_variable_false_object_raises(tmp_path):
     ]
     with pytest.raises(ConfigError, match="orientation"):
         load_config(write_config(tmp_path, data))
+
+
+# ===== shape: "points" =====
+
+
+def _with_points_pattern(points: list) -> dict:
+    data = dict(VALID)
+    data["objects"] = [
+        dict(VALID["objects"][0], pattern={"shape": "points", "points": points}),
+        VALID["objects"][1],
+    ]
+    return data
+
+
+def test_load_config_with_points_pattern(tmp_path):
+    pts = [[10, 20], [30, 40], [50, 60]]
+    config = load_config(write_config(tmp_path, _with_points_pattern(pts)))
+    pattern = config.objects[0].pattern
+    assert pattern.shape == "points"
+    assert pattern.points == [(10.0, 20.0), (30.0, 40.0), (50.0, 60.0)]
+
+
+def test_points_pattern_empty_list_raises(tmp_path):
+    with pytest.raises(ConfigError, match="non-empty"):
+        load_config(write_config(tmp_path, _with_points_pattern([])))
+
+
+def test_points_pattern_unknown_field_raises(tmp_path):
+    data = dict(VALID)
+    data["objects"] = [
+        dict(VALID["objects"][0], pattern={"shape": "points", "points": [[1, 2]], "bogus": 1}),
+        VALID["objects"][1],
+    ]
+    with pytest.raises(ConfigError):
+        load_config(write_config(tmp_path, data))
+
+
+def test_points_pattern_invalid_point_raises(tmp_path):
+    with pytest.raises(ConfigError):
+        load_config(write_config(tmp_path, _with_points_pattern([[1, 2], [3]])))
+
+
+# ===== Per-object sequencing =====
+
+
+def _with_object_knobs(**knobs) -> dict:
+    data = dict(VALID)
+    data["objects"] = [dict(VALID["objects"][0], **knobs), VALID["objects"][1]]
+    return data
+
+
+def test_object_knobs_default_to_todays_behavior(tmp_path):
+    config = load_config(write_config(tmp_path, VALID))
+    cube = config.objects[0]
+    assert cube.sequencing == "lockstep"
+
+
+def test_object_knobs_parsed(tmp_path):
+    data = _with_object_knobs(sequencing="shuffled")
+    config = load_config(write_config(tmp_path, data))
+    cube = config.objects[0]
+    assert cube.sequencing == "shuffled"
+
+
+def test_object_invalid_sequencing_raises(tmp_path):
+    data = _with_object_knobs(sequencing="bogus")
+    with pytest.raises(ConfigError, match="sequencing"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_object_knobs_on_variable_false_object_raises(tmp_path):
+    data = dict(VALID)
+    data["objects"] = [
+        VALID["objects"][0],
+        dict(VALID["objects"][1], sequencing="shuffled"),
+    ]
+    with pytest.raises(ConfigError, match="sequencing"):
+        load_config(write_config(tmp_path, data))
+
+
+# ===== scene-level co_location / level_strategy / level_seed =====
+
+
+def test_co_location_defaults_to_stack(tmp_path):
+    config = load_config(write_config(tmp_path, VALID))
+    assert config.co_location == "stack"
+    assert config.level_strategy == "fixed"
+    assert config.level_seed == 0
+
+
+def test_co_location_keep_apart_parsed(tmp_path):
+    data = dict(VALID)
+    data["co_location"] = "keep_apart"
+    config = load_config(write_config(tmp_path, data))
+    assert config.co_location == "keep_apart"
+
+
+def test_co_location_invalid_value_raises(tmp_path):
+    data = dict(VALID)
+    data["co_location"] = "bogus"
+    with pytest.raises(ConfigError, match="co_location"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_level_strategy_parsed(tmp_path):
+    data = dict(VALID)
+    data["level_strategy"] = "balanced"
+    data["level_seed"] = 7
+    config = load_config(write_config(tmp_path, data))
+    assert config.level_strategy == "balanced"
+    assert config.level_seed == 7
+
+
+def test_level_strategy_invalid_value_raises(tmp_path):
+    data = dict(VALID)
+    data["level_strategy"] = "bogus"
+    with pytest.raises(ConfigError, match="level_strategy"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_level_seed_non_integer_raises(tmp_path):
+    data = dict(VALID)
+    data["level_seed"] = "bogus"
+    with pytest.raises(ConfigError, match="level_seed"):
+        load_config(write_config(tmp_path, data))
+
+
+# ===== scene-level episode_targets =====
+
+
+def test_episode_targets_defaults_to_all(tmp_path):
+    config = load_config(write_config(tmp_path, VALID))
+    assert config.episode_targets == "all"
+
+
+def test_episode_targets_one_parsed(tmp_path):
+    data = dict(VALID)
+    data["episode_targets"] = "one"
+    config = load_config(write_config(tmp_path, data))
+    assert config.episode_targets == "one"
+
+
+def test_episode_targets_invalid_value_raises(tmp_path):
+    data = dict(VALID)
+    data["episode_targets"] = "bogus"
+    with pytest.raises(ConfigError, match="episode_targets"):
+        load_config(write_config(tmp_path, data))
+
+
+# ===== scene-level combination_count =====
+
+
+def test_combination_count_defaults_to_none(tmp_path):
+    config = load_config(write_config(tmp_path, VALID))
+    assert config.combination_count is None
+
+
+def test_combination_count_parsed(tmp_path):
+    data = dict(VALID)
+    data["combination_count"] = 50
+    config = load_config(write_config(tmp_path, data))
+    assert config.combination_count == 50
+
+
+def test_combination_count_zero_raises(tmp_path):
+    data = dict(VALID)
+    data["combination_count"] = 0
+    with pytest.raises(ConfigError, match="combination_count"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_combination_count_non_integer_raises(tmp_path):
+    data = dict(VALID)
+    data["combination_count"] = "bogus"
+    with pytest.raises(ConfigError, match="combination_count"):
+        load_config(write_config(tmp_path, data))
+
+
+# ===== scene-level combination_mode / combination_seed =====
+
+
+def test_combination_mode_defaults_to_systematic(tmp_path):
+    config = load_config(write_config(tmp_path, VALID))
+    assert config.combination_mode == "systematic"
+    assert config.combination_seed == 0
+
+
+@pytest.mark.parametrize("mode", ["cartesian", "lcm"])
+def test_combination_mode_cartesian_lcm_parsed_without_combination_count(tmp_path, mode):
+    # These two derive their own natural period -- combination_count is optional for them.
+    data = dict(VALID)
+    data["combination_mode"] = mode
+    config = load_config(write_config(tmp_path, data))
+    assert config.combination_mode == mode
+    assert config.combination_count is None
+
+
+@pytest.mark.parametrize("mode", ["random", "coprime"])
+def test_combination_mode_random_coprime_require_combination_count(tmp_path, mode):
+    data = dict(VALID)
+    data["combination_mode"] = mode
+    with pytest.raises(ConfigError, match="combination_count"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize("mode", ["random", "coprime"])
+def test_combination_mode_random_coprime_parsed_with_combination_count(tmp_path, mode):
+    data = dict(VALID)
+    data["combination_mode"] = mode
+    data["combination_count"] = 30
+    config = load_config(write_config(tmp_path, data))
+    assert config.combination_mode == mode
+    assert config.combination_count == 30
+
+
+def test_combination_mode_invalid_value_raises(tmp_path):
+    data = dict(VALID)
+    data["combination_mode"] = "bogus"
+    with pytest.raises(ConfigError, match="combination_mode"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_combination_seed_parsed(tmp_path):
+    data = dict(VALID)
+    data["combination_mode"] = "random"
+    data["combination_count"] = 20
+    data["combination_seed"] = 9
+    config = load_config(write_config(tmp_path, data))
+    assert config.combination_seed == 9
+
+
+def test_combination_seed_non_integer_raises(tmp_path):
+    data = dict(VALID)
+    data["combination_seed"] = "bogus"
+    with pytest.raises(ConfigError, match="combination_seed"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_points_pattern_seed_defaults_to_zero(tmp_path):
+    config = load_config(write_config(tmp_path, _with_points_pattern([[1, 2]])))
+    assert config.objects[0].pattern.seed == 0
+
+
+def test_points_pattern_seed_parsed(tmp_path):
+    data = dict(VALID)
+    data["objects"] = [
+        dict(VALID["objects"][0], pattern={"shape": "points", "points": [[1, 2]], "seed": 7}),
+        VALID["objects"][1],
+    ]
+    config = load_config(write_config(tmp_path, data))
+    assert config.objects[0].pattern.seed == 7

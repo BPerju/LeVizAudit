@@ -25,6 +25,8 @@ _UNION_REQUIRED = {"circles"}
 _UNION_ALLOWED = _UNION_REQUIRED | {"shape", "seed", "distribution", "border_width", "count_mode"}
 _UNION_CIRCLE_REQUIRED = {"center", "radius"}
 _DISTRIBUTIONS = {"grid", "radial", "random"}
+_POINTS_REQUIRED = {"points"}
+_POINTS_ALLOWED = _POINTS_REQUIRED | {"shape", "seed"}
 _ORIENTATION_REQUIRED = {"count"}
 _ORIENTATION_ALLOWED = _ORIENTATION_REQUIRED | {
     "method", "angle_start_deg", "angle_end_deg", "seed", "arrow_length", "initial_angle_deg",
@@ -36,6 +38,15 @@ _EXCLUDE_ZONE_POLYGON_REQUIRED = {"name", "vertices"}
 _EXCLUDE_ZONE_POLYGON_ALLOWED = _EXCLUDE_ZONE_POLYGON_REQUIRED | {"shape"}
 _SURFACE_CALIBRATION_REQUIRED = {"corners"}
 _SURFACE_CALIBRATION_ALLOWED = _SURFACE_CALIBRATION_REQUIRED | {"aspect_ratio"}
+_SEQUENCING_MODES = {"lockstep", "shuffled"}
+_LEVEL_STRATEGIES = {"fixed", "shuffle", "cycle", "balanced"}
+_CO_LOCATION_MODES = {"stack", "keep_apart"}
+_EPISODE_TARGETS_MODES = {"all", "one"}
+_COMBINATION_MODES = {"systematic", "random", "coprime", "cartesian", "lcm"}
+_COMBINATION_MODES_REQUIRING_COUNT = {"random", "coprime"}  # "systematic" tolerates an unset
+                                                              # count (it just means inert/
+                                                              # legacy); "cartesian"/"lcm"
+                                                              # derive their own natural period
 
 
 @dataclass(frozen=True)
@@ -64,6 +75,9 @@ class PatternConfig:
                                                          # their UNION so an overlap between two
                                                          # arms' circles isn't double-density --
                                                          # see generate_union_points
+    points: list[Point] | None = None  # "points" only -- explicit, manually-authored positions
+                                         # (the calibration tool's per-object point assignment),
+                                         # returned as-is by build_pattern with no sampling
 
 
 @dataclass(frozen=True)
@@ -117,6 +131,18 @@ class ObjectConfig:
                                                     # at all, the original position-only
                                                     # behavior) -- only meaningful/allowed when
                                                     # variable: true, same as pattern
+    sequencing: str = "lockstep"  # how this object cycles through its own pattern's points --
+                                    # "lockstep" (default, today's exact i % len behavior) |
+                                    # "shuffled" -- see pattern.sequence_index. Decorrelates two
+                                    # objects of equal-length patterns from always pairing the
+                                    # same way. ("stratified" and "phase", two earlier modes,
+                                    # were both removed before this ever shipped in a release --
+                                    # see CLAUDE.md. "phase" in particular conflated object-pair
+                                    # decorrelation with the separate, scene-level question of
+                                    # whether co-located objects should ever coincide at all --
+                                    # that's now OverlayConfig.co_location, below. `jitter_px`
+                                    # and `presence`, two other earlier per-object knobs, were
+                                    # also removed -- see CLAUDE.md.)
 
 
 @dataclass(frozen=True)
@@ -126,6 +152,66 @@ class OverlayConfig:
     marker: MarkerConfig
     exclude_zones: list[ExcludeZoneConfig] = field(default_factory=list)
     surface_calibration: SurfaceCalibrationConfig | None = None
+    # SCENE-LEVEL (not per-object): whether 2+ objects sharing a point this episode are a real
+    # STACK (today's default/original behavior -- z-order via level_strategy/level_seed,
+    # see pattern.level_order) or should instead be kept apart -- each nudged, where possible,
+    # onto one of its OWN other assigned points instead of co-occupying (pattern.
+    # resolve_keep_apart). Replaces the removed per-StackConfig authored-site design: stacking
+    # is now read directly off which objects' `pattern: {shape: points}` lists happen to share
+    # a coordinate, not a separately-authored block -- see CLAUDE.md.
+    co_location: str = "stack"  # "stack" | "keep_apart" -- only meaningful under
+                                  # episode_targets == "all"; under "one", co-location is a
+                                  # static, guaranteed fact derived from occupied_sites (see
+                                  # below), not something that can or can't coincide per
+                                  # episode, so this setting has no effect there
+    level_strategy: str = "fixed"  # "fixed" | "shuffle" | "cycle" | "balanced" -- consulted
+                                     # whenever 2+ objects share a site this episode: under
+                                     # "all", only when co_location == "stack" and they happen
+                                     # to coincide; under "one", always, for every site with 2+
+                                     # objects (every such site is a guaranteed stack)
+    level_seed: int = 0
+    # SCENE-LEVEL: how many SITES are visible at once each episode. A site is one occupied
+    # point -- either a single object, or several objects that share that exact coordinate
+    # (see pattern.occupied_sites for "one", or the per-episode coincidence grouping in
+    # session.show_targets for "all"). "all" (default, today's exact behavior): every site is
+    # shown simultaneously, every episode -- decoupled from any one object's own pattern length
+    # via combination_count below. "one": exactly ONE site is shown per episode, round-robin in
+    # declaration order over pattern.occupied_sites (the STATIC union of every object's own
+    # assigned points) -- every object outside the active site is cleared. #episodes under
+    # "one" therefore equals the number of distinct occupied points, not the longest object's
+    # pattern length; an object with several assigned points gets one dedicated turn per point,
+    # not a sweep. See CLAUDE.md for the reports that shaped this (stacks were rare/partial
+    # under an earlier dynamic-coincidence design, and the JS preview separately
+    # over-multiplied its episode count).
+    episode_targets: str = "all"  # "all" | "one"
+    # SCENE-LEVEL, "all" mode only: how many distinct simultaneous-combination episodes to
+    # cycle through, via pattern.resolve_combination_indices, instead of each object
+    # independently lockstep/shuffled-sweeping its own pattern (sequence_index) -- decouples
+    # the visible combination count from any one object's own pattern length (reported
+    # directly: "if i have 3 objects and 20 steps the combinations are limited to the nr of
+    # steps"). `None` (default, with combination_mode also left at its default "systematic")
+    # keeps today's exact lockstep/shuffled behavior, byte-for-byte. Ignored under
+    # episode_targets == "one", which has no notion of "combination" at all.
+    combination_count: int | None = None
+    # SCENE-LEVEL, "all" mode only: which combination-generation strategy combination_count
+    # drives -- see pattern.resolve_combination_indices/combination_period for the full
+    # rationale of each. "systematic" (default): a deterministic, evenly-spread mapping,
+    # capped per object at that object's own pattern length (see the note on combination_index
+    # about why ANY purely-deterministic per-object function is capped there -- escaping that
+    # cap needs "cartesian" or "random" below). "random": independent seeded draws per object
+    # (combination_seed) -- the joint combination space is up to the PRODUCT of every object's
+    # length, not capped at any single one. "coprime": a deterministic, no-RNG alternative to
+    # "systematic" (a fixed coprime stride per object) -- same per-object cap as "systematic".
+    # "cartesian": the full Cartesian product of every object's own points, enumerated
+    # deterministically -- escapes the per-object cap exactly like "random" does, with no
+    # randomness; can get very large (combination_count, if set, caps it). "lcm": plain
+    # lockstep cycling, but run for exactly lcm(every object's own length) episodes instead of
+    # just the longest one, so every pairing lockstep naturally produces appears once.
+    # "cartesian"/"lcm" derive their own natural period when combination_count is left unset
+    # (the product, or the lcm, of every object's length) -- "systematic"/"random"/"coprime"
+    # have no such natural period and REQUIRE combination_count to be set.
+    combination_mode: str = "systematic"  # "systematic" | "random" | "coprime" | "cartesian" | "lcm"
+    combination_seed: int = 0  # "random" mode only
 
 
 class ConfigError(ValueError):
@@ -252,8 +338,22 @@ def _parse_pattern(data: dict, context: str) -> PatternConfig:
             border_width=float(border_width),
             count_mode=count_mode,
         )
+    if shape == "points":
+        _require_keys(data, _POINTS_REQUIRED, _POINTS_ALLOWED, f"{context} (shape: points)")
+        raw_points = data["points"]
+        if not isinstance(raw_points, list) or not raw_points:
+            raise ConfigError(f"{context}: 'points' must be a non-empty list")
+        points = [_parse_point(p, f"{context}.points[{i}]") for i, p in enumerate(raw_points)]
+        # Not used for sampling (points are explicit, not generated) -- only as the seed
+        # `sequence_index` draws from for this object's "shuffled" sequencing mode (see
+        # ObjectConfig.sequencing).
+        seed = data.get("seed", 0)
+        if not isinstance(seed, int) or isinstance(seed, bool):
+            raise ConfigError(f"{context}: seed must be an integer, got {seed!r}")
+        return PatternConfig(shape="points", points=points, seed=int(seed))
     raise ConfigError(
-        f"{context}: unknown pattern shape {shape!r} (allowed: 'arc', 'line', 'sector', 'union')"
+        f"{context}: unknown pattern shape {shape!r} "
+        "(allowed: 'arc', 'line', 'sector', 'union', 'points')"
     )
 
 
@@ -348,7 +448,9 @@ def _parse_object(data: dict, context: str, default_marker: MarkerConfig) -> Obj
     _require_keys(
         data,
         {"name", "count", "variable"},
-        {"name", "count", "variable", "pattern", "marker", "orientation"},
+        {
+            "name", "count", "variable", "pattern", "marker", "orientation", "sequencing",
+        },
         context,
     )
     name = data["name"]
@@ -384,8 +486,14 @@ def _parse_object(data: dict, context: str, default_marker: MarkerConfig) -> Obj
         if raw_orientation:
             raise ConfigError(f"{context}: 'orientation' must be omitted/null when variable: false")
         orientation = None
+    sequencing = data.get("sequencing", "lockstep")
+    if not variable and "sequencing" in data:
+        raise ConfigError(f"{context}: 'sequencing' must be omitted when variable: false")
+    if sequencing not in _SEQUENCING_MODES:
+        raise ConfigError(f"{context}: sequencing must be one of {sorted(_SEQUENCING_MODES)}, got {sequencing!r}")
     return ObjectConfig(
-        name=name, count=count, variable=variable, pattern=pattern, marker=marker, orientation=orientation
+        name=name, count=count, variable=variable, pattern=pattern, marker=marker, orientation=orientation,
+        sequencing=sequencing,
     )
 
 
@@ -444,10 +552,54 @@ def load_config(path: str | Path) -> OverlayConfig:
         else None
     )
 
+    co_location = raw.get("co_location", "stack")
+    if co_location not in _CO_LOCATION_MODES:
+        raise ConfigError(f"{path}: co_location must be one of {sorted(_CO_LOCATION_MODES)}, got {co_location!r}")
+    level_strategy = raw.get("level_strategy", "fixed")
+    if level_strategy not in _LEVEL_STRATEGIES:
+        raise ConfigError(f"{path}: level_strategy must be one of {sorted(_LEVEL_STRATEGIES)}, got {level_strategy!r}")
+    level_seed = raw.get("level_seed", 0)
+    if not isinstance(level_seed, int) or isinstance(level_seed, bool):
+        raise ConfigError(f"{path}: level_seed must be an integer, got {level_seed!r}")
+
+    episode_targets = raw.get("episode_targets", "all")
+    if episode_targets not in _EPISODE_TARGETS_MODES:
+        raise ConfigError(
+            f"{path}: episode_targets must be one of {sorted(_EPISODE_TARGETS_MODES)}, got {episode_targets!r}"
+        )
+
+    combination_count = raw.get("combination_count")
+    if combination_count is not None:
+        if not isinstance(combination_count, int) or isinstance(combination_count, bool) or combination_count < 1:
+            raise ConfigError(
+                f"{path}: combination_count must be a positive integer, got {combination_count!r}"
+            )
+
+    combination_mode = raw.get("combination_mode", "systematic")
+    if combination_mode not in _COMBINATION_MODES:
+        raise ConfigError(
+            f"{path}: combination_mode must be one of {sorted(_COMBINATION_MODES)}, got {combination_mode!r}"
+        )
+    if combination_mode in _COMBINATION_MODES_REQUIRING_COUNT and combination_count is None:
+        raise ConfigError(
+            f"{path}: combination_mode={combination_mode!r} requires combination_count to be set"
+        )
+
+    combination_seed = raw.get("combination_seed", 0)
+    if not isinstance(combination_seed, int) or isinstance(combination_seed, bool):
+        raise ConfigError(f"{path}: combination_seed must be an integer, got {combination_seed!r}")
+
     return OverlayConfig(
         camera_key=camera_key,
         objects=objects,
         marker=marker,
         exclude_zones=exclude_zones,
         surface_calibration=surface_calibration,
+        co_location=co_location,
+        level_strategy=level_strategy,
+        level_seed=int(level_seed),
+        episode_targets=episode_targets,
+        combination_count=combination_count,
+        combination_mode=combination_mode,
+        combination_seed=int(combination_seed),
     )

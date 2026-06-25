@@ -6,23 +6,35 @@ import pytest
 from vizaudit.overlay.config import ExcludeZoneConfig, PatternConfig
 from vizaudit.overlay.pattern import (
     build_pattern,
+    combination_index,
+    combination_period,
     generate_arc_points,
     generate_line_points,
     generate_rotation_angles,
     generate_sector_points,
     generate_union_points,
+    level_order,
+    occupied_sites,
     orientation_arrow_points,
+    resolve_combination_indices,
+    resolve_keep_apart,
+    sequence_index,
     target_for_episode,
 )
 from vizaudit.overlay.pattern import (
     _allocate_shares,
     _available_angle_intervals_at_radius,
+    _cartesian_indices,
     _circle_zone_angle_block,
     _clamp_to_region,
+    _combine_seed,
+    _coprime_stride_for,
     _excluded_y_intervals_at_x,
+    _gcd,
     _inflate_polygon,
     _merge_angle_intervals,
     _merge_intervals,
+    _mulberry32,
     _occupancy_guard,
     _outside_bounds_angle_intervals,
     _place_in_available_intervals,
@@ -31,6 +43,7 @@ from vizaudit.overlay.pattern import (
     _point_near_polygon,
     _refine_radial_local_separation,
     _relocate_if_invalid,
+    _seeded_permutation,
     _subtract_intervals,
 )
 from vizaudit.overlay.perspective import apply_homography, compute_homography, invert_homography
@@ -1365,3 +1378,422 @@ def test_orientation_arrow_points_homography_rotates_in_canonical_space_not_pixe
     px, py = position
     naive_tip = (px + length * math.cos(theta), py + length * math.sin(theta))
     assert tip != pytest.approx(naive_tip, abs=1e-6)
+
+
+# ===== Multi-object behavioral randomization (mulberry32, sequencing, rotation groups, levels) =====
+
+
+def test_mulberry32_deterministic_given_seed():
+    a = _mulberry32(42)
+    b = _mulberry32(42)
+    assert [a() for _ in range(10)] == [b() for _ in range(10)]
+
+
+def test_mulberry32_different_seeds_differ():
+    a = _mulberry32(1)
+    b = _mulberry32(2)
+    assert [a() for _ in range(5)] != [b() for _ in range(5)]
+
+
+def test_mulberry32_draws_in_unit_interval():
+    rng = _mulberry32(7)
+    draws = [rng() for _ in range(1000)]
+    assert all(0.0 <= d < 1.0 for d in draws)
+
+
+def test_mulberry32_known_first_values_for_seed_zero():
+    # Pins the exact algorithm (a literal port target for calibrate.js's mulberry32) against
+    # regressions -- if this ever changes, the JS port must change identically or parity breaks.
+    rng = _mulberry32(0)
+    first, second = rng(), rng()
+    assert first == pytest.approx(0.26642920868471265, abs=1e-12)
+    assert second == pytest.approx(0.0003297457005828619, abs=1e-12)
+
+
+def test_combine_seed_deterministic_and_order_sensitive():
+    assert _combine_seed(1, 2, 3) == _combine_seed(1, 2, 3)
+    assert _combine_seed(1, 2, 3) != _combine_seed(3, 2, 1)
+
+
+def test_seeded_permutation_is_a_permutation():
+    perm = _seeded_permutation(20, seed=5)
+    assert sorted(perm) == list(range(20))
+
+
+def test_seeded_permutation_deterministic_given_seed():
+    assert _seeded_permutation(20, seed=5) == _seeded_permutation(20, seed=5)
+
+
+def test_sequence_index_lockstep_matches_target_for_episode():
+    for i in range(10):
+        assert sequence_index(i, length=4, mode="lockstep") == i % 4
+
+
+def test_sequence_index_unknown_mode_raises():
+    with pytest.raises(ValueError):
+        sequence_index(0, length=4, mode="bogus")
+
+
+def test_sequence_index_rejects_zero_length():
+    with pytest.raises(ValueError):
+        sequence_index(0, length=0)
+
+
+@pytest.mark.parametrize("mode", ["lockstep", "shuffled"])
+def test_sequence_index_visits_every_point_evenly_over_one_period(mode):
+    length = 7
+    visited = [
+        sequence_index(i, length, mode=mode, object_ordinal=2, num_objects=3, seed=11)
+        for i in range(length)
+    ]
+    assert sorted(visited) == list(range(length))
+
+
+def test_sequence_index_shuffled_differs_from_lockstep_for_some_seed():
+    length = 9
+    lockstep = [sequence_index(i, length, mode="lockstep") for i in range(length)]
+    shuffled = [sequence_index(i, length, mode="shuffled", object_ordinal=1, seed=3) for i in range(length)]
+    assert shuffled != lockstep
+
+
+def test_combination_index_rejects_zero_length():
+    with pytest.raises(ValueError):
+        combination_index(0, length=0, object_ordinal=0, num_combinations=5)
+
+
+def test_combination_index_rejects_zero_num_combinations():
+    with pytest.raises(ValueError):
+        combination_index(0, length=4, object_ordinal=0, num_combinations=0)
+
+
+def test_combination_index_rejects_a_joint_only_mode():
+    # "cartesian"/"lcm" need every object's length jointly -- only resolve_combination_indices
+    # handles them, never this per-object function.
+    with pytest.raises(ValueError):
+        combination_index(0, length=4, object_ordinal=0, num_combinations=5, mode="cartesian")
+    with pytest.raises(ValueError):
+        combination_index(0, length=4, object_ordinal=0, num_combinations=5, mode="lcm")
+
+
+@pytest.mark.parametrize("mode", ["systematic", "random", "coprime"])
+def test_combination_index_always_in_range(mode):
+    length, num_combinations = 5, 17
+    for i in range(num_combinations):
+        for ordinal in range(3):
+            idx = combination_index(i, length, ordinal, num_combinations, mode=mode, seed=11)
+            assert 0 <= idx < length
+
+
+def test_combination_index_systematic_undersampling_spreads_evenly_no_duplicates():
+    # num_combinations <= length: each combination should land on a DIFFERENT point, evenly
+    # spread across the larger pool (skipping some) -- the proportional formula's intended use.
+    length, num_combinations = 20, 10
+    indices = [combination_index(i, length, object_ordinal=0, num_combinations=num_combinations) for i in range(num_combinations)]
+    assert len(set(indices)) == num_combinations  # all distinct
+    assert indices == sorted(indices)  # monotonically increasing -- evenly spread, not shuffled
+
+
+def test_combination_index_systematic_oversampling_never_stalls_on_consecutive_episodes():
+    # The reported bug: setting num_combinations higher than an object's own pattern length
+    # made consecutive episodes repeat the SAME point for several episodes in a row (the
+    # proportional formula's floor-division naturally clusters when the step size is < 1)
+    # instead of cycling. Fixed via a plain-modulo branch once num_combinations > length.
+    length, num_combinations = 4, 20
+    indices = [combination_index(i, length, object_ordinal=0, num_combinations=num_combinations) for i in range(num_combinations)]
+    for a, b in zip(indices, indices[1:]):
+        assert a != b, f"consecutive episodes repeated index {a} -- the stalling bug is back"
+
+
+def test_combination_index_systematic_oversampling_still_evenly_counts_each_point():
+    # The bug fix shouldn't sacrifice aggregate fairness -- still num_combinations/length visits
+    # per point when num_combinations is an exact multiple of length.
+    length, num_combinations = 4, 20
+    counts = [0] * length
+    for i in range(num_combinations):
+        counts[combination_index(i, length, object_ordinal=0, num_combinations=num_combinations)] += 1
+    assert all(c == num_combinations // length for c in counts)
+
+
+def test_combination_index_systematic_decouples_combination_count_from_length():
+    # The whole point: num_combinations can exceed (or be less than) length -- unlike
+    # sequence_index's lockstep, which is hard-capped at `length` distinct values per period.
+    length = 5
+    values_at_20 = {combination_index(i, length, 0, 20) for i in range(20)}
+    assert values_at_20 == set(range(length))  # all 5 points visited well before 20 combos
+
+
+def test_combination_index_systematic_phase_shifts_equal_length_objects_apart():
+    # Two objects with the SAME length, no phase shift, would always land on the same
+    # proportional point at the same combination -- the phase (object_ordinal) decorrelates
+    # them so they don't always pair the same way.
+    length, num_combinations = 6, 6
+    ordinal0 = [combination_index(i, length, 0, num_combinations) for i in range(num_combinations)]
+    ordinal1 = [combination_index(i, length, 1, num_combinations) for i in range(num_combinations)]
+    assert ordinal0 != ordinal1
+
+
+def test_combination_index_systematic_undersampling_pure_integer_arithmetic():
+    # Within the undersampling (num_combinations <= length) branch, combination_i * length is
+    # exactly divisible by num_combinations here (an exact half-integer boundary would be the
+    # classic round()/Math.round() divergence point) -- confirms floor division alone (no
+    # round()) is used, by checking an exact value.
+    assert combination_index(1, length=8, object_ordinal=0, num_combinations=4) == 2  # 1*8//4 = 2
+    assert combination_index(2, length=8, object_ordinal=0, num_combinations=4) == 4  # 2*8//4 = 4
+
+
+def test_combination_index_random_deterministic_given_seed():
+    a = [combination_index(i, 7, 0, 1, mode="random", seed=42) for i in range(30)]
+    b = [combination_index(i, 7, 0, 1, mode="random", seed=42) for i in range(30)]
+    assert a == b
+
+
+def test_combination_index_random_covers_full_range_given_enough_draws():
+    length = 5
+    draws = {combination_index(i, length, object_ordinal=0, num_combinations=1, mode="random", seed=3) for i in range(200)}
+    assert draws == set(range(length))
+
+
+def test_combination_index_random_differs_by_seed():
+    a = [combination_index(i, 6, 0, 1, mode="random", seed=1) for i in range(20)]
+    b = [combination_index(i, 6, 0, 1, mode="random", seed=2) for i in range(20)]
+    assert a != b
+
+
+def test_gcd_basic():
+    assert _gcd(12, 8) == 4
+    assert _gcd(7, 5) == 1
+    assert _gcd(0, 5) == 5
+
+
+@pytest.mark.parametrize("length", [2, 3, 4, 5, 7, 11, 12, 20])
+@pytest.mark.parametrize("ordinal", [0, 1, 2, 5])
+def test_coprime_stride_for_is_always_actually_coprime(length, ordinal):
+    stride = _coprime_stride_for(length, ordinal)
+    assert _gcd(stride, length) == 1
+
+
+def test_combination_index_coprime_is_a_permutation_within_one_period():
+    length = 9
+    values = [combination_index(i, length, object_ordinal=0, num_combinations=1, mode="coprime") for i in range(length)]
+    assert sorted(values) == list(range(length))
+
+
+def test_combination_index_coprime_is_fully_deterministic_no_randomness_involved():
+    length, num_combinations = 7, 7
+    a = [combination_index(i, length, 2, num_combinations, mode="coprime") for i in range(length)]
+    b = [combination_index(i, length, 2, num_combinations, mode="coprime") for i in range(length)]
+    assert a == b
+
+
+def test_combination_index_coprime_differs_by_ordinal_typically():
+    length = 8
+    ordinal0 = [combination_index(i, length, 0, 1, mode="coprime") for i in range(length)]
+    ordinal1 = [combination_index(i, length, 1, 1, mode="coprime") for i in range(length)]
+    assert ordinal0 != ordinal1
+
+
+def test_cartesian_indices_enumerates_full_product_exactly_once():
+    lengths = [2, 3]
+    seen = set()
+    for i in range(2 * 3):
+        seen.add(tuple(_cartesian_indices(i, lengths)))
+    assert len(seen) == 6
+    assert seen == {(a, b) for a in range(2) for b in range(3)}
+
+
+def test_cartesian_indices_wraps_after_full_product():
+    lengths = [2, 3]
+    assert _cartesian_indices(0, lengths) == _cartesian_indices(6, lengths)
+
+
+def test_resolve_combination_indices_cartesian_matches_cartesian_indices_directly():
+    lengths = [3, 4, 2]
+    for i in range(24):
+        assert resolve_combination_indices(i, lengths, mode="cartesian") == _cartesian_indices(i, lengths)
+
+
+def test_resolve_combination_indices_lcm_is_plain_modulo_no_phase():
+    lengths = [4, 6]
+    for i in range(12):
+        assert resolve_combination_indices(i, lengths, mode="lcm") == [i % 4, i % 6]
+
+
+def test_resolve_combination_indices_lcm_completes_every_lockstep_pairing_once():
+    # lcm(4, 6) = 12 -- over exactly 12 combinations, every (i%4, i%6) pair that plain lockstep
+    # naturally produces should appear, with no repeat before the 12th.
+    lengths = [4, 6]
+    pairs = [tuple(resolve_combination_indices(i, lengths, mode="lcm")) for i in range(12)]
+    assert len(set(pairs)) == 12
+
+
+def test_resolve_combination_indices_systematic_delegates_to_combination_index():
+    lengths = [5, 7]
+    for i in range(10):
+        expected = [combination_index(i, length, ordinal, 10, mode="systematic") for ordinal, length in enumerate(lengths)]
+        assert resolve_combination_indices(i, lengths, mode="systematic", num_combinations=10) == expected
+
+
+def test_resolve_combination_indices_requires_count_for_systematic_random_coprime():
+    with pytest.raises(ValueError):
+        resolve_combination_indices(0, [4, 5], mode="systematic", num_combinations=None)
+    with pytest.raises(ValueError):
+        resolve_combination_indices(0, [4, 5], mode="random", num_combinations=None)
+    with pytest.raises(ValueError):
+        resolve_combination_indices(0, [4, 5], mode="coprime", num_combinations=None)
+
+
+def test_combination_period_unknown_mode_raises():
+    with pytest.raises(ValueError):
+        combination_period([4, 5], mode="bogus")
+
+
+def test_combination_period_systematic_random_coprime_require_count():
+    for mode in ("systematic", "random", "coprime"):
+        with pytest.raises(ValueError):
+            combination_period([4, 5], mode=mode, combination_count=None)
+        assert combination_period([4, 5], mode=mode, combination_count=50) == 50
+
+
+def test_combination_period_cartesian_natural_is_product_of_lengths():
+    assert combination_period([4, 5, 2], mode="cartesian", combination_count=None) == 40
+
+
+def test_combination_period_cartesian_capped_by_combination_count():
+    assert combination_period([4, 5, 2], mode="cartesian", combination_count=10) == 10
+    # cap above the natural product is a no-op, not an error
+    assert combination_period([4, 5, 2], mode="cartesian", combination_count=1000) == 40
+
+
+def test_combination_period_lcm_natural_is_lcm_of_lengths():
+    assert combination_period([4, 6], mode="lcm", combination_count=None) == 12
+
+
+def test_combination_period_lcm_capped_by_combination_count():
+    assert combination_period([4, 6], mode="lcm", combination_count=5) == 5
+
+
+def test_occupied_sites_disjoint_objects_one_site_each():
+    sites = occupied_sites([[(1.0, 1.0)], [(2.0, 2.0)]])
+    assert sites == [((1.0, 1.0), [0]), ((2.0, 2.0), [1])]
+
+
+def test_occupied_sites_shared_point_forms_a_guaranteed_multi_member_site():
+    sites = occupied_sites([[(5.0, 5.0)], [(5.0, 5.0)]])
+    assert sites == [((5.0, 5.0), [0, 1])]
+
+
+def test_occupied_sites_orders_by_earliest_object_ordinal_then_point_index():
+    # B (ordinal 1) is declared after A (ordinal 0), so A's points sort first; within A's own
+    # points, the earlier point_index sorts first.
+    sites = occupied_sites([[(10.0, 10.0), (20.0, 20.0)], [(30.0, 30.0)]])
+    assert [p for p, _ in sites] == [(10.0, 10.0), (20.0, 20.0), (30.0, 30.0)]
+
+
+def test_occupied_sites_a_shared_point_is_ordered_by_its_earliest_member():
+    # The shared point (50,50) appears at A's index 0 and B's index 0 -- its order key is
+    # min((0, 0), (1, 0)) = (0, 0), so it sorts before A's OTHER, later point (5,5) at (0, 1).
+    sites = occupied_sites([[(50.0, 50.0), (5.0, 5.0)], [(50.0, 50.0)]])
+    assert [p for p, _ in sites] == [(50.0, 50.0), (5.0, 5.0)]
+    assert sites[0][1] == [0, 1]
+
+
+def test_occupied_sites_empty_when_no_object_has_any_point():
+    assert occupied_sites([[], []]) == []
+
+
+def test_resolve_keep_apart_disjoint_sets_untouched():
+    natural = [0, 0]  # would collide if these were the same list, but they aren't
+    assigned = [[0, 1], [0, 1]]
+    resolved, residual = resolve_keep_apart(natural, assigned, episode_index=0)
+    # First object (declared first) keeps its natural point; second collides and must move.
+    assert resolved[0] == 0
+    assert resolved[1] != 0
+    assert residual == []
+
+
+def test_resolve_keep_apart_truly_disjoint_assigned_sets_never_perturbed():
+    natural = [0, 2]  # no collision at all -- different points entirely
+    assigned = [[0, 1], [2, 3]]
+    resolved, residual = resolve_keep_apart(natural, assigned, episode_index=5)
+    assert resolved == [0, 2]
+    assert residual == []
+
+
+def test_resolve_keep_apart_moves_second_object_to_its_own_free_point():
+    natural = [0, 0]
+    assigned = [[0, 1], [0, 2]]
+    resolved, residual = resolve_keep_apart(natural, assigned, episode_index=0)
+    assert resolved[0] == 0
+    assert resolved[1] == 2
+    assert residual == []
+
+
+def test_resolve_keep_apart_residual_when_no_alternative_exists():
+    # Both objects have ONLY point 0 -- there's nowhere for the second one to go.
+    natural = [0, 0]
+    assigned = [[0], [0]]
+    resolved, residual = resolve_keep_apart(natural, assigned, episode_index=0)
+    assert resolved == [0, 0]
+    assert residual == [1]
+
+
+def test_resolve_keep_apart_skips_absent_objects():
+    natural = [0, None, 0]
+    assigned = [[0, 1], [5], [0, 2]]
+    resolved, residual = resolve_keep_apart(natural, assigned, episode_index=0)
+    assert resolved[1] is None
+    assert resolved[0] == 0
+    assert resolved[2] != 0
+    assert residual == []
+
+
+def test_resolve_keep_apart_deterministic_given_episode_index():
+    natural = [0, 0, 0]
+    assigned = [[0, 1, 2], [0, 1, 2], [0, 1, 2]]
+    a = resolve_keep_apart(natural, assigned, episode_index=3)
+    b = resolve_keep_apart(natural, assigned, episode_index=3)
+    assert a == b
+
+
+def test_level_order_fixed_is_identity():
+    assert level_order(4, episode_index=5, strategy="fixed") == [0, 1, 2, 3]
+
+
+def test_level_order_unknown_strategy_raises():
+    with pytest.raises(ValueError):
+        level_order(3, 0, strategy="bogus")
+
+
+def test_level_order_rejects_zero_stack_size():
+    with pytest.raises(ValueError):
+        level_order(0, 0)
+
+
+def test_level_order_shuffle_is_a_permutation():
+    order = level_order(5, episode_index=3, strategy="shuffle", seed=2)
+    assert sorted(order) == list(range(5))
+
+
+@pytest.mark.parametrize("strategy", ["cycle", "balanced"])
+def test_level_order_cycle_and_balanced_are_latin_squares(strategy):
+    stack_size = 4
+    # For a fixed slot, the levels it visits across one full period must all be distinct.
+    for slot in range(stack_size):
+        levels_for_slot = {
+            level_order(stack_size, episode_index=e, strategy=strategy, seed=7)[slot]
+            for e in range(stack_size)
+        }
+        assert levels_for_slot == set(range(stack_size))
+
+
+def test_level_order_balanced_seeded_start_differs_from_cycle():
+    stack_size = 5
+    cycle = [level_order(stack_size, e, strategy="cycle") for e in range(stack_size)]
+    balanced = [level_order(stack_size, e, strategy="balanced", seed=13) for e in range(stack_size)]
+    assert balanced != cycle
+
+
+def test_build_pattern_dispatches_points_shape_returns_as_is():
+    pts = [(1.0, 2.0), (3.0, 4.0), (5.0, 6.0)]
+    cfg = PatternConfig(shape="points", points=pts)
+    assert build_pattern(cfg, count=3) == pts
