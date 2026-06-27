@@ -1,18 +1,16 @@
-# vizaudit-overlay pattern config demonstrating the behavioral randomization knobs added on
-# top of the Objects layer -- see CLAUDE.md for the full design rationale. None of this is
-# preview-only: every field below is read by session.py/pattern.py during a live recording.
+# vizaudit-overlay pattern config demonstrating the scene-level model on top of the Objects
+# layer -- see CLAUDE.md for the full design rationale. None of this is preview-only: every
+# field below is read by session.py/pattern.py during a live recording.
 #
 # Scenario: a 3-block stacking/assembly task. All three blocks share the EXACT SAME assigned
-# point ([320, 240]) -- stacking is derived automatically from that coincidence (no separate
-# "stacks:" block to author), with `co_location: stack` (the default -- can be omitted, shown
-# here for clarity) keeping them together every episode. Which block ends up on top, middle,
-# or bottom is randomized across episodes via the scene-level `level_strategy: balanced`, so a
-# policy trained on this data can't quietly learn "red is always on the bottom." A fourth
-# object is an unrelated, independently-swept distractor cube demonstrating the remaining
-# per-object knob: non-lockstep sequencing (so it doesn't always pair with the stack's own
-# episode cadence). (Two earlier per-object knobs, `jitter_px`/`presence`, were removed after a
-# direct report that they didn't pull their weight against the rest of this feature's
-# complexity -- see CLAUDE.md.)
+# point ([320, 240]) -- objects with an identical point-list are grouped into one atomic stack
+# unit and always shown together, full, never sliced (see CLAUDE.md's "atomic-stack
+# composition" decision). `stacking: stack` (the default -- can be omitted, shown here for
+# clarity) keeps them together every episode. Which block ends up on top, middle, or bottom is
+# randomized across episodes via `level: balanced`, so a policy trained on this data can't
+# quietly learn "red is always on the bottom." A fourth object is an unrelated, independently-
+# swept distractor cube demonstrating the remaining scene-level knob: a non-"synced"
+# `combinations` value (so it doesn't always pair with the stack's own episode cadence).
 
 camera_key: observation.images.top
 
@@ -21,39 +19,33 @@ surface_calibration:
 
 objects:
   # The three stacked blocks: each has only ONE assigned position, and it's the SAME position
-  # for all three -- that exact coincidence is what makes them a stack. An object with several
-  # OTHER positions too would only coincidentally share this point on some episodes, which is
-  # a different thing (see co_location: keep_apart below for the opposite intent).
+  # for all three -- that exact coincidence is what makes them an atomic stack unit. An object
+  # with several OTHER positions too would only coincidentally share this point on some
+  # episodes, which is a different thing (see `stacking: keep_apart` below for the opposite
+  # intent).
   - name: red_block
     count: 1
-    variable: true
     pattern: { shape: points, points: [[320, 240]] }
     marker: { color_rgba: [239, 68, 68, 255] }
 
   - name: green_block
     count: 1
-    variable: true
     pattern: { shape: points, points: [[320, 240]] }
     marker: { color_rgba: [74, 222, 128, 255] }
 
   - name: blue_block
     count: 1
-    variable: true
     pattern: { shape: points, points: [[320, 240]] }
     marker: { color_rgba: [59, 130, 246, 255] }
 
-  # An unrelated distractor cube, swept over its own small position list -- demonstrates the
-  # three remaining per-object knobs (none of which interact with the stack above):
+  # An unrelated distractor cube, swept over its own small position list -- demonstrates that
+  # `combinations` (scene-level, below) doesn't interact with the stack above at all, since
+  # this object's point-list isn't shared with anyone else's.
   - name: distractor_cube
     count: 1
-    variable: true
     pattern:
       shape: points
       points: [[120, 360], [480, 380], [220, 120]]
-      seed: 3                  # feeds this object's "shuffled" sequencing
-    sequencing: shuffled        # visits its 3 points in a seeded-random order instead of the
-                                  # plain lockstep i % 3 cycle (default) -- decorrelates it from
-                                  # whatever cadence the stack above happens to follow
     marker: { color_rgba: [148, 163, 184, 255] }
 
 marker:
@@ -61,48 +53,40 @@ marker:
   color_rgba: [255, 64, 64, 255]
   label: true
 
-# SCENE-LEVEL (sibling to objects:, applies to the whole session): co_location is "stack" by
-# default (omitted here for that reason -- shown only in the comment for clarity) -- objects
-# sharing a point this episode stack together rather than being kept apart. level_strategy
-# governs the z-order: "balanced" is a Latin square with a seeded starting order, so each
-# block visits each level (0, 1, 2) exactly once every 3 episodes, just not always the same
-# one first -- see pattern.level_order. The alternative for a scene where co-located objects
-# should instead be nudged apart (e.g. two independently-swept objects that must never
-# literally coincide) is `co_location: keep_apart` -- meaningful only under episode_targets:
-# all (under "one", co-location is a static, guaranteed fact derived from which objects are
-# assigned to the same point, not a per-episode choice).
+# SCENE-LEVEL (sibling to objects:, applies to the whole session) -- see CLAUDE.md for the
+# full per_episode/combinations/order/stacking/level model. `per_episode: all` (the default,
+# omitted here) means every object's own position advances every episode -- the 3-block stack
+# AND the distractor cube's current position both show every episode. `stacking: stack` (the
+# default -- shown only in this comment for clarity) keeps coincidentally- or permanently-
+# co-located objects together as one stack rather than nudging them apart (`stacking:
+# keep_apart`, meaningful only under `per_episode: all` -- under a static `per_episode: <int>`,
+# stacking instead decides whether the rotation cycles through whole stacks or through every
+# individual point, see CLAUDE.md). `level: balanced` (active below) is a Latin square with a
+# seeded starting order, so each block visits each level (0, 1, 2) exactly once every 3
+# episodes, just not always the same one first -- see pattern.level_order.
 #
-# episode_targets is a SEPARATE scene-level setting, also "all" by default (omitted here for
-# the same reason): "all" shows every occupied point simultaneously every episode (today's
-# behavior, used here -- the 3-block stack AND the distractor cube's current position both
-# show every episode). "one" instead shows exactly ONE occupied point per episode, round-robin
-# over the STATIC union of every object's own assigned points -- on THIS config that's 4 sites,
-# not 2: the 3-block stack counts as a single site (all three blocks share that one point), but
-# the distractor cube's 3 own points ([120,360], [480,380], [220,120]) are each a SEPARATE site
-# of their own (an object with several assigned points gets one dedicated turn per point under
-# "one", not a single combined turn) -- so `episode_targets: one` here would rotate through the
-# stack, then each of the distractor's 3 positions in turn, one per episode.
-# co_location: stack
-# episode_targets: all
+# A few other named presets exist as shorthand for common axis combinations -- e.g.
+# `preset: one_at_a_time` (per_episode: 1, the "place N objects one at a time" case),
+# `preset: cycle_through_points` (per_episode: 1, stacking: keep_apart), `preset:
+# every_combination` (combinations: all), `preset: show_everything` (per_episode: static).
+# Any axis you set explicitly overrides whatever the preset would have defaulted it to.
+# per_episode: all
+# stacking: stack
 #
-# combination_count/combination_mode are "all"-mode only, and only change anything once 2+
-# objects each have MORE than one assigned point (none do here -- the 3 blocks have exactly 1
-# point each, and only the distractor has more than 1). combination_mode picks the strategy:
-# "systematic" (default) is a deterministic, evenly-spread mapping capped at each object's own
-# pattern length (setting `combination_count` higher than that length still cycles evenly,
-# never repeating two consecutive episodes -- it just revisits points instead of growing the
-# JOINT combination space when every object shares a similar length). "random" (needs
-# combination_seed too) and "cartesian" both escape that per-object cap -- "random" via
-# independent seeded draws (up to the PRODUCT of every object's length, non-deterministic),
-# "cartesian" via the full deterministic Cartesian product (same product, but enumerated, no
-# randomness -- can get very large, so `combination_count` caps it if set). "coprime" is a
-# deterministic, no-RNG alternative to "systematic" with the same per-object cap. "lcm" ignores
-# combination_count's exact value and instead runs exactly lcm(every object's own length)
-# episodes, so every pairing plain lockstep naturally produces appears once. Left
-# unset/commented here since this scene has only one multi-point object, where none of this
-# would demonstrate much.
-# combination_count: 50
-# combination_mode: systematic
-# combination_seed: 0
-level_strategy: balanced
-level_seed: 5
+# `combinations` is the visit-order axis (per_episode: all only) -- it replaces both the old
+# per-object `sequencing` field and a separate combination-count subsystem, since both were
+# always the same underlying question. "synced" (default): plain i%length cycle for each unit.
+# "shuffled": each unit visits its own points in its own seeded-random order (`seed`) -- e.g.
+# setting `combinations: shuffled` here would decorrelate the distractor_cube's own 3-point
+# sweep from the 3-block stack's episode cadence, without touching the stack's own grouping at
+# all (it's still one atomic unit either way). `combinations`/`order` only change anything once
+# 2+ units each have MORE than one assigned point (none do here in the default case -- the
+# stack is 1 unit of length 1, and only the distractor has more than 1 point). "all" (every
+# simultaneous combination, the full Cartesian product) and <a positive integer> (sample that
+# many combinations, spread by `order: even | random | coprime`) are the other values -- see
+# CLAUDE.md for the full rationale of each. Left unset/commented here since this scene has only
+# one multi-point object, where none of this would demonstrate much.
+# combinations: synced
+# order: even
+level: balanced
+seed: 5

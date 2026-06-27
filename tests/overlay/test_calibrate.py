@@ -55,28 +55,54 @@ def test_static_html_has_objects_card():
     assert "objectLevelInput" not in html, "level must be automatic, not a manual input field"
 
 
-def test_static_html_has_behavioral_randomization_knobs():
-    # The behavioral knobs (sequencing/episode_targets/co-location/level strategy) are REAL
-    # config fields the live overlay consumes (session.py/pattern.py), not preview-only -- see
-    # CLAUDE.md. Animate/play is the one pure-preview addition alongside them.
+def test_static_html_has_scene_level_model_controls():
+    # The scene-level model (per_episode/combinations/order/stacking/level/seed, plus a `preset`
+    # shorthand) are REAL config fields the live overlay consumes (session.py/pattern.py), not
+    # preview-only -- see CLAUDE.md. Animate/play is the one pure-preview addition alongside
+    # them. This redesign REPLACED five previously co-equal, implementation-named axes
+    # (position_mode, site_selection+site_count+site_order+site_seed, combination_mode+
+    # combination_count+combination_seed, co_location, level_strategy+level_seed) -- the old
+    # `episode_targets` alias is gone too. `previewMode` itself now only ever has 2 values
+    # ("marginal"/"episode") -- it no longer secretly carries the real scene's per_episode value
+    # (that grew an open-ended "<int>" case a 2-3 option dropdown can't represent), so it has its
+    # own dedicated `perEpisodeSelect`/`perEpisodeCountInput` controls instead -- see CLAUDE.md.
     html = _STATIC_HTML.read_text()
     for element_id in [
-        "objectSequencingSelect", "objectSeedInput", "episodeTargetsSelect",
-        "coLocationSelect", "stackLevelStrategySelect", "stackLevelSeedInput",
+        "presetSelect", "previewModeSelect",
+        "perEpisodeSelect", "perEpisodeCountInput",
+        "combinationsSelect", "combinationsCountInput", "orderSelect",
+        "stackingSelect", "levelSelect", "sceneSeedInput",
         "episodePlayBtn", "collisionWarning", "sampleCountLabel",
     ]:
         assert f'id="{element_id}"' in html, f"missing #{element_id} in calibrate.html"
+    assert "positionModeSelect" not in html
+    assert 'value="episode_sweep"' not in html
+    assert 'value="episode_overlay"' not in html
+    assert 'value="static"' in html  # per_episode: "static" -- "show everything" preset
+    # Every removed field's old control id is gone entirely (clean break, not a deprecated
+    # alias -- this project is pre-release, see CLAUDE.md).
+    for removed_id in [
+        "siteSelectionSelect", "siteCountInput", "siteOrderSelect", "siteSeedInput",
+        "combinationModeSelect", "combinationCountInput", "combinationSeedInput",
+        "coLocationSelect", "stackLevelStrategySelect", "stackLevelSeedInput",
+    ]:
+        assert f'id="{removed_id}"' not in html, f"removed control #{removed_id} still present"
     # "stratified" and "phase" sequencing modes were both removed before ever shipping in a
     # release -- "shuffled" already covers stratified's use case at least as well (a fixed
     # stride risks resonating with the underlying point grid's own periodic structure, which
     # true randomness can't), and "phase" conflated object-pair decorrelation with the
-    # separate, scene-level co_location concern (see CLAUDE.md). `jitter_px`/`presence`, two
+    # separate, scene-level stacking concern (see CLAUDE.md). `jitter_px`/`presence`, two
     # other earlier per-object knobs, were removed after a direct report that they didn't pull
-    # their weight against the rest of this feature's complexity.
+    # their weight against the rest of this feature's complexity. Per-object `sequencing` (and
+    # its `objectSequencingSelect`/`objectSeedInput` controls) was folded into scene-level
+    # `combinations`/`order` -- see CLAUDE.md.
     assert "stratified" not in html.lower()
     assert "phase offset" not in html.lower()
     assert "objectJitterInput" not in html
     assert "objectPresenceInput" not in html
+    assert "objectSequencingSelect" not in html
+    assert "objectSeedInput" not in html
+    assert "episodeTargetsSelect" not in html
 
 
 def test_write_calibration_html_copies_to_output(tmp_path):

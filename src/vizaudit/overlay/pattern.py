@@ -1808,8 +1808,8 @@ def combination_index(
     mode: str = "systematic",
     seed: int = 0,
 ) -> int:
-    """``OverlayConfig.episode_targets == "all"`` + ``OverlayConfig.combination_count`` set:
-    which of an object's own ``length`` assigned points to show for combination
+    """``OverlayConfig.position_mode == "sweep"`` + ``OverlayConfig.combination_count`` set:
+    which of a stack unit's own ``length`` assigned points to show for combination
     ``combination_i`` out of ``num_combinations`` total -- decoupling the number of distinct
     SIMULTANEOUS multi-object combinations from any one object's own pattern length.
     Previously, "all" mode's lockstep ``sequence_index`` forced the visible combination count
@@ -1940,8 +1940,8 @@ def resolve_combination_indices(
     num_combinations: int | None = None,
     seed: int = 0,
 ) -> list[int]:
-    """Top-level dispatcher ``session.py`` calls for ``episode_targets == "all"`` +
-    ``combination_count``/``combination_mode`` -- one index per object (by position in
+    """Dispatcher ``resolve_unit_indices`` calls (for ``position_mode == "sweep"``) when
+    ``combination_mode`` is one of the 5 joint modes -- one index per unit (by position in
     ``lengths``), for ANY of the 5 ``_COMBINATION_MODES``, including ``"cartesian"``/``"lcm"``
     which need every object's length jointly and can't go through the per-object
     ``combination_index`` above.
@@ -1974,8 +1974,9 @@ def resolve_combination_indices(
 
 def combination_period(lengths: list[int], mode: str = "systematic", combination_count: int | None = None) -> int:
     """The effective number of distinct combinations to cycle through for
-    ``episode_targets == "all"`` -- ``episode_index % combination_period(...)`` is what
-    ``session.py`` actually feeds as ``combination_i`` into ``resolve_combination_indices``.
+    ``position_mode == "sweep"`` -- ``episode_index % combination_period(...)`` is what
+    ``resolve_unit_indices`` actually feeds as ``combination_i`` into
+    ``resolve_combination_indices``.
 
     ``"cartesian"``/``"lcm"`` derive their own NATURAL period (the product, or the LCM, of
     every object's own length) when ``combination_count`` is unset -- the whole convenience of
@@ -2004,11 +2005,130 @@ def combination_period(lengths: list[int], mode: str = "systematic", combination
     return combination_count
 
 
+def resolve_unit_indices(
+    episode_index: int,
+    lengths: list[int],
+    mode: str = "lockstep",
+    combination_count: int | None = None,
+    seed: int = 0,
+) -> list[int]:
+    """``OverlayConfig.position_mode == "sweep"``: which point index each stack unit (or, in a
+    scene with no shared point-lists, each individual object -- see ``group_into_units``) shows
+    this episode. This is the single, unified visit-order axis that REPLACES both the old
+    per-object ``ObjectConfig.sequencing`` field (``"lockstep"``/``"shuffled"``) and the old
+    scene-level ``combination_*`` subsystem -- both were always the same underlying question
+    ("which of this thing's own assigned points to show") asked at two different scopes, so
+    keeping both was redundant rather than complementary. See CLAUDE.md.
+
+    ``"lockstep"``/``"shuffled"`` dispatch to ``sequence_index`` per unit (the unit's own index
+    into ``lengths`` is its ``object_ordinal``, ``len(lengths)`` is ``num_objects`` -- the same
+    decorrelation phase ``sequence_index`` already provides between units). ``seed`` is now one
+    shared SCENE-level seed rather than a per-object one -- losing that per-object override is a
+    deliberate, accepted tradeoff (see CLAUDE.md); it's a no-op for ``"lockstep"``, which never
+    even consults ``seed``/``object_ordinal``.
+
+    The remaining 5 joint modes (``"systematic"``/``"random"``/``"coprime"``/``"cartesian"``/
+    ``"lcm"``) dispatch to ``combination_period``/``resolve_combination_indices`` exactly as the
+    old scene-level combination subsystem did.
+
+    Back-compat guarantee: for an all-singleton-units scene (no two objects share an identical
+    point-list -- see ``group_into_units``) under the new default ``"lockstep"``, ``lengths``
+    and unit ordinals exactly match the old per-object ``sequence_index(..., "lockstep", ...)``
+    sweep, byte-for-byte."""
+    if mode in _SEQUENCING_MODES:
+        num_units = len(lengths)
+        return [
+            sequence_index(episode_index, length, mode, ordinal, num_units, seed)
+            for ordinal, length in enumerate(lengths)
+        ]
+    period = combination_period(lengths, mode, combination_count)
+    return resolve_combination_indices(episode_index % period, lengths, mode, period, seed)
+
+
+def group_into_units(object_point_lists: list[list[Point]], co_location: str = "stack") -> list[list[int]]:
+    """``OverlayConfig.position_mode == "sweep"``: groups object ordinals into atomic STACK
+    UNITS -- a maximal set of objects whose ENTIRE assigned point-list is identical (same
+    points, same order) -- so the unit can sweep its one shared point-list via
+    ``resolve_unit_indices`` and every member is always at the same point: a full stack, never
+    sliced. This fixes the originally-reported bug: under the old per-object independent sweep,
+    an authored stack (2+ objects assigned to the same point) only showed as a partial "slice"
+    whenever the objects' independently-decorrelated sweeps happened to coincide -- with no
+    operator control over it. See CLAUDE.md.
+
+    Objects that merely share SOME points, but not their entire list, deliberately stay in
+    separate units -- they're only ever shown together at full membership under
+    ``position_mode == "overlay"`` (see ``occupied_sites``), which is exactly why the two
+    position modes complement each other instead of overlapping.
+
+    ``co_location == "keep_apart"`` disables grouping entirely (every object is its own
+    singleton unit) -- keep_apart exists to SEPARATE co-located objects, so bonding
+    identical-point-list objects into one atomic unit would directly contradict it.
+
+    Units are returned in ascending order of their smallest member ordinal -- so a scene with
+    no shared point-lists produces one singleton unit per object, IN DECLARATION ORDER, which is
+    the degeneracy that makes ``position_mode == "sweep"`` byte-identical to the pre-unification
+    per-object sweep for every non-stack scene."""
+    n = len(object_point_lists)
+    if co_location == "keep_apart":
+        return [[i] for i in range(n)]
+    key_to_ordinals: dict[tuple[Point, ...], list[int]] = {}
+    for ordinal, points in enumerate(object_point_lists):
+        key_to_ordinals.setdefault(tuple(points), []).append(ordinal)
+    units = list(key_to_ordinals.values())
+    units.sort(key=lambda unit: unit[0])
+    return units
+
+
+_SITE_SELECTIONS = {"all", "subset"}
+_SITE_ORDERS_IMPLEMENTED = {"round_robin", "random"}
+
+
+def select_sites(
+    num_sites: int,
+    selection: str,
+    count: int | None,
+    order: str,
+    seed: int,
+    episode_index: int,
+) -> list[int]:
+    """``OverlayConfig.site_selection``: which of ``num_sites`` occupied sites (indices ``0``..
+    ``num_sites - 1``, in whatever stable order the caller built them) to actually show this
+    episode -- orthogonal to ``position_mode`` (which decides what the sites/their positions
+    ARE in the first place). Returns a sorted list of distinct site indices.
+
+    ``"all"``: every site, every episode -- today's exact ``episode_targets: "all"`` behavior
+    when combined with ``position_mode == "sweep"``.
+
+    ``"subset"`` (``k = min(count, num_sites)``):
+
+    - ``"round_robin"``: a sliding window of ``k`` sites advancing by ``k`` each episode --
+      ``sorted((episode_index * k + j) % num_sites for j in range(k))``. ``k == 1`` reduces to
+      ``episode_index % num_sites``, exactly the old ``episode_targets: "one"`` rotation (now
+      the alias for ``position_mode="overlay", site_selection="subset", site_count=1``).
+    - ``"random"``: a seeded subset via ``_seeded_permutation(num_sites, _combine_seed(seed,
+      episode_index))[:k]``, sorted for a stable render order.
+
+    Reserved for later (gated in ``config.py``, never reached here): ``"systematic"``,
+    ``"coprime"`` site orders -- see CLAUDE.md."""
+    if selection == "all":
+        return list(range(num_sites))
+    if selection != "subset":
+        raise ValueError(f"Unknown site_selection: {selection!r} (allowed: {sorted(_SITE_SELECTIONS)})")
+    if num_sites == 0:
+        return []
+    k = min(count, num_sites) if count is not None else num_sites
+    if order == "round_robin":
+        return sorted((episode_index * k + j) % num_sites for j in range(k))
+    if order == "random":
+        return sorted(_seeded_permutation(num_sites, _combine_seed(seed, episode_index))[:k])
+    raise ValueError(f"Unknown site_order: {order!r} (allowed: {sorted(_SITE_ORDERS_IMPLEMENTED)})")
+
+
 def occupied_sites(object_points: list[list[Point]]) -> list[tuple[Point, list[int]]]:
-    """``OverlayConfig.episode_targets == "one"``: every distinct point at least one object is
+    """``OverlayConfig.position_mode == "overlay"``: every distinct point at least one object is
     assigned to, across ALL of that object's own pattern points (``object_points[ordinal]`` is
     that object's full, static ``points`` pattern) -- grouped by exact coordinate, the same
-    equality the "all"-mode coincidence grouping already uses. Each entry's second element is
+    equality the "sweep"-mode coincidence grouping already uses. Each entry's second element is
     every object's ordinal (index into ``object_points``, i.e. declaration order) that has
     this exact point anywhere in its own pattern -- 2+ ordinals at one site mean those objects
     are a REAL, GUARANTEED stack there: assignment to the same point now IS co-location, full
@@ -2114,6 +2234,195 @@ def level_order(stack_size: int, episode_index: int, strategy: str = "fixed", se
         base = _seeded_permutation(stack_size, seed)
         return [base[(i + episode_index) % stack_size] for i in range(stack_size)]
     raise ValueError(f"Unknown level strategy: {strategy!r} (allowed: {sorted(_LEVEL_STRATEGIES)})")
+
+
+# ===== Scene-level orchestrator (config.py's per_episode/combinations/order/stacking/level) =====
+#
+# Everything above this point is an existing, independently-tested building block
+# (group_into_units/resolve_unit_indices/occupied_sites/select_sites/resolve_keep_apart/
+# level_order). `episode_placements` is the single function that wires them into the two
+# headline scene shapes the redesigned config exposes -- see CLAUDE.md for the full rationale
+# (the "what Rerun actually shows is just {point, object, color, level} per episode" model) and
+# the worked period table. The 7 underlying `pattern.py` modes this dispatches into
+# (lockstep/shuffled/systematic/random/coprime/cartesian/lcm) are unchanged.
+_COMBINATIONS_KEYWORD_TO_MODE = {"synced": "lockstep", "shuffled": "shuffled", "all": "cartesian"}
+_ORDER_TO_COMBINATION_MODE = {"even": "systematic", "random": "random", "coprime": "coprime"}
+_ORDER_TO_SITE_ORDER = {"even": "round_robin", "random": "random"}
+
+# A single user-facing `seed` drives three structurally different randomized aspects
+# (combinations/level/site selection); salting each with a distinct constant before passing it
+# on avoids them silently correlating (e.g. "combinations: shuffled" + "level: shuffle" landing
+# on suspiciously similar-looking draws) without asking the user to manage three seeds.
+_SEED_SALT_COMBINATIONS = 0
+_SEED_SALT_LEVEL = 1
+_SEED_SALT_SITES = 2
+
+
+def _exploded_sites(object_points: list[list[Point]]) -> list[tuple[Point, list[int]]]:
+    """Like ``occupied_sites``, but NEVER merges two objects' points sharing the same exact
+    coordinate into one site -- every ``(object, point)`` pair is its own, permanently
+    un-stacked site. This is what makes ``stacking="keep_apart"`` under a static
+    ``per_episode=<int>`` mean "cycle through every individual point, one at a time" rather
+    than "cycle through stacks" (``occupied_sites``, used for ``stacking="stack"``). Ordered by
+    declaration (object ordinal, then that object's own point order), matching
+    ``occupied_sites``'s tie-break exactly, for a stable, predictable rotation."""
+    return [(point, [ordinal]) for ordinal, points in enumerate(object_points) for point in points]
+
+
+def _placements_from_sites(
+    sites: list[tuple[Point, list[int]]],
+    episode_index: int,
+    level: str,
+    seed: int,
+    point_lists: list[list[Point]],
+    visit_number_fn: Callable[[int], int],
+) -> dict[int, list[tuple[Point, int, int, int]]]:
+    """Shared by both ``episode_placements`` branches: turns a list of this-episode sites
+    (``(point, member_ordinals)``) into ``{ordinal: [(point, level, stack_size,
+    visit_number), ...]}``, computing each site's z-order via ``level_order`` only when 2+
+    objects actually share it."""
+    placements: dict[int, list[tuple[Point, int, int, int]]] = {}
+    for site_point, member_ordinals in sites:
+        stack_size = len(member_ordinals)
+        levels = (
+            level_order(stack_size, episode_index, level, _combine_seed(seed, _SEED_SALT_LEVEL))
+            if stack_size > 1 else None
+        )
+        for slot, ordinal in enumerate(member_ordinals):
+            lvl = levels[slot] if levels is not None else 0
+            placements.setdefault(ordinal, []).append(
+                (site_point, lvl, stack_size, visit_number_fn(ordinal))
+            )
+    return placements
+
+
+def _episode_placements_sweep(
+    point_lists: list[list[Point]],
+    episode_index: int,
+    combinations: str | int,
+    order: str,
+    stacking: str,
+    level: str,
+    seed: int,
+) -> tuple[dict[int, list[tuple[Point, int, int, int]]], list[int]]:
+    """``per_episode="all"``: every object's own position advances every episode -- the DYNAMIC
+    sweep. Objects whose entire point-list is identical are grouped into one atomic stack unit
+    first (``group_into_units``) so a stack is always shown full, never sliced;
+    ``stacking="keep_apart"`` additionally nudges any cross-unit coincidence apart
+    (``resolve_keep_apart``) instead of letting it pile into a stack."""
+    units = group_into_units(point_lists, stacking)
+    unit_lengths = [len(point_lists[unit[0]]) for unit in units]
+    mode = _COMBINATIONS_KEYWORD_TO_MODE.get(combinations)
+    combination_count = None
+    if mode is None:
+        mode = _ORDER_TO_COMBINATION_MODE[order]
+        combination_count = combinations
+    unit_indices = resolve_unit_indices(
+        episode_index, unit_lengths, mode, combination_count,
+        _combine_seed(seed, _SEED_SALT_COMBINATIONS),
+    )
+    natural_indices: list[int | None] = [None] * len(point_lists)
+    for unit, idx in zip(units, unit_indices):
+        for ordinal in unit:
+            natural_indices[ordinal] = idx
+
+    residual: list[int] = []
+    if stacking == "keep_apart":
+        assigned_lists = [list(range(len(pl))) for pl in point_lists]
+        resolved_indices, residual = resolve_keep_apart(natural_indices, assigned_lists, episode_index)
+    else:
+        resolved_indices = natural_indices
+
+    groups: dict[Point, list[int]] = {}
+    for ordinal, idx in enumerate(resolved_indices):
+        groups.setdefault(point_lists[ordinal][idx], []).append(ordinal)
+    sites = list(groups.items())
+
+    placements = _placements_from_sites(
+        sites, episode_index, level, seed, point_lists,
+        visit_number_fn=lambda ordinal: episode_index // len(point_lists[ordinal]),
+    )
+    return placements, residual
+
+
+def _episode_placements_static(
+    point_lists: list[list[Point]],
+    episode_index: int,
+    per_episode: int | str,
+    order: str,
+    stacking: str,
+    level: str,
+    seed: int,
+) -> dict[int, list[tuple[Point, int, int, int]]]:
+    """``per_episode="static"`` or ``per_episode=<int>``: no sweep at all -- every point any
+    object is assigned to is a fixed, permanent site (``stacking="stack"``: objects sharing an
+    exact point are ALWAYS one site, via ``occupied_sites``; ``stacking="keep_apart"``: every
+    individual point is its own site, via ``_exploded_sites``). ``"static"`` shows every one of
+    those fixed sites, every episode, with no rotation at all (the degenerate "k == every site"
+    case -- useful when the count of sites isn't known/stable up front, e.g. it depends on
+    `exclude_zones` or how many objects exist). ``<int>`` instead shows exactly that many of
+    them per episode, chosen by ``order`` (``select_sites``) -- this is what makes "cycle
+    through every point one at a time" exact and literal under ``keep_apart``, vs. "one full
+    stack per episode" under ``stack``."""
+    sites = occupied_sites(point_lists) if stacking == "stack" else _exploded_sites(point_lists)
+    if not sites:
+        return {}
+    num_sites = len(sites)
+    if per_episode == "static":
+        selected_sites = sites
+    else:
+        site_order = _ORDER_TO_SITE_ORDER.get(order)
+        if site_order is None:
+            raise ValueError(
+                f"order={order!r} is not valid for a static per_episode selection "
+                f"(allowed: {sorted(_ORDER_TO_SITE_ORDER)})"
+            )
+        selected_idx = select_sites(
+            num_sites, "subset", per_episode, site_order, _combine_seed(seed, _SEED_SALT_SITES), episode_index,
+        )
+        selected_sites = [sites[i] for i in selected_idx]
+    return _placements_from_sites(
+        selected_sites, episode_index, level, seed, point_lists,
+        visit_number_fn=lambda ordinal: episode_index // num_sites,
+    )
+
+
+def episode_placements(
+    point_lists: list[list[Point]],
+    episode_index: int,
+    per_episode: int | str,
+    combinations: str | int,
+    order: str,
+    stacking: str,
+    level: str,
+    seed: int,
+) -> tuple[dict[int, list[tuple[Point, int, int, int]]], list[int]]:
+    """The single orchestrator behind the whole multi-object scene model -- see CLAUDE.md.
+    Returns ``(placements_per_ordinal, residual_collision_ordinals)``:
+
+    - ``placements_per_ordinal[ordinal]`` is a list of ``(point, level, stack_size,
+      visit_number)`` -- one entry per site this episode that object ``ordinal`` belongs to
+      (almost always exactly one; an absent object has no entry at all; an object can belong to
+      2+ simultaneous sites only under a static ``per_episode`` with ``stacking="stack"``, when
+      2+ of that object's own unshared points are both selected this episode).
+    - ``residual_collision_ordinals`` is only ever non-empty for ``per_episode="all"`` with
+      ``stacking="keep_apart"``, when an object's own points are all taken and it has to
+      co-occupy anyway -- callers should log this as a warning.
+
+    ``per_episode="all"`` dispatches to ``_episode_placements_sweep`` (DYNAMIC: every object's
+    position advances every episode). ``per_episode="static"`` or ``<positive int>`` dispatches
+    to ``_episode_placements_static`` (STATIC: a fixed set of sites -- every one of them, or
+    exactly ``per_episode`` of them, shown per episode) -- no residual collisions are possible
+    there (no per-episode coincidence is ever resolved at request, since "stack" vs.
+    "keep_apart" instead picks how the fixed sites themselves are built)."""
+    if per_episode == "all":
+        return _episode_placements_sweep(point_lists, episode_index, combinations, order, stacking, level, seed)
+    if per_episode != "static" and (
+        not isinstance(per_episode, int) or isinstance(per_episode, bool) or per_episode < 1
+    ):
+        raise ValueError(f"per_episode must be 'all', 'static', or a positive integer, got {per_episode!r}")
+    placements = _episode_placements_static(point_lists, episode_index, per_episode, order, stacking, level, seed)
+    return placements, []
 
 
 def generate_rotation_angles(

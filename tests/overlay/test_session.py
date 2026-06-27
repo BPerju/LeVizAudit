@@ -49,19 +49,9 @@ def _run(config: OverlayConfig, finished_episode_indices: list):
     return calls
 
 
-def test_no_variable_objects_does_nothing():
-    config = OverlayConfig(
-        camera_key=CAMERA_KEY,
-        objects=[ObjectConfig(name="fixed", count=1, variable=False, pattern=None, marker=MarkerConfig())],
-        marker=MarkerConfig(),
-    )
-    calls = _run(config, [])
-    assert calls == []
-
-
 def test_default_knobs_reproduce_lockstep_position_cycling():
     points = [(10.0, 10.0), (20.0, 20.0), (30.0, 30.0)]
-    obj = ObjectConfig(name="cube", count=3, variable=True, pattern=_points_pattern(points), marker=MarkerConfig())
+    obj = ObjectConfig(name="cube", count=3, pattern=_points_pattern(points), marker=MarkerConfig())
     config = OverlayConfig(camera_key=CAMERA_KEY, objects=[obj], marker=MarkerConfig())
 
     calls = _run(config, [0, 1, 2, 3])  # episodes 0,1,2,3,4
@@ -76,16 +66,11 @@ def test_default_knobs_reproduce_lockstep_position_cycling():
 
 
 def test_stack_forms_when_objects_share_a_point_and_assigns_levels():
-    # Stacking is no longer an authored, separate config block -- it's derived directly from
-    # 2+ objects' own `pattern: {shape: points}` lists sharing a literal coordinate, with
-    # config.level_strategy/level_seed (scene-level) deciding z-order. Default co_location is
-    # "stack" (today's behavior).
-    point_a = ObjectConfig(
-        name="A", count=1, variable=True, pattern=_points_pattern([(50.0, 50.0)]), marker=MarkerConfig(),
-    )
-    point_b = ObjectConfig(
-        name="B", count=1, variable=True, pattern=_points_pattern([(50.0, 50.0)]), marker=MarkerConfig(),
-    )
+    # Stacking is derived directly from 2+ objects' own `pattern: {shape: points}` lists
+    # sharing a literal coordinate, with config.level/seed (scene-level) deciding z-order.
+    # Default stacking is "stack" (today's behavior).
+    point_a = ObjectConfig(name="A", count=1, pattern=_points_pattern([(50.0, 50.0)]), marker=MarkerConfig())
+    point_b = ObjectConfig(name="B", count=1, pattern=_points_pattern([(50.0, 50.0)]), marker=MarkerConfig())
     config = OverlayConfig(camera_key=CAMERA_KEY, objects=[point_a, point_b], marker=MarkerConfig())
 
     calls = _run(config, [])  # just episode 0
@@ -94,21 +79,17 @@ def test_stack_forms_when_objects_share_a_point_and_assigns_levels():
     assert log_calls["B"][1][1] == (50.0, 50.0)
     assert log_calls["A"][2]["stack_size"] == 2
     assert log_calls["B"][2]["stack_size"] == 2
-    # "fixed" (default) level strategy + declaration order: A (declared first) is level 0.
+    # "fixed" (default) level + declaration order: A (declared first) is level 0.
     assert log_calls["A"][2]["level"] == 0
     assert log_calls["B"][2]["level"] == 1
 
 
-def test_scene_level_balanced_level_strategy_changes_across_episodes():
-    point_a = ObjectConfig(
-        name="A", count=1, variable=True, pattern=_points_pattern([(50.0, 50.0)]), marker=MarkerConfig(),
-    )
-    point_b = ObjectConfig(
-        name="B", count=1, variable=True, pattern=_points_pattern([(50.0, 50.0)]), marker=MarkerConfig(),
-    )
+def test_scene_level_balanced_level_changes_across_episodes():
+    point_a = ObjectConfig(name="A", count=1, pattern=_points_pattern([(50.0, 50.0)]), marker=MarkerConfig())
+    point_b = ObjectConfig(name="B", count=1, pattern=_points_pattern([(50.0, 50.0)]), marker=MarkerConfig())
     config = OverlayConfig(
         camera_key=CAMERA_KEY, objects=[point_a, point_b], marker=MarkerConfig(),
-        level_strategy="balanced", level_seed=3,
+        level="balanced", seed=3,
     )
 
     calls = _run(config, [0])  # episodes 0, 1
@@ -125,12 +106,9 @@ def test_scene_level_balanced_level_strategy_changes_across_episodes():
 def test_emergent_stack_forms_when_independent_patterns_coincide():
     # A always sits at (10, 10) (length-1 pattern). B alternates (99, 99)/(10, 10) lockstep --
     # so episode 0 has no coincidence (stack_size 1 each), episode 1 does (stack_size 2 each).
-    obj_a = ObjectConfig(
-        name="A", count=1, variable=True, pattern=_points_pattern([(10.0, 10.0)]), marker=MarkerConfig(),
-    )
+    obj_a = ObjectConfig(name="A", count=1, pattern=_points_pattern([(10.0, 10.0)]), marker=MarkerConfig())
     obj_b = ObjectConfig(
-        name="B", count=2, variable=True,
-        pattern=_points_pattern([(99.0, 99.0), (10.0, 10.0)]), marker=MarkerConfig(),
+        name="B", count=2, pattern=_points_pattern([(99.0, 99.0), (10.0, 10.0)]), marker=MarkerConfig(),
     )
     config = OverlayConfig(camera_key=CAMERA_KEY, objects=[obj_a, obj_b], marker=MarkerConfig())
 
@@ -142,7 +120,7 @@ def test_emergent_stack_forms_when_independent_patterns_coincide():
     assert by_episode_and_name[(0, "B")][2]["stack_size"] == 1
     assert by_episode_and_name[(1, "A")][2]["stack_size"] == 2
     assert by_episode_and_name[(1, "B")][2]["stack_size"] == 2
-    # Declaration order (A before B) decides level under the default "fixed" level_strategy.
+    # Declaration order (A before B) decides level under the default "fixed" level.
     assert by_episode_and_name[(1, "A")][2]["level"] == 0
     assert by_episode_and_name[(1, "B")][2]["level"] == 1
 
@@ -151,12 +129,10 @@ def test_stacked_object_orientation_cycles_every_episode():
     # A length-1 pattern naturally gives visit_number = episode_index // 1 == episode_index --
     # i.e. its orientation cycles every episode regardless of whether it's part of a stack.
     obj_a = ObjectConfig(
-        name="A", count=1, variable=True, pattern=_points_pattern([(50.0, 50.0)]), marker=MarkerConfig(),
+        name="A", count=1, pattern=_points_pattern([(50.0, 50.0)]), marker=MarkerConfig(),
         orientation=OrientationConfig(count=3, method="uniform"),
     )
-    obj_b = ObjectConfig(
-        name="B", count=1, variable=True, pattern=_points_pattern([(50.0, 50.0)]), marker=MarkerConfig(),
-    )
+    obj_b = ObjectConfig(name="B", count=1, pattern=_points_pattern([(50.0, 50.0)]), marker=MarkerConfig())
     config = OverlayConfig(camera_key=CAMERA_KEY, objects=[obj_a, obj_b], marker=MarkerConfig())
 
     calls = _run(config, [0, 1, 2])  # episodes 0..3
@@ -167,20 +143,18 @@ def test_stacked_object_orientation_cycles_every_episode():
     assert orientation_tips[0] == orientation_tips[3]
 
 
-def test_co_location_keep_apart_separates_objects_with_alternative_points():
+def test_stacking_keep_apart_separates_objects_with_alternative_points():
     # Both objects naturally want index 0 this episode (lockstep, same shape), but B has a
     # free alternative (index 1) in its own assigned list -- keep_apart should use it instead
     # of letting them coincide.
     obj_a = ObjectConfig(
-        name="A", count=2, variable=True,
-        pattern=_points_pattern([(0.0, 0.0), (1.0, 1.0)]), marker=MarkerConfig(),
+        name="A", count=2, pattern=_points_pattern([(0.0, 0.0), (1.0, 1.0)]), marker=MarkerConfig(),
     )
     obj_b = ObjectConfig(
-        name="B", count=2, variable=True,
-        pattern=_points_pattern([(0.0, 0.0), (2.0, 2.0)]), marker=MarkerConfig(),
+        name="B", count=2, pattern=_points_pattern([(0.0, 0.0), (2.0, 2.0)]), marker=MarkerConfig(),
     )
     config = OverlayConfig(
-        camera_key=CAMERA_KEY, objects=[obj_a, obj_b], marker=MarkerConfig(), co_location="keep_apart",
+        camera_key=CAMERA_KEY, objects=[obj_a, obj_b], marker=MarkerConfig(), stacking="keep_apart",
     )
 
     calls = _run(config, [])  # episode 0
@@ -191,18 +165,14 @@ def test_co_location_keep_apart_separates_objects_with_alternative_points():
     assert log_calls["B"][2]["stack_size"] == 1
 
 
-def test_co_location_keep_apart_residual_collision_falls_back_to_stack_and_warns(caplog):
+def test_stacking_keep_apart_residual_collision_falls_back_to_stack_and_warns(caplog):
     # Both objects have ONLY one shared point -- there's nowhere for either to go, so
     # keep_apart degrades to rendering them as a (visible, fanned) stack and logs a warning
     # rather than silently overlapping with no indication.
-    obj_a = ObjectConfig(
-        name="A", count=1, variable=True, pattern=_points_pattern([(5.0, 5.0)]), marker=MarkerConfig(),
-    )
-    obj_b = ObjectConfig(
-        name="B", count=1, variable=True, pattern=_points_pattern([(5.0, 5.0)]), marker=MarkerConfig(),
-    )
+    obj_a = ObjectConfig(name="A", count=1, pattern=_points_pattern([(5.0, 5.0)]), marker=MarkerConfig())
+    obj_b = ObjectConfig(name="B", count=1, pattern=_points_pattern([(5.0, 5.0)]), marker=MarkerConfig())
     config = OverlayConfig(
-        camera_key=CAMERA_KEY, objects=[obj_a, obj_b], marker=MarkerConfig(), co_location="keep_apart",
+        camera_key=CAMERA_KEY, objects=[obj_a, obj_b], marker=MarkerConfig(), stacking="keep_apart",
     )
 
     with caplog.at_level(logging.WARNING):
@@ -214,15 +184,11 @@ def test_co_location_keep_apart_residual_collision_falls_back_to_stack_and_warns
     assert any("B" in r.message for r in caplog.records)
 
 
-def test_co_location_keep_apart_disjoint_objects_unaffected():
-    obj_a = ObjectConfig(
-        name="A", count=1, variable=True, pattern=_points_pattern([(1.0, 1.0)]), marker=MarkerConfig(),
-    )
-    obj_b = ObjectConfig(
-        name="B", count=1, variable=True, pattern=_points_pattern([(2.0, 2.0)]), marker=MarkerConfig(),
-    )
+def test_stacking_keep_apart_disjoint_objects_unaffected():
+    obj_a = ObjectConfig(name="A", count=1, pattern=_points_pattern([(1.0, 1.0)]), marker=MarkerConfig())
+    obj_b = ObjectConfig(name="B", count=1, pattern=_points_pattern([(2.0, 2.0)]), marker=MarkerConfig())
     config = OverlayConfig(
-        camera_key=CAMERA_KEY, objects=[obj_a, obj_b], marker=MarkerConfig(), co_location="keep_apart",
+        camera_key=CAMERA_KEY, objects=[obj_a, obj_b], marker=MarkerConfig(), stacking="keep_apart",
     )
 
     calls = _run(config, [])
@@ -233,14 +199,12 @@ def test_co_location_keep_apart_disjoint_objects_unaffected():
     assert log_calls["B"][2]["stack_size"] == 1
 
 
-def test_episode_targets_one_rotates_independent_objects_round_robin():
+def test_per_episode_one_rotates_independent_objects_round_robin():
     # A and B never coincide -- every episode has 2 singleton sites, declaration order [A, B].
-    # Under episode_targets="one" exactly one site is shown per episode, alternating.
-    obj_a = ObjectConfig(name="A", count=1, variable=True, pattern=_points_pattern([(1.0, 1.0)]), marker=MarkerConfig())
-    obj_b = ObjectConfig(name="B", count=1, variable=True, pattern=_points_pattern([(2.0, 2.0)]), marker=MarkerConfig())
-    config = OverlayConfig(
-        camera_key=CAMERA_KEY, objects=[obj_a, obj_b], marker=MarkerConfig(), episode_targets="one",
-    )
+    # Under per_episode=1 exactly one site is shown per episode, alternating.
+    obj_a = ObjectConfig(name="A", count=1, pattern=_points_pattern([(1.0, 1.0)]), marker=MarkerConfig())
+    obj_b = ObjectConfig(name="B", count=1, pattern=_points_pattern([(2.0, 2.0)]), marker=MarkerConfig())
+    config = OverlayConfig(camera_key=CAMERA_KEY, objects=[obj_a, obj_b], marker=MarkerConfig(), per_episode=1)
 
     calls = _run(config, [0, 1, 2])  # episodes 0,1,2,3
     by_episode = [calls[i * 2:i * 2 + 2] for i in range(4)]
@@ -256,18 +220,17 @@ def test_episode_targets_one_rotates_independent_objects_round_robin():
         assert kinds_by_name[other_name] == "clear_target"
 
 
-def test_episode_targets_one_keeps_a_permanent_stack_together_as_one_site():
+def test_per_episode_one_keeps_a_permanent_stack_together_as_one_site():
     # A/B/C all pinned to the same point, every episode -- always ONE site (declared first,
     # since A is ordinal 0); D is independent (its own site). Only one site is active per
     # episode, so the stack and the independent object alternate, never both at once.
     shared = [(50.0, 50.0)]
-    obj_a = ObjectConfig(name="A", count=1, variable=True, pattern=_points_pattern(shared), marker=MarkerConfig())
-    obj_b = ObjectConfig(name="B", count=1, variable=True, pattern=_points_pattern(shared), marker=MarkerConfig())
-    obj_c = ObjectConfig(name="C", count=1, variable=True, pattern=_points_pattern(shared), marker=MarkerConfig())
-    obj_d = ObjectConfig(name="D", count=1, variable=True, pattern=_points_pattern([(99.0, 99.0)]), marker=MarkerConfig())
+    obj_a = ObjectConfig(name="A", count=1, pattern=_points_pattern(shared), marker=MarkerConfig())
+    obj_b = ObjectConfig(name="B", count=1, pattern=_points_pattern(shared), marker=MarkerConfig())
+    obj_c = ObjectConfig(name="C", count=1, pattern=_points_pattern(shared), marker=MarkerConfig())
+    obj_d = ObjectConfig(name="D", count=1, pattern=_points_pattern([(99.0, 99.0)]), marker=MarkerConfig())
     config = OverlayConfig(
-        camera_key=CAMERA_KEY, objects=[obj_a, obj_b, obj_c, obj_d], marker=MarkerConfig(),
-        episode_targets="one",
+        camera_key=CAMERA_KEY, objects=[obj_a, obj_b, obj_c, obj_d], marker=MarkerConfig(), per_episode=1,
     )
 
     calls = _run(config, [0])  # episodes 0, 1
@@ -287,10 +250,10 @@ def test_episode_targets_one_keeps_a_permanent_stack_together_as_one_site():
     assert by_kind_episode1["D"][2]["stack_size"] == 1
 
 
-def test_combination_count_unset_falls_back_to_lockstep_byte_for_byte():
-    # Default (no combination_count): identical to the pre-existing lockstep behavior.
+def test_combinations_unset_falls_back_to_synced_byte_for_byte():
+    # Default (no combinations override): identical to the pre-existing lockstep behavior.
     points = [(10.0, 10.0), (20.0, 20.0), (30.0, 30.0)]
-    obj = ObjectConfig(name="cube", count=3, variable=True, pattern=_points_pattern(points), marker=MarkerConfig())
+    obj = ObjectConfig(name="cube", count=3, pattern=_points_pattern(points), marker=MarkerConfig())
     config = OverlayConfig(camera_key=CAMERA_KEY, objects=[obj], marker=MarkerConfig())
 
     calls = _run(config, [0, 1, 2, 3])
@@ -299,12 +262,13 @@ def test_combination_count_unset_falls_back_to_lockstep_byte_for_byte():
     assert shown_points == [points[i % 3] for i in range(5)]
 
 
-def test_combination_count_decouples_combinations_from_pattern_length():
+def test_combinations_int_decouples_combination_count_from_pattern_length():
     # 3 objects, each with a 4-point pattern -- under plain lockstep this would cap the
     # distinct combination count at 4 (reported directly: "if i have 3 objects and 20 steps
-    # the combinations are limited to the nr of steps"). combination_count=10 decouples that:
-    # the resolved index per object must match pattern.combination_index directly, and the
-    # whole combination cycles with period 10 (episode 10 reproduces episode 0 exactly).
+    # the combinations are limited to the nr of steps"). combinations=10 (order="even", the
+    # default) decouples that: the resolved index per object must match pattern.combination_index
+    # directly, and the whole combination cycles with period 10 (episode 10 reproduces episode
+    # 0 exactly).
     from vizaudit.overlay.pattern import combination_index
 
     points_per_object = [
@@ -313,10 +277,10 @@ def test_combination_count_decouples_combinations_from_pattern_length():
         [(20.0, 20.0), (21.0, 21.0), (22.0, 22.0), (23.0, 23.0)],
     ]
     objs = [
-        ObjectConfig(name=n, count=4, variable=True, pattern=_points_pattern(pts), marker=MarkerConfig())
+        ObjectConfig(name=n, count=4, pattern=_points_pattern(pts), marker=MarkerConfig())
         for n, pts in zip(["A", "B", "C"], points_per_object)
     ]
-    config = OverlayConfig(camera_key=CAMERA_KEY, objects=objs, marker=MarkerConfig(), combination_count=10)
+    config = OverlayConfig(camera_key=CAMERA_KEY, objects=objs, marker=MarkerConfig(), combinations=10)
 
     calls = _run(config, list(range(10)))  # episodes 0..10
     log_calls = [c for c in calls if c[0] == "log_target"]
@@ -326,16 +290,16 @@ def test_combination_count_decouples_combinations_from_pattern_length():
         for ordinal, name in enumerate(["A", "B", "C"]):
             expected_idx = combination_index(episode_index % 10, 4, ordinal, 10)
             assert by_name[name] == points_per_object[ordinal][expected_idx]
-    # Episode 10 reproduces episode 0 exactly -- period is combination_count, not 4.
+    # Episode 10 reproduces episode 0 exactly -- period is combinations, not 4.
     assert by_episode[10] == by_episode[0]
 
 
-def test_combination_count_oversampling_no_longer_stalls_on_consecutive_episodes():
-    # The reported bug: setting combination_count higher than an object's own pattern length
+def test_combinations_int_oversampling_no_longer_stalls_on_consecutive_episodes():
+    # The reported bug: setting combinations higher than an object's own pattern length
     # repeated the SAME point for several consecutive episodes instead of cycling.
     points = [(0.0, 0.0), (1.0, 1.0), (2.0, 2.0), (3.0, 3.0)]
-    obj = ObjectConfig(name="A", count=4, variable=True, pattern=_points_pattern(points), marker=MarkerConfig())
-    config = OverlayConfig(camera_key=CAMERA_KEY, objects=[obj], marker=MarkerConfig(), combination_count=20)
+    obj = ObjectConfig(name="A", count=4, pattern=_points_pattern(points), marker=MarkerConfig())
+    config = OverlayConfig(camera_key=CAMERA_KEY, objects=[obj], marker=MarkerConfig(), combinations=20)
 
     calls = _run(config, list(range(19)))  # episodes 0..19
     shown = [c[1][1] for c in calls if c[0] == "log_target"]
@@ -343,32 +307,34 @@ def test_combination_count_oversampling_no_longer_stalls_on_consecutive_episodes
         assert a != b, "consecutive episodes repeated the same point -- the stalling bug is back"
 
 
-def test_combination_mode_random_uses_full_joint_space_not_capped_by_one_length():
-    # 3 objects, all length 5 -- under "systematic"/"coprime" the JOINT combination space is
+def test_order_random_uses_full_joint_space_not_capped_by_one_length():
+    # 3 objects, all length 5 -- under order="even"/"coprime" the JOINT combination space is
     # mathematically capped at 5 (every object is a deterministic function of i mod 5). Random
-    # draws independently per object, so it can exceed that cap.
-    points_per_object = [[(float(i), float(i)) for i in range(5)] for _ in range(3)]
+    # draws independently per object, so it can exceed that cap. Each object's own 5 points are
+    # offset to a DISTINCT coordinate range -- if all 3 had the literal same point-list they'd
+    # collapse into one atomic stack unit (group_into_units) and always move together, which
+    # would defeat this test's whole premise (independent per-unit draws).
+    points_per_object = [[(float(i) + offset * 100, float(i)) for i in range(5)] for offset in range(3)]
     objs = [
-        ObjectConfig(name=n, count=5, variable=True, pattern=_points_pattern(pts), marker=MarkerConfig())
+        ObjectConfig(name=n, count=5, pattern=_points_pattern(pts), marker=MarkerConfig())
         for n, pts in zip(["A", "B", "C"], points_per_object)
     ]
     config = OverlayConfig(
         camera_key=CAMERA_KEY, objects=objs, marker=MarkerConfig(),
-        combination_count=60, combination_mode="random", combination_seed=7,
+        combinations=60, order="random", seed=7,
     )
     calls = _run(config, list(range(59)))
     log_calls = [c for c in calls if c[0] == "log_target"]
     by_episode = [log_calls[i * 3:i * 3 + 3] for i in range(60)]
     joint_tuples = {tuple(c[1][1] for c in episode_calls) for episode_calls in by_episode}
-    assert len(joint_tuples) > 5  # escapes the per-object cap that systematic/coprime can't
+    assert len(joint_tuples) > 5  # escapes the per-object cap that even/coprime can't
 
 
-def test_combination_mode_coprime_is_deterministic_and_capped_like_systematic():
+def test_order_coprime_is_deterministic_and_capped_like_even():
     points = [(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)]
-    obj = ObjectConfig(name="A", count=3, variable=True, pattern=_points_pattern(points), marker=MarkerConfig())
+    obj = ObjectConfig(name="A", count=3, pattern=_points_pattern(points), marker=MarkerConfig())
     config = OverlayConfig(
-        camera_key=CAMERA_KEY, objects=[obj], marker=MarkerConfig(),
-        combination_count=9, combination_mode="coprime",
+        camera_key=CAMERA_KEY, objects=[obj], marker=MarkerConfig(), combinations=9, order="coprime",
     )
     calls_a = _run(config, list(range(8)))
     calls_b = _run(config, list(range(8)))
@@ -377,16 +343,15 @@ def test_combination_mode_coprime_is_deterministic_and_capped_like_systematic():
     assert shown == set(points)  # still capped at this object's own 3 points
 
 
-def test_combination_mode_cartesian_escapes_the_per_object_cap_deterministically():
-    # 2 objects, length 3 each -- cartesian's natural period is the full product (9), every
-    # combination appearing exactly once, fully deterministically (no seed needed).
+def test_combinations_all_escapes_the_per_object_cap_deterministically():
+    # 2 objects, length 3 each -- combinations="all" (the full Cartesian product)'s natural
+    # period is the full product (9), every combination appearing exactly once, fully
+    # deterministically (no seed needed).
     points_a = [(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)]
     points_b = [(10.0, 10.0), (11.0, 11.0), (12.0, 12.0)]
-    obj_a = ObjectConfig(name="A", count=3, variable=True, pattern=_points_pattern(points_a), marker=MarkerConfig())
-    obj_b = ObjectConfig(name="B", count=3, variable=True, pattern=_points_pattern(points_b), marker=MarkerConfig())
-    config = OverlayConfig(
-        camera_key=CAMERA_KEY, objects=[obj_a, obj_b], marker=MarkerConfig(), combination_mode="cartesian",
-    )
+    obj_a = ObjectConfig(name="A", count=3, pattern=_points_pattern(points_a), marker=MarkerConfig())
+    obj_b = ObjectConfig(name="B", count=3, pattern=_points_pattern(points_b), marker=MarkerConfig())
+    config = OverlayConfig(camera_key=CAMERA_KEY, objects=[obj_a, obj_b], marker=MarkerConfig(), combinations="all")
 
     calls = _run(config, list(range(8)))  # episodes 0..8, natural period is 3*3=9
     log_calls = [c for c in calls if c[0] == "log_target"]
@@ -400,16 +365,16 @@ def test_combination_mode_cartesian_escapes_the_per_object_cap_deterministically
     assert by_episode_extended[9] == by_episode_extended[0]
 
 
-def test_combination_mode_lcm_runs_exactly_lcm_episodes_with_no_phase():
-    # Lengths 4 and 6 -- lcm(4, 6) = 12, NOT max(4, 6) = 6 (what plain lockstep alone would
-    # naturally repeat at) and NOT 4*6 = 24 (the full cartesian product).
+def test_combinations_synced_default_runs_exactly_lcm_episodes_with_no_phase():
+    # Lengths 4 and 6 -- the default ("synced", today's lockstep) naturally repeats only after
+    # lcm(4, 6) = 12 episodes, NOT max(4, 6) = 6 (what a shared period would naively suggest)
+    # and NOT 4*6 = 24 (the full cartesian product) -- no explicit `combinations` setting
+    # needed at all, since plain per-unit modulo cycling already has this property.
     points_a = [(float(i), 0.0) for i in range(4)]
     points_b = [(0.0, float(i)) for i in range(6)]
-    obj_a = ObjectConfig(name="A", count=4, variable=True, pattern=_points_pattern(points_a), marker=MarkerConfig())
-    obj_b = ObjectConfig(name="B", count=6, variable=True, pattern=_points_pattern(points_b), marker=MarkerConfig())
-    config = OverlayConfig(
-        camera_key=CAMERA_KEY, objects=[obj_a, obj_b], marker=MarkerConfig(), combination_mode="lcm",
-    )
+    obj_a = ObjectConfig(name="A", count=4, pattern=_points_pattern(points_a), marker=MarkerConfig())
+    obj_b = ObjectConfig(name="B", count=6, pattern=_points_pattern(points_b), marker=MarkerConfig())
+    config = OverlayConfig(camera_key=CAMERA_KEY, objects=[obj_a, obj_b], marker=MarkerConfig())
 
     calls = _run(config, list(range(12)))  # episodes 0..12
     log_calls = [c for c in calls if c[0] == "log_target"]
@@ -423,19 +388,101 @@ def test_combination_mode_lcm_runs_exactly_lcm_episodes_with_no_phase():
     assert by_episode[12] == by_episode[0]  # repeats only after the full lcm period
 
 
-def test_episode_targets_one_iterates_every_one_of_an_objects_own_points_as_separate_sites():
-    # Under episode_targets="one", sites are the STATIC union of every object's own assigned
-    # points (pattern.occupied_sites), not a per-episode sweep -- an object with several
-    # assigned points gets one dedicated turn per point, not a single "active turn" that
-    # sweeps across them. A has 3 own points (none shared with B), B has 1 -- so there are 4
-    # static sites total, visited round-robin in declaration order: A's 3 points (in their own
-    # list order), then B's 1 point.
-    points_a = [(0.0, 0.0), (10.0, 10.0), (20.0, 20.0)]
-    obj_a = ObjectConfig(name="A", count=3, variable=True, pattern=_points_pattern(points_a), marker=MarkerConfig())
-    obj_b = ObjectConfig(name="B", count=1, variable=True, pattern=_points_pattern([(1.0, 1.0)]), marker=MarkerConfig())
+# ===== per_episode "all"/"static"/<int> -- atomic stacks / static enumeration / subset =====
+
+
+def test_sweep_authored_stack_never_slices_even_under_shuffled_combinations():
+    # THE originally-reported bug: under the old per-object independent sweep, an authored
+    # stack (2+ objects assigned to the identical point) only showed FULLY whenever their
+    # independently-decorrelated sweeps happened to coincide -- with "shuffled" actively
+    # decorrelating them, most episodes showed a partial "slice" instead. Now, identical
+    # point-lists are grouped into one atomic unit (group_into_units) BEFORE any visit-order
+    # axis runs, so the stack is full on every single episode, regardless of `combinations`.
+    shared = [(10.0, 10.0), (20.0, 20.0), (30.0, 30.0)]
+    obj_a = ObjectConfig(name="A", count=3, pattern=_points_pattern(shared), marker=MarkerConfig())
+    obj_b = ObjectConfig(name="B", count=3, pattern=_points_pattern(shared), marker=MarkerConfig())
     config = OverlayConfig(
-        camera_key=CAMERA_KEY, objects=[obj_a, obj_b], marker=MarkerConfig(), episode_targets="one",
+        camera_key=CAMERA_KEY, objects=[obj_a, obj_b], marker=MarkerConfig(),
+        combinations="shuffled", seed=42,
     )
+
+    calls = _run(config, list(range(9)))  # episodes 0..9
+    log_calls = [c for c in calls if c[0] == "log_target"]
+    by_episode = [log_calls[i * 2:i * 2 + 2] for i in range(10)]
+    points_visited_by_a = set()
+    for episode_calls in by_episode:
+        by_name = {c[1][2]: c for c in episode_calls}
+        assert by_name["A"][1][1] == by_name["B"][1][1]  # always at the same point
+        assert by_name["A"][2]["stack_size"] == 2  # always a full stack, never sliced
+        assert by_name["B"][2]["stack_size"] == 2
+        assert by_name["A"][1][1] in shared  # the unit still genuinely sweeps its 3 points
+        points_visited_by_a.add(by_name["A"][1][1])
+    # The unit (not each object independently) sweeps -- both visit all 3 shared points.
+    assert points_visited_by_a == set(shared)
+
+
+def test_sweep_disjoint_objects_unaffected_by_combinations_choice():
+    # Objects with no shared point-list are untouched by the unit-grouping change -- each stays
+    # its own singleton unit and sweeps independently, same as before.
+    points_a = [(0.0, 0.0), (1.0, 1.0)]
+    points_b = [(9.0, 9.0), (8.0, 8.0)]
+    obj_a = ObjectConfig(name="A", count=2, pattern=_points_pattern(points_a), marker=MarkerConfig())
+    obj_b = ObjectConfig(name="B", count=2, pattern=_points_pattern(points_b), marker=MarkerConfig())
+    config = OverlayConfig(camera_key=CAMERA_KEY, objects=[obj_a, obj_b], marker=MarkerConfig())
+
+    calls = _run(config, [0, 1, 2])
+    log_calls = [c for c in calls if c[0] == "log_target"]
+    by_episode = [log_calls[i * 2:i * 2 + 2] for i in range(4)]
+    for episode_index, episode_calls in enumerate(by_episode):
+        by_name = {c[1][2]: c[1][1] for c in episode_calls}
+        assert by_name["A"] == points_a[episode_index % 2]
+        assert by_name["B"] == points_b[episode_index % 2]
+
+
+def test_per_episode_static_shows_every_occupied_point_full_every_episode_with_no_sweep():
+    # per_episode="static": a single object's own multi-point pattern is shown FULLY (every
+    # point at once), not swept -- needs the rerun_client extra_placements mechanism, since one
+    # object now logs MULTIPLE simultaneous markers under a single log_target call.
+    points = [(1.0, 1.0), (2.0, 2.0), (3.0, 3.0)]
+    obj = ObjectConfig(name="A", count=3, pattern=_points_pattern(points), marker=MarkerConfig())
+    config = OverlayConfig(camera_key=CAMERA_KEY, objects=[obj], marker=MarkerConfig(), per_episode="static")
+
+    calls = _run(config, [0, 1])  # 3 episodes -- position should NOT change across them
+    log_calls = [c for c in calls if c[0] == "log_target"]
+    assert len(log_calls) == 3  # one log_target call per episode (all 3 points in ONE call)
+    for _kind, args, kwargs in log_calls:
+        assert args[1] == points[0]  # primary placement
+        extra = kwargs["extra_placements"]
+        assert [p for p, _, _, _ in extra] == points[1:]  # the other 2 points, same call
+        assert kwargs["stack_size"] == 1  # a lone object at each of its own points, no stacking
+
+
+def test_per_episode_static_stack_shows_full_membership_every_episode():
+    points_shared = [(50.0, 50.0)]
+    obj_a = ObjectConfig(name="A", count=1, pattern=_points_pattern(points_shared), marker=MarkerConfig())
+    obj_b = ObjectConfig(name="B", count=1, pattern=_points_pattern(points_shared), marker=MarkerConfig())
+    config = OverlayConfig(camera_key=CAMERA_KEY, objects=[obj_a, obj_b], marker=MarkerConfig(), per_episode="static")
+
+    calls = _run(config, [0, 1])  # episodes 0, 1, 2
+    log_calls = [c for c in calls if c[0] == "log_target"]
+    assert len(log_calls) == 6  # 2 objects x 3 episodes, both shown every time
+    for _kind, args, kwargs in log_calls:
+        assert args[1] == (50.0, 50.0)
+        assert kwargs["stack_size"] == 2
+        assert kwargs["extra_placements"] is None  # each object has only ONE occupied point
+
+
+def test_per_episode_int_iterates_every_one_of_an_objects_own_points_as_separate_sites():
+    # Under per_episode=1, sites are the STATIC union of every object's own assigned points
+    # (pattern.occupied_sites), not a per-episode sweep -- an object with several assigned
+    # points gets one dedicated turn per point, not a single "active turn" that sweeps across
+    # them. A has 3 own points (none shared with B), B has 1 -- so there are 4 static sites
+    # total, visited round-robin in declaration order: A's 3 points (in their own list order),
+    # then B's 1 point.
+    points_a = [(0.0, 0.0), (10.0, 10.0), (20.0, 20.0)]
+    obj_a = ObjectConfig(name="A", count=3, pattern=_points_pattern(points_a), marker=MarkerConfig())
+    obj_b = ObjectConfig(name="B", count=1, pattern=_points_pattern([(1.0, 1.0)]), marker=MarkerConfig())
+    config = OverlayConfig(camera_key=CAMERA_KEY, objects=[obj_a, obj_b], marker=MarkerConfig(), per_episode=1)
 
     calls = _run(config, [0, 1, 2, 3, 4, 5, 6])  # episodes 0..7 -- 2 full rotations of period 4
     log_calls = [c for c in calls if c[0] == "log_target"]
@@ -444,26 +491,23 @@ def test_episode_targets_one_iterates_every_one_of_an_objects_own_points_as_sepa
     assert shown == expected_cycle + expected_cycle
 
 
-def test_episode_targets_one_objects_sharing_any_point_in_their_own_list_always_stack_there():
-    # Assignment to the same point is now a GUARANTEED, permanent stack -- not a per-episode
-    # coincidence that only sometimes happens to line up (the previous, dynamic-coincidence
-    # design this replaced -- see CLAUDE.md). A and B share point (50,50) in their own pattern
-    # lists; A also has a private point (5,5), B also has a private point (99,99); C is fully
-    # independent. occupied_sites groups by exact coordinate across ALL of each object's own
-    # points (not just "this episode's swept position"), giving 4 static sites, ordered by the
-    # earliest (object_ordinal, point_index) that touches each: {A,B}@(50,50), {A}@(5,5),
-    # {B}@(99,99), {C}@(7,7).
+def test_per_episode_int_objects_sharing_any_point_in_their_own_list_always_stack_there():
+    # Assignment to the same point is a GUARANTEED, permanent stack -- not a per-episode
+    # coincidence that only sometimes happens to line up. A and B share point (50,50) in their
+    # own pattern lists; A also has a private point (5,5), B also has a private point (99,99);
+    # C is fully independent. occupied_sites groups by exact coordinate across ALL of each
+    # object's own points (not just "this episode's swept position"), giving 4 static sites,
+    # ordered by the earliest (object_ordinal, point_index) that touches each:
+    # {A,B}@(50,50), {A}@(5,5), {B}@(99,99), {C}@(7,7).
     obj_a = ObjectConfig(
-        name="A", count=2, variable=True,
-        pattern=_points_pattern([(50.0, 50.0), (5.0, 5.0)]), marker=MarkerConfig(),
+        name="A", count=2, pattern=_points_pattern([(50.0, 50.0), (5.0, 5.0)]), marker=MarkerConfig(),
     )
     obj_b = ObjectConfig(
-        name="B", count=2, variable=True,
-        pattern=_points_pattern([(50.0, 50.0), (99.0, 99.0)]), marker=MarkerConfig(),
+        name="B", count=2, pattern=_points_pattern([(50.0, 50.0), (99.0, 99.0)]), marker=MarkerConfig(),
     )
-    obj_c = ObjectConfig(name="C", count=1, variable=True, pattern=_points_pattern([(7.0, 7.0)]), marker=MarkerConfig())
+    obj_c = ObjectConfig(name="C", count=1, pattern=_points_pattern([(7.0, 7.0)]), marker=MarkerConfig())
     config = OverlayConfig(
-        camera_key=CAMERA_KEY, objects=[obj_a, obj_b, obj_c], marker=MarkerConfig(), episode_targets="one",
+        camera_key=CAMERA_KEY, objects=[obj_a, obj_b, obj_c], marker=MarkerConfig(), per_episode=1,
     )
 
     calls = _run(config, [0, 1, 2, 3])  # episodes 0..4 -- one full rotation of period 4, plus one
@@ -500,3 +544,21 @@ def test_episode_targets_one_objects_sharing_any_point_in_their_own_list_always_
     by_name_ep4 = {c[1][2]: c for c in calls[12:15] if c[0] == "log_target"}
     assert set(by_name_ep4) == {"A", "B"}
     assert by_name_ep4["A"][2]["stack_size"] == 2
+
+
+def test_combinations_shuffled_replaces_old_per_object_sequencing_shuffled():
+    # The old per-object `sequencing: "shuffled"` field is gone -- this is the new way to get
+    # the same decorrelated-visit-order behavior, now scene-wide via `combinations`.
+    points = [(float(i), float(i)) for i in range(6)]
+    obj = ObjectConfig(name="A", count=6, pattern=_points_pattern(points), marker=MarkerConfig())
+    config_synced = OverlayConfig(camera_key=CAMERA_KEY, objects=[obj], marker=MarkerConfig())
+    config_shuffled = OverlayConfig(
+        camera_key=CAMERA_KEY, objects=[obj], marker=MarkerConfig(),
+        combinations="shuffled", seed=4,
+    )
+
+    synced_shown = [c[1][1] for c in _run(config_synced, list(range(5))) if c[0] == "log_target"]
+    shuffled_shown = [c[1][1] for c in _run(config_shuffled, list(range(5))) if c[0] == "log_target"]
+    assert synced_shown == points  # plain i % 6
+    assert shuffled_shown != synced_shown
+    assert sorted(shuffled_shown) == sorted(points)  # still a permutation -- every point visited

@@ -17,7 +17,6 @@ objects:
   - name: cube
     count: 12          # number of episodes this object's pattern covers; wraps if the
                         # session runs longer
-    variable: true      # tracked -- a target marker is shown for this object each episode
     pattern:
       shape: arc                # arc | line | sector
       center: [320, 240]          # pixel xy, image center for a 640x480 camera
@@ -27,7 +26,6 @@ objects:
 
   - name: marble
     count: 20
-    variable: true
     pattern:
       shape: sector                  # filled pie-slice/annular-sector -- area-uniform random
                                        # sampling across the region, not just its boundary
@@ -53,12 +51,6 @@ objects:
       seed: 7                         # "random" method only
       arrow_length: 60                 # same space as this pattern's center/radius (canonical
                                          # here, since surface_calibration is set above)
-
-  - name: distractor_block
-    count: 1
-    variable: false    # not tracked -- no marker is ever drawn for this object; the
-                        # operator places it anywhere
-    pattern: null
 
 marker:
   radius_px: 10

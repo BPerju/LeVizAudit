@@ -8,19 +8,24 @@ from vizaudit.overlay.pattern import (
     build_pattern,
     combination_index,
     combination_period,
+    episode_placements,
     generate_arc_points,
     generate_line_points,
     generate_rotation_angles,
     generate_sector_points,
     generate_union_points,
+    group_into_units,
     level_order,
     occupied_sites,
     orientation_arrow_points,
     resolve_combination_indices,
     resolve_keep_apart,
+    resolve_unit_indices,
+    select_sites,
     sequence_index,
     target_for_episode,
 )
+from vizaudit.overlay.pattern import _exploded_sites
 from vizaudit.overlay.pattern import (
     _allocate_shares,
     _available_angle_intervals_at_radius,
@@ -1793,7 +1798,223 @@ def test_level_order_balanced_seeded_start_differs_from_cycle():
     assert balanced != cycle
 
 
+# ===== position_mode unification: group_into_units / resolve_unit_indices / select_sites =====
+
+
+def test_group_into_units_disjoint_objects_all_singletons():
+    units = group_into_units([[(0.0, 0.0)], [(1.0, 1.0)], [(2.0, 2.0)]])
+    assert units == [[0], [1], [2]]
+
+
+def test_group_into_units_identical_point_lists_form_one_unit():
+    shared = [(5.0, 5.0), (6.0, 6.0)]
+    units = group_into_units([shared, shared, [(9.0, 9.0)]])
+    assert sorted(units) == sorted([[0, 1], [2]])
+
+
+def test_group_into_units_partial_overlap_stays_separate():
+    # Sharing SOME but not ALL points must NOT bond into one unit -- that's what position_mode
+    # == "overlay" (occupied_sites) is for instead; the two position modes complement each
+    # other precisely because they don't overlap in scope.
+    a = [(1.0, 1.0), (2.0, 2.0)]
+    b = [(1.0, 1.0), (3.0, 3.0)]
+    units = group_into_units([a, b])
+    assert sorted(units) == [[0], [1]]
+
+
+def test_group_into_units_keep_apart_disables_grouping_even_for_identical_lists():
+    shared = [(5.0, 5.0)]
+    units = group_into_units([shared, shared], co_location="keep_apart")
+    assert units == [[0], [1]]
+
+
+def test_group_into_units_orders_by_smallest_member_ordinal():
+    shared = [(1.0, 1.0)]
+    other = [(2.0, 2.0)]
+    # Declared order: ordinal 0 (shared), ordinal 1 (other), ordinal 2 (shared again).
+    units = group_into_units([shared, other, shared])
+    assert units == [[0, 2], [1]]
+
+
+def test_resolve_unit_indices_lockstep_matches_sequence_index_for_singleton_units():
+    # Back-compat anchor: for all-singleton units, "lockstep" must be byte-identical to the old
+    # per-object sequence_index sweep, regardless of seed (lockstep never consults it).
+    lengths = [3, 4, 5]
+    for episode_index in range(10):
+        expected = [sequence_index(episode_index, length) for length in lengths]
+        assert resolve_unit_indices(episode_index, lengths, "lockstep") == expected
+
+
+def test_resolve_unit_indices_shuffled_matches_sequence_index_per_unit():
+    lengths = [4, 4, 4]
+    for episode_index in range(8):
+        expected = [
+            sequence_index(episode_index, length, "shuffled", ordinal, len(lengths), seed=9)
+            for ordinal, length in enumerate(lengths)
+        ]
+        assert resolve_unit_indices(episode_index, lengths, "shuffled", seed=9) == expected
+
+
+def test_resolve_unit_indices_lockstep_ignores_combination_count():
+    # lockstep/shuffled never consult combination_count -- it's the systematic/random/coprime/
+    # cartesian/lcm modes' own knob.
+    lengths = [4]
+    with_count = resolve_unit_indices(2, lengths, "lockstep", combination_count=99)
+    without_count = resolve_unit_indices(2, lengths, "lockstep", combination_count=None)
+    assert with_count == without_count == [2 % 4]
+
+
+def test_resolve_unit_indices_systematic_matches_resolve_combination_indices():
+    lengths = [4, 4, 4]
+    for episode_index in range(10):
+        period = combination_period(lengths, "systematic", combination_count=10)
+        expected = resolve_combination_indices(episode_index % period, lengths, "systematic", period, seed=0)
+        assert resolve_unit_indices(episode_index, lengths, "systematic", combination_count=10) == expected
+
+
+def test_resolve_unit_indices_cartesian_needs_no_combination_count():
+    lengths = [2, 3]
+    result = resolve_unit_indices(5, lengths, "cartesian")
+    assert all(0 <= idx < length for idx, length in zip(result, lengths))
+
+
+def test_select_sites_all_returns_every_index():
+    assert select_sites(5, "all", count=None, order="round_robin", seed=0, episode_index=3) == [0, 1, 2, 3, 4]
+
+
+def test_select_sites_subset_round_robin_k1_matches_old_episode_targets_one():
+    for episode_index in range(6):
+        assert select_sites(4, "subset", 1, "round_robin", 0, episode_index) == [episode_index % 4]
+
+
+def test_select_sites_subset_round_robin_k_greater_than_one_slides_window():
+    # k=2 over 6 sites: episode 0 -> {0,1}, episode 1 -> {2,3}, episode 2 -> {4,5}, episode 3 wraps.
+    assert select_sites(6, "subset", 2, "round_robin", 0, 0) == [0, 1]
+    assert select_sites(6, "subset", 2, "round_robin", 0, 1) == [2, 3]
+    assert select_sites(6, "subset", 2, "round_robin", 0, 2) == [4, 5]
+    assert select_sites(6, "subset", 2, "round_robin", 0, 3) == [0, 1]
+
+
+def test_select_sites_subset_count_capped_at_num_sites():
+    assert select_sites(3, "subset", 10, "round_robin", 0, 0) == [0, 1, 2]
+
+
+def test_select_sites_subset_random_deterministic_sorted_and_distinct():
+    a = select_sites(8, "subset", 3, "random", seed=5, episode_index=2)
+    b = select_sites(8, "subset", 3, "random", seed=5, episode_index=2)
+    assert a == b
+    assert a == sorted(a)
+    assert len(set(a)) == 3
+
+
+def test_select_sites_subset_random_varies_by_episode():
+    draws = {tuple(select_sites(10, "subset", 2, "random", seed=1, episode_index=e)) for e in range(10)}
+    assert len(draws) > 1
+
+
+def test_select_sites_empty_when_no_sites():
+    assert select_sites(0, "all", None, "round_robin", 0, 0) == []
+    assert select_sites(0, "subset", 1, "round_robin", 0, 0) == []
+
+
+def test_select_sites_unknown_selection_raises():
+    with pytest.raises(ValueError):
+        select_sites(5, "bogus", 1, "round_robin", 0, 0)
+
+
+def test_select_sites_unknown_order_raises():
+    with pytest.raises(ValueError):
+        select_sites(5, "subset", 1, "bogus", 0, 0)
+
+
 def test_build_pattern_dispatches_points_shape_returns_as_is():
     pts = [(1.0, 2.0), (3.0, 4.0), (5.0, 6.0)]
     cfg = PatternConfig(shape="points", points=pts)
     assert build_pattern(cfg, count=3) == pts
+
+
+# ===== episode_placements (the scene-level orchestrator) =====
+
+
+def test_exploded_sites_never_merges_shared_points():
+    point_lists = [[(0.0, 0.0), (1.0, 1.0)], [(0.0, 0.0)]]
+    sites = _exploded_sites(point_lists)
+    assert sites == [((0.0, 0.0), [0]), ((1.0, 1.0), [0]), ((0.0, 0.0), [1])]
+
+
+def test_episode_placements_all_default_matches_plain_lockstep():
+    points = [(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)]
+    placements, residual = episode_placements(
+        [points], episode_index=4, per_episode="all", combinations="synced",
+        order="even", stacking="stack", level="fixed", seed=0,
+    )
+    assert residual == []
+    assert placements[0] == [(points[4 % 3], 0, 1, 4 // 3)]
+
+
+def test_episode_placements_per_episode_one_stack_cycles_distinct_points():
+    # The user's primary case: 3 objects, one point each -- per_episode=1 cycles A, B, C, A...
+    point_lists = [[(0.0, 0.0)], [(1.0, 1.0)], [(2.0, 2.0)]]
+    shown = []
+    for episode in range(6):
+        placements, _ = episode_placements(
+            point_lists, episode, per_episode=1, combinations="synced",
+            order="even", stacking="stack", level="fixed", seed=0,
+        )
+        shown.append(sorted(placements.keys()))
+    assert shown == [[0], [1], [2], [0], [1], [2]]
+
+
+def test_episode_placements_per_episode_one_keep_apart_cycles_every_individual_point():
+    # 2 objects sharing one point ((5,5)) plus A's own private point -- stack mode would
+    # collapse the shared point into ONE site (2 episodes total: the stack, then A's private
+    # point); keep_apart instead treats every individual (object, point) pair as its own site
+    # (3 episodes total), per the user's explicit description of this mode.
+    point_lists = [[(5.0, 5.0), (9.0, 9.0)], [(5.0, 5.0)]]
+    stack_sites_per_episode = []
+    keep_apart_sites_per_episode = []
+    for episode in range(3):
+        stack_placements, _ = episode_placements(
+            point_lists, episode, per_episode=1, combinations="synced",
+            order="even", stacking="stack", level="fixed", seed=0,
+        )
+        keep_apart_placements, _ = episode_placements(
+            point_lists, episode, per_episode=1, combinations="synced",
+            order="even", stacking="keep_apart", level="fixed", seed=0,
+        )
+        stack_sites_per_episode.append(len(stack_placements))
+        keep_apart_sites_per_episode.append(sum(len(v) for v in keep_apart_placements.values()))
+    # Under "stack": only 2 distinct sites exist ({A,B}@(5,5), {A}@(9,9)) -- episode 2 just
+    # repeats episode 0. Under "keep_apart": 3 distinct (object, point) sites exist, one shown
+    # each of the 3 episodes, never merging the shared point into one stack.
+    assert sum(stack_sites_per_episode[:2]) == 2 + 1  # ep0: 2 objects shown; ep1: 1 object shown
+    assert keep_apart_sites_per_episode == [1, 1, 1]
+
+
+def test_episode_placements_static_shows_every_site_with_no_rotation():
+    points = [(1.0, 1.0), (2.0, 2.0), (3.0, 3.0)]
+    for episode in (0, 1, 5):
+        placements, residual = episode_placements(
+            [points], episode, per_episode="static", combinations="synced",
+            order="even", stacking="stack", level="fixed", seed=0,
+        )
+        assert residual == []
+        assert [p for p, _, _, _ in placements[0]] == points
+
+
+def test_episode_placements_keep_apart_under_all_reports_residual():
+    point_lists = [[(5.0, 5.0)], [(5.0, 5.0)]]
+    placements, residual = episode_placements(
+        point_lists, episode_index=0, per_episode="all", combinations="synced",
+        order="even", stacking="keep_apart", level="fixed", seed=0,
+    )
+    assert residual == [1]
+    assert placements[0][0][2] == 2  # stack_size -- degraded to a visible stack
+
+
+def test_episode_placements_invalid_per_episode_raises():
+    with pytest.raises(ValueError, match="per_episode"):
+        episode_placements(
+            [[(0.0, 0.0)]], 0, per_episode=0, combinations="synced",
+            order="even", stacking="stack", level="fixed", seed=0,
+        )

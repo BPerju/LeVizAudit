@@ -62,6 +62,55 @@ def test_log_target_no_orientation_call_when_tip_omitted():
         mock_rr.Arrows2D.assert_not_called()
 
 
+def test_log_target_extra_placements_logs_all_positions_in_one_call():
+    primary = (1.0, 1.0)
+    extra = [(2.0, 2.0), (3.0, 3.0)]
+    with patch("vizaudit.overlay.rerun_client.rr") as mock_rr:
+        log_target(
+            CAMERA_KEY, primary, "cube", MARKER,
+            extra_placements=[(extra[0], None, 0, 1), (extra[1], None, 0, 1)],
+        )
+        positions = mock_rr.Points2D.call_args.kwargs["positions"]
+        assert positions == [primary, extra[0], extra[1]]
+        mock_rr.log.assert_called_once()  # ONE entity, not 3 separate log calls
+
+
+def test_log_target_extra_placements_each_get_their_own_label_and_fan_offset():
+    with patch("vizaudit.overlay.rerun_client.rr") as mock_rr:
+        log_target(
+            CAMERA_KEY, (0.0, 0.0), "cube", MARKER, level=0, stack_size=2,
+            extra_placements=[((10.0, 10.0), None, 1, 2)],
+        )
+        kwargs = mock_rr.Points2D.call_args.kwargs
+        assert kwargs["labels"] == ["cube L0", "cube L1"]
+        assert kwargs["positions"][0] == _stack_offset_position((0.0, 0.0), 0, 2)
+        assert kwargs["positions"][1] == _stack_offset_position((10.0, 10.0), 1, 2)
+
+
+def test_log_target_extra_placements_orientation_arrows_skip_missing_tips():
+    with patch("vizaudit.overlay.rerun_client.rr") as mock_rr:
+        log_target(
+            CAMERA_KEY, (0.0, 0.0), "cube", MARKER, orientation_tip=(5.0, 0.0),
+            extra_placements=[((10.0, 10.0), None, 0, 1), ((20.0, 20.0), (25.0, 20.0), 0, 1)],
+        )
+        arrows_kwargs = mock_rr.Arrows2D.call_args.kwargs
+        # Only the 2 placements WITH a tip (primary + the third extra) get an arrow.
+        assert len(arrows_kwargs["origins"]) == 2
+        assert arrows_kwargs["vectors"] == [(5.0, 0.0), (5.0, 0.0)]
+
+
+def test_log_target_no_extra_placements_is_byte_for_byte_unchanged():
+    # The default (omitted extra_placements) call shape, byte-for-byte against a plain single
+    # placement -- confirms the multi-placement mechanism is a pure additive capability.
+    with patch("vizaudit.overlay.rerun_client.rr") as mock_rr1:
+        log_target(CAMERA_KEY, (1.0, 2.0), "cube", MARKER, level=1, stack_size=2)
+        kwargs1 = dict(mock_rr1.Points2D.call_args.kwargs)
+    with patch("vizaudit.overlay.rerun_client.rr") as mock_rr2:
+        log_target(CAMERA_KEY, (1.0, 2.0), "cube", MARKER, level=1, stack_size=2, extra_placements=None)
+        kwargs2 = dict(mock_rr2.Points2D.call_args.kwargs)
+    assert kwargs1 == kwargs2
+
+
 def test_clear_target_logs_recursive_clear_at_object_path():
     with patch("vizaudit.overlay.rerun_client.rr") as mock_rr:
         clear_target(CAMERA_KEY, "cube")

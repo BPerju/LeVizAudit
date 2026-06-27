@@ -66,14 +66,15 @@ def log_target(
     orientation_tip: tuple[float, float] | None = None,
     level: int = 0,
     stack_size: int = 1,
+    extra_placements: list[tuple[Point, Point | None, int, int]] | None = None,
 ) -> None:
     """Logs a target marker as a child entity of the live camera image entity, so Rerun's
     Spatial2D view composites it directly on top of the feed.
 
     Re-logging to the same path (one fixed path per object) replaces the prior marker in
     the viewer's current-time view, so no `rr.Clear` is needed here -- see `clear_target` for
-    the one case that does need it (an object not active this episode, under
-    `OverlayConfig.episode_targets == "one"`).
+    the one case that does need it (an object not active at all this episode, under
+    `OverlayConfig.site_selection == "subset"`).
 
     ``level``/``stack_size`` (default ``0``/``1``, today's exact behavior -- a lone marker
     with no offset or badge) describe this object's place in a STACK of objects sharing one
@@ -93,27 +94,46 @@ def log_target(
     to it. Whether an object has an orientation arrow at all is fixed for the whole session
     (set by its config, not toggled per episode), so there's no need to ever clear a stale one
     here.
+
+    ``extra_placements``, if given, is a list of additional SIMULTANEOUS ``(point,
+    orientation_tip, level, stack_size)`` tuples for this SAME object -- needed under
+    `OverlayConfig.position_mode == "overlay"` when an object's own pattern has more than one
+    point: every one of its points is shown at once (not swept), so one marker no longer
+    represents the whole picture. All placements (the primary one plus every extra) are logged
+    as N fanned positions/labels under ONE entity (and N orientation arrows, skipping any
+    placement with no tip, under one child entity) -- a single `rr.log` call per entity means
+    re-logging always fully replaces every previous placement, even if a PREVIOUS episode had
+    MORE of them, with no separate clearing needed for the shrinking case. Omitting
+    ``extra_placements`` (the default, and every pre-existing call site) is byte-for-byte
+    unchanged from the single-marker behavior this function always had.
     """
+    placements = [(point, orientation_tip, level, stack_size)] + (extra_placements or [])
     path = f"{camera_key}/target/{object_name}"
-    display_point = _stack_offset_position(point, level, stack_size)
-    label = f"{object_name} L{level}" if stack_size > 1 else object_name
+    display_points = [_stack_offset_position(p, lv, sz) for p, _, lv, sz in placements]
+    labels = [f"{object_name} L{lv}" if sz > 1 else object_name for _, _, lv, sz in placements]
     rr.log(
         path,
         rr.Points2D(
-            positions=[display_point],
+            positions=display_points,
             radii=marker.radius_px,
-            colors=[marker.color_rgba],
-            labels=[label] if marker.label else None,
+            colors=[marker.color_rgba] * len(display_points),
+            labels=labels if marker.label else None,
         ),
     )
-    if orientation_tip is not None:
-        vector = (orientation_tip[0] - point[0], orientation_tip[1] - point[1])
+    arrow_origins = []
+    arrow_vectors = []
+    for (p, tip, _lv, _sz), display_point in zip(placements, display_points):
+        if tip is None:
+            continue
+        arrow_origins.append(display_point)
+        arrow_vectors.append((tip[0] - p[0], tip[1] - p[1]))
+    if arrow_origins:
         rr.log(
             f"{path}/orientation",
             rr.Arrows2D(
-                origins=[display_point],
-                vectors=[vector],
-                colors=[marker.color_rgba],
+                origins=arrow_origins,
+                vectors=arrow_vectors,
+                colors=[marker.color_rgba] * len(arrow_origins),
             ),
         )
 
@@ -122,11 +142,11 @@ def clear_target(camera_key: str, object_name: str) -> None:
     """Removes a previously-logged target marker (and its orientation arrow, if any).
 
     Re-logging to the same path normally replaces stale data for free (see `log_target`'s
-    docstring) -- but an object not in this episode's active SITE (under
-    `OverlayConfig.episode_targets == "one"` -- session.py's `show_targets` picks exactly one
-    of this episode's coincidence-grouped sites to show, see CLAUDE.md) has nothing new to log
-    at all, so skipping the call entirely would leave the PREVIOUS episode's marker visibly
-    stuck on screen instead of disappearing.
+    docstring) -- but an object not in any of this episode's SELECTED sites (under
+    `OverlayConfig.site_selection == "subset"` -- session.py's `show_targets` picks a subset of
+    this episode's sites to show, see CLAUDE.md) has nothing new to log at all, so skipping the
+    call entirely would leave the PREVIOUS episode's marker visibly stuck on screen instead of
+    disappearing.
     """
     path = f"{camera_key}/target/{object_name}"
     rr.log(path, rr.Clear(recursive=True))

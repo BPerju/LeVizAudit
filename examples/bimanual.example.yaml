@@ -23,7 +23,6 @@ surface_calibration:
 objects:
   - name: left_cube
     count: 20
-    variable: true
     pattern:
       shape: sector
       center: [180, 240]      # left arm's own reach-circle center, fit via vizaudit-calibrate
@@ -39,7 +38,6 @@ objects:
 
   - name: right_block
     count: 20
-    variable: true
     pattern:
       shape: sector
       center: [460, 240]      # right arm's own reach-circle center -- a SEPARATE fit, even

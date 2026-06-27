@@ -130,54 +130,68 @@
     <button id="unassignSelectedBtn" title="Remove the active object from every currently-selected sample point" disabled>Unassign</button>
   </div>
   <div class="toolbar-group-inner" style="margin-top: 9px;">
-    <label title="How the active object cycles through its own assigned points across episodes. Lockstep is today's plain i%length cycle. Shuffled decorrelates two objects of equal-length patterns from always pairing the same way.">Sequencing
-      <select id="objectSequencingSelect" disabled>
-        <option value="lockstep" selected>Lockstep</option>
-        <option value="shuffled">Shuffled</option>
+    <label title="A shorthand that sets every axis below at once -- pick one, or pick 'Custom' and set axes individually. Editing any axis directly afterward switches this back to Custom automatically.">Preset
+      <select id="presetSelect">
+        <option value="sweep" selected>Sweep (default -- every object, every episode)</option>
+        <option value="shuffled_sweep">Shuffled sweep</option>
+        <option value="one_at_a_time">One at a time</option>
+        <option value="cycle_through_points">Cycle through points</option>
+        <option value="show_everything">Show everything (no rotation)</option>
+        <option value="every_combination">Every combination</option>
+        <option value="sample_combinations">Sample combinations</option>
+        <option value="custom">Custom</option>
       </select>
     </label>
-    <label title="Seed for this object's 'Shuffled' sequencing.">Seed <input type="number" id="objectSeedInput" value="0" disabled></label>
   </div>
   <div class="toolbar-group-inner" style="margin-top: 9px;">
-    <label title="SCENE-LEVEL: how many sites (one occupied point, holding one object or a guaranteed stack of several) are shown at once each episode. 'All' (default) shows every occupied site simultaneously, every episode -- today's behavior, with the visible combination count controlled by 'Combinations' below. 'One at a time' shows exactly one OCCUPIED POINT per episode, round-robin over every object's own assigned points -- #episodes equals the number of distinct occupied points.">Episode targets
-      <select id="episodeTargetsSelect">
-        <option value="all" selected>All sites (default)</option>
-        <option value="one">One occupied point at a time</option>
+    <label title="SCENE-LEVEL: how many targets are shown each episode. All (default): every object's own position advances every episode (a dynamic sweep). Static: every point any object is assigned to is shown at once, every episode, with no rotation at all. N at a time: exactly N of those fixed points/stacks rotate through, one selection per episode -- N=1 is the common 'place one object/stack at a time' case.">Per episode
+      <select id="perEpisodeSelect">
+        <option value="all" selected>All (default)</option>
+        <option value="static">Static (every point)</option>
+        <option value="n">N at a time</option>
       </select>
     </label>
-    <label title="'All' mode only: how many distinct simultaneous-combination episodes to cycle through, decoupled from any one object's own pattern length (e.g. 3 objects with 20 points each can have far more than 20 distinct combinations). 0/blank = today's exact lockstep/shuffled behavior, capped at the longest object's own pattern length. Optional for Cartesian/LCM modes -- they derive their own natural count (the product, or the lcm, of every object's own length) when left blank; required for Random/Coprime.">Combinations <input type="number" id="combinationCountInput" value="0" min="0"></label>
-    <label title="Systematic (default): deterministic, evenly-spread, capped at each object's own pattern length -- and, since this combination mode's whole point is a number HIGHER than that length, will revisit each point multiple times rather than ever repeating two consecutive episodes. Random: independent seeded draws -- escapes that per-object cap (the joint space is up to the PRODUCT of every object's length), at the cost of losing the even/no-repeat guarantee. Coprime: a deterministic, no-RNG alternative to Systematic, same per-object cap. Cartesian: the full Cartesian product of every object's own points, enumerated deterministically -- escapes the cap with no randomness; can get very large. LCM: plain lockstep, but run for exactly lcm(every object's own length) episodes so every pairing lockstep naturally produces appears once.">Combination mode
-      <select id="combinationModeSelect">
-        <option value="systematic" selected>Systematic (default)</option>
-        <option value="random">Random</option>
-        <option value="coprime">Coprime</option>
-        <option value="cartesian">Cartesian</option>
-        <option value="lcm">LCM</option>
-      </select>
-    </label>
-    <label title="Seed for Random combination mode.">Combination seed <input type="number" id="combinationSeedInput" value="0"></label>
-    <label title="SCENE-LEVEL: when 2+ objects' own sequenced positions land on the same point this episode, should they STACK there together (one site, several levels), or should the scene actively try to KEEP THEM APART by nudging the later one onto its own other assigned point? Keep apart degrades to a stack (with a warning below) if no alternative point is free that episode. Only applies under 'All sites' -- under 'One occupied point at a time', co-location is a static, guaranteed fact, not a per-episode choice.">Co-location
-      <select id="coLocationSelect">
-        <option value="stack" selected>Stack (default)</option>
-        <option value="keep_apart">Keep apart</option>
-      </select>
-    </label>
-    <label title="When 2+ objects share a point this episode, how their stacking order (level) varies across episodes. Fixed = today's assignment-order rank, always.">Stack level strategy
-      <select id="stackLevelStrategySelect">
+    <label title="'N at a time' only: how many fixed sites to show per episode.">Count <input type="number" id="perEpisodeCountInput" value="1" min="1" disabled></label>
+    <label title="When 2+ objects share a point this episode, how their stacking order (level) varies across episodes. Fixed = today's assignment-order rank, always.">Level
+      <select id="levelSelect">
         <option value="fixed" selected>Fixed</option>
         <option value="shuffle">Shuffle</option>
         <option value="cycle">Cycle</option>
         <option value="balanced">Balanced</option>
       </select>
     </label>
-    <label>Stack seed <input type="number" id="stackLevelSeedInput" value="0"></label>
+    <label title="Seed for every randomized aspect above (Combinations=Shuffled/Custom count, Order=Random, Level=Shuffle/Balanced) -- internally kept separate per aspect so they don't silently correlate.">Seed <input type="number" id="sceneSeedInput" value="0"></label>
+  </div>
+  <div class="toolbar-group-inner" style="margin-top: 9px;">
+    <label title="Per episode='All' only: the visit-order axis -- which of a stack unit's own assigned points to show each episode. Synced (default): plain i%length cycle. Shuffled: a seeded-random visit order, decorrelating units of equal length from always pairing the same way. All: every simultaneous combination of every unit's own points (the full Cartesian product). Custom count: sample exactly N combinations, spread by Order below -- decouples the visible combination count from any one unit's own pattern length (e.g. 3 objects with 20 points each can have far more than 20 distinct combinations).">Combinations
+      <select id="combinationsSelect">
+        <option value="synced" selected>Synced (default)</option>
+        <option value="shuffled">Shuffled</option>
+        <option value="all">All</option>
+        <option value="n">Custom count</option>
+      </select>
+    </label>
+    <label title="Combinations='Custom count' only.">Count <input type="number" id="combinationsCountInput" value="50" min="1" disabled></label>
+    <label title="Even (default): a deterministic, evenly-spread choice -- used both for sampling Combinations='Custom count' and for which sites a Per episode='N at a time' selection shows each episode. Random: a seeded random choice instead. Coprime: a deterministic, no-RNG alternative to Even for sampling Combinations='Custom count' only.">Order
+      <select id="orderSelect">
+        <option value="even" selected>Even</option>
+        <option value="random">Random</option>
+        <option value="coprime">Coprime</option>
+      </select>
+    </label>
+    <label title="SCENE-LEVEL: when 2+ objects' own sequenced positions land on the same point this episode, should they STACK there together (one site, several levels), or should the scene actively try to KEEP THEM APART? Under Per episode='All', a later object is nudged onto its own other assigned point (degrades to a stack, with a warning below, if none is free). Under a static Per episode, this instead decides whether the rotation cycles through whole stacks ('Stack') or through every individual point ('Keep apart'), never merging coincidentally-shared points.">Stacking
+      <select id="stackingSelect">
+        <option value="stack" selected>Stack (default)</option>
+        <option value="keep_apart">Keep apart</option>
+      </select>
+    </label>
   </div>
   <p class="note" id="collisionWarning" style="display: none; color: var(--cut); margin: 6px 0 0;"></p>
   <div class="toolbar-group-inner" style="margin-top: 9px;">
-    <label>Preview
+    <label title="Which VIEW this tool shows -- purely a preview choice, with no bearing on what gets exported (that's entirely the Per episode/Combinations/Order/Stacking/Level axes above). Marginal: today's always-on coverage cloud, every assigned point of every object at once. Episode: step through individual episodes using the scene-level axes above.">Preview
       <select id="previewModeSelect" disabled>
         <option value="marginal" selected>Marginal (every assigned point)</option>
-        <option value="episode">Episode (one simultaneous placement)</option>
+        <option value="episode">Episode</option>
       </select>
     </label>
     <span class="toolbar-group-inner" id="episodeStepper" style="display: none;">

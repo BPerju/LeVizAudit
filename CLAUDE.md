@@ -2384,6 +2384,412 @@ still pre-implementation — see `research_report.md` §3/§5/§7 for that desig
     56 JS assertions total. `examples/stacking.example.yaml`'s `combination_count` comment
     block was extended to describe all 5 modes, with `combination_mode`/`combination_seed`
     added as further commented-out fields.
+- **`episode_targets: "all"` + `co_location: "stack"` had a real, reported design flaw: at one
+  location holding a single object and another holding an authored stack, the rendered scene
+  mixed "a point" with "a SLICE of the stack" rather than "a point and the full stack" — and
+  the operator had no setting to control this.** Root cause: in `"all"` mode, each OBJECT swept
+  its own assigned points independently every episode (`sequence_index`, or the combination
+  subsystem), and objects were grouped into sites purely by PER-EPISODE coincidence — so an
+  authored stack (2+ objects assigned to the same point) only rendered full on whichever
+  episodes the objects' independently-decorrelated sweeps happened to land together, and
+  rendered a partial slice every other episode. Investigating the fix surfaced (and the user
+  directly confirmed) two existing redundancies worth resolving FIRST, rather than adding a
+  third parallel concept on top of them:
+  1. **`episode_targets: "all" | "one"` was secretly two collapsed axes** — `"all"` =
+     (sweep positions, show all sites); `"one"` = (static/full positions, show exactly one
+     site) — two diagonal corners of a 2×2 grid. The originally-requested `overlay` ("all sites,
+     fixed & full") and `subsample` features were simply the OTHER corners of that same grid,
+     not new parallel concepts.
+  2. **Per-object `ObjectConfig.sequencing` (`"lockstep"`/`"shuffled"`) and the scene-level
+     `combination_*` subsystem were the same axis — visit order — asked at two different
+     scopes.** The code already made them mutually exclusive (the combination subsystem, when
+     active, silently bypassed `sequencing` entirely); keeping both was redundant surface area,
+     not complementary functionality.
+- **Fix: `episode_targets` was replaced by two ORTHOGONAL scene-level axes —
+  `OverlayConfig.position_mode: "sweep" | "overlay"` (default `"sweep"`) and
+  `OverlayConfig.site_selection: "all" | "subset"` (default `"all"`, + `site_count`/
+  `site_order`/`site_seed` for `"subset"`) — and `ObjectConfig.sequencing` was REMOVED entirely,
+  folded into `OverlayConfig.combination_mode` gaining two new values, `"lockstep"` (the NEW
+  default, replacing `"systematic"`) and `"shuffled"`.** `position_mode` decides what a
+  scene's SITES are (swept per-episode positions, or every assigned point shown statically);
+  `site_selection` decides how many of those sites are shown each episode — fully independent,
+  so e.g. `sweep` + `subset` is a new, real corner ("a sampled subset of SWEEPING sites each
+  episode") that neither old value could express. Old `"all"`/`"one"` are exactly the
+  `(sweep, all)` / `(overlay, subset k=1)` corners.
+  - **The atomic-stack fix itself**: `pattern.py` gained `group_into_units(object_point_lists,
+    co_location="stack") -> list[list[int]]` — groups object ordinals into a maximal set
+    sharing an IDENTICAL ORDERED point-list (not merely some overlapping points — that weaker
+    case is deliberately left to `position_mode: "overlay"`/`occupied_sites` instead, which is
+    exactly why the two position modes complement rather than duplicate each other) into one
+    atomic STACK UNIT, ordered by smallest member ordinal. `co_location == "keep_apart"`
+    disables grouping entirely (returns all singletons) — keep_apart exists to SEPARATE
+    co-located objects, so bonding identical-point-list objects into one unit would directly
+    contradict it. Under `position_mode: "sweep"`, `session.py`'s `show_targets` runs the
+    visit-order axis over UNIT lengths/ordinals instead of per-object ones, then expands each
+    unit's chosen index back to every member — a stack unit's members always resolve to the
+    IDENTICAL point every episode, so a stack can never be partially sliced again, regardless of
+    `combination_mode`. **The back-compat guarantee**: when no two objects share a point-list
+    (the common, non-stacking case), `group_into_units` returns one singleton unit per object,
+    in declaration order — unit ordinal equals object ordinal, unit count equals object count —
+    so feeding those into the SAME `sequence_index`/`resolve_combination_indices` machinery the
+    old per-object code already called produces BYTE-IDENTICAL output to the pre-unification
+    `episode_targets: "all"` behavior, verified by a dedicated test. This holds unconditionally
+    for the new `"lockstep"` default (which never even consults `seed`/`object_ordinal`), and
+    holds for `"shuffled"` whenever seeds are left at their (overwhelmingly common) default of
+    `0` — `"shuffled"` switching from a per-object seed to one shared scene-level
+    `combination_seed` is the one deliberate, accepted loss of granularity from folding
+    `sequencing` into `combination_mode` (an object that previously set a custom per-object seed
+    specifically for `sequencing: "shuffled"` needs a one-time migration; this project is
+    pre-release, so a clean, documented break is acceptable here — same precedent as every other
+    hard-break field removal in this file).
+  - **`pattern.py` gained `resolve_unit_indices(episode_index, lengths, mode="lockstep",
+    combination_count=None, seed=0) -> list[int]`** — the single dispatcher unifying the old
+    per-object `sequence_index` sweep and the old scene-level combination subsystem into ONE
+    visit-order axis: `"lockstep"`/`"shuffled"` route to `sequence_index` per unit (unit ordinal
+    as `object_ordinal`, unit count as `num_objects`); the other 5 modes
+    (`"systematic"`/`"random"`/`"coprime"`/`"cartesian"`/`"lcm"`) route to
+    `combination_period`/`resolve_combination_indices` exactly as the old scene-level subsystem
+    did — no more `combination_active` bypass flag (every mode is now dispatched unconditionally
+    by name, never silently inert). **A real, deliberate correction this surfaced**: the OLD
+    `_COMBINATION_MODES_REQUIRING_COUNT = {"random", "coprime"}` excluded `"systematic"` only
+    because the old `combination_active` flag (`combination_count is not None or
+    combination_mode != "systematic"`) meant `"systematic"` (the old default) was NEVER actually
+    invoked with `combination_count=None` in practice — `combination_period` itself already
+    unconditionally raises for `"systematic"` + no count, that branch was just unreachable
+    before. Now that `"lockstep"` is the new no-count default and every mode dispatches directly
+    with no bypass, `"systematic"` genuinely needs a count if selected — `config.py`'s
+    `_COMBINATION_MODES_REQUIRING_COUNT` now correctly includes it, validated eagerly at load
+    time (a `ConfigError` naming the requirement, not a sometime-later runtime crash).
+  - **`pattern.py` gained `select_sites(num_sites, selection, count, order, seed,
+    episode_index) -> list[int]`** — the `site_selection` axis: `"all"` returns every site
+    index; `"subset"` (`k = min(count, num_sites)`) returns either a deterministic sliding
+    window (`"round_robin"`: `sorted((episode_index*k+j) % num_sites for j in range(k))` — `k=1`
+    reduces to exactly the old `episode_targets: "one"` rotation, `episode_index % num_sites`)
+    or a seeded subset (`"random"`: `sorted(_seeded_permutation(num_sites,
+    _combine_seed(seed, episode_index))[:k])`, reusing the existing `_seeded_permutation` shuffle
+    directly rather than re-deriving the math, for the same reason `level_order`/
+    `sequence_index`'s seeded modes already do). `"systematic"`/`"coprime"` site orders are
+    reserved (present in `config.py`'s allowed-value set, gated to raise `ConfigError(...not yet
+    implemented...)` at load time if selected) — designed for a future pass, deliberately not
+    built now (only `"round_robin"`/`"random"` ship), mirroring this project's established
+    "design the enum, implement one now, gate the rest" pattern (see the `subsample_mode`-style
+    precedent elsewhere in this file).
+  - **`session.py`'s `show_targets` is now ONE unified function** (previously two
+    near-duplicated branches keyed on `episode_targets`): builds `raw_sites` either from
+    `occupied_sites` (static, `position_mode == "overlay"`) or from unit-grouping + the
+    visit-order axis + `co_location`/`resolve_keep_apart` + exact-position grouping (dynamic,
+    `"sweep"`) — THEN applies `select_sites` to both paths identically, so `site_selection` is
+    genuinely orthogonal to `position_mode` in the implementation, not just in the config schema.
+    Rotation's `visit_number` approximation (see `target_for_episode`'s existing "approximates
+    how many times this position has been visited" caveat) generalizes to `episode_index //
+    len(occupied_sites(...))` under `"overlay"` (matching the old `"one"` mode's formula exactly)
+    and `episode_index // len(point_lists[ordinal])` under `"sweep"` (matching the old `"all"`
+    mode's formula exactly, using the object's own FULL pattern length, not the unit's).
+  - **`OverlayConfig.episode_targets` is GONE as a dataclass field — kept only as a deprecated
+    YAML-level PARSING alias inside `load_config`**, not as a real field anything downstream
+    reads: `episode_targets: "all"` sets the `position_mode`/`site_selection`/`site_count`
+    DEFAULTS to `"sweep"`/`"all"`/`None` before the normal new-field parsing runs (a no-op if the
+    file already matches today's defaults); `"one"` sets them to `"overlay"`/`"subset"`/`1`.
+    Specifying `episode_targets` together with ANY of the new axis keys is a `ConfigError` (never
+    two ways to say the same thing in one file) — verified by a dedicated test in both
+    directions. Python test code that constructs `OverlayConfig` directly (bypassing
+    `load_config`) must use the new field names — this is a hard, intentional break (consistent
+    with this project's pre-release stance), not a silently-accepted old kwarg.
+  - **A second, smaller dead-code finding surfaced while removing `sequencing`**:
+    `PatternConfig.seed` under `shape: "points"` had its ONLY remaining consumer (the per-object
+    `sequencing: "shuffled"` seed) removed by this same change, making it pure unused config
+    surface — removed from `_POINTS_ALLOWED` entirely (a `seed:` key under `shape: points` is now
+    a `ConfigError`, same treatment as the `StackConfig`/`jitter_px`/`presence` removals
+    elsewhere in this file). `seed` remains on `PatternConfig` itself and fully functional for
+    `sector`/`union` shapes, which have their own, unrelated sampling use for it.
+  - **`rerun_client.log_target` gained an optional `extra_placements: list[tuple[Point, Point |
+    None, int, int]] | None = None` parameter — needed because `position_mode: "overlay"` can
+    make ONE object occupy several simultaneous points at once** (every point in its own
+    pattern is its own site under `"overlay"`, unlike `"sweep"` where an object is always in
+    exactly one site). All placements (the existing primary point/orientation_tip/level/
+    stack_size args, plus every `extra_placements` tuple) are logged as N fanned positions/
+    labels under ONE `rr.Points2D` entity (and N arrows, skipping placements with no tip, under
+    one `rr.Arrows2D` child) — a SINGLE `rr.log` call per entity means re-logging always fully
+    replaces every previous placement, even if a PREVIOUS episode had MORE of them, with no
+    separate clearing logic needed for the shrinking case. Deliberately additive, not a
+    signature overhaul: every pre-existing call site (the overwhelmingly common case — `"sweep"`,
+    or `"overlay"` with single-point objects) omits `extra_placements` and is byte-for-byte
+    unchanged, confirmed by every pre-existing `test_rerun_client.py` test passing with zero
+    modifications.
+  - **Calibration tool**: `episodeTargetsSelect`/the per-object `objectSequencingSelect`/
+    `objectSeedInput` controls were removed outright (not deprecated-but-hidden) and replaced
+    with `positionModeSelect`/`siteSelectionSelect`/`siteCountInput`/`siteOrderSelect`/
+    `siteSeedInput` plus `combinationModeSelect` gaining "Lockstep"/"Shuffled" options —
+    `calibrate.js` ported `groupIntoUnits`/`resolveUnitIndices`/`selectSites` bit-for-bit
+    (adapted to this tool's shared `samplePointsCanonical` INDEX space: "identical point-list"
+    there is just "identical sorted assigned-index array," no float-coordinate keying needed,
+    unlike the Python original which must compare raw point lists since each object owns its
+    own independent list) and rewrote `computeEpisodePlacements`/`maxEpisodeCount` as ONE
+    unified function each, mirroring `session.py`'s own unification exactly — the return shape
+    (`{sites, residual}`) is unchanged, so `renderObjectPlacementsCamera`/`Ortho`/
+    `drawStackLegend`/`updateCollisionWarning` needed NO changes at all. The old `"episode_
+    targets: 'one' auto-engages episode preview"` UX fix was generalized to fire whenever
+    `siteSelection` becomes `"subset"` (the new, more general "fewer things shown" case the
+    marginal/coverage view can't represent) rather than the old binary `episodeTargets ===
+    "one"` check. `effectiveCombinationModeForPreview()` replaced `combinationSubsystemActive()`
+    for the same live-preview-robustness reason as before (a transiently-incomplete
+    systematic/random/coprime selection with no count yet falls back to `"lockstep"` rather than
+    crashing `renderAll()` on every keystroke; lockstep/shuffled/cartesian/lcm never need this
+    fallback). Verified via an ad-hoc Node harness (this project's established,
+    not-committed-to-the-repo convention) — 113 assertions covering `groupIntoUnits`/
+    `resolveUnitIndices`/`selectSites` parity (cross-checked directly against the Python
+    functions' outputs for the seeded/grouping cases, not just internal JS self-consistency),
+    the atomic-stack-never-slices behavior under `"shuffled"` end-to-end through
+    `computeEpisodePlacements`, disjoint objects staying unaffected, both `"overlay"` cases
+    (multi-point single object, static stack), `"sweep"` + `"subset"`, `maxEpisodeCount` parity,
+    export gating, real DOM-event wiring for every new control plus the auto-engage behavior,
+    a full `renderAll()` smoke test, and the back-compat byte-identical default-sweep anchor.
+  - **`examples/stacking.example.yaml`** was migrated: the distractor cube's `sequencing:
+    shuffled` + pattern-level `seed: 3` (both removed) became scene-level commentary describing
+    the equivalent `combination_mode: shuffled` (commented out, since this scene's stack and
+    distractor don't need decorrelating from each other to demonstrate the feature); the
+    `episode_targets`/`combination_mode` commentary was rewritten for the new fields and the new
+    `"lockstep"` default. Re-verified end-to-end via `load_config` plus a mocked `run_session`
+    smoke for BOTH the default config (confirms the 3-block stack renders with `stack_size=3`
+    every episode, levels rotating under `level_strategy: balanced`) and a
+    `position_mode: overlay` + `site_selection: subset, site_count: 1` variant (confirms the
+    documented 4-site rotation: the stack as one site, then each of the distractor's 3 own
+    points in turn).
+  - Verified via Python: `group_into_units`/`resolve_unit_indices`/`select_sites` unit tests in
+    `test_pattern.py` (identical/partial-overlap/keep_apart/ordering for grouping; lockstep/
+    shuffled/systematic dispatch correctness for the index resolver; all/subset round_robin/
+    random correctness, capping, and empty-input handling for site selection); `test_config.py`
+    coverage for `position_mode`/`site_selection`/`site_count`/`site_order`/`site_seed` defaults/
+    parsing/validation, the `episode_targets` alias resolving to the correct new-field values in
+    both directions and erroring when combined with a new axis key, the `sequencing`-key removal
+    error, the points-shape `seed`-key removal error, and the new `"lockstep"` default/
+    `"systematic"`-now-requires-count behavior; `test_session.py` coverage for the atomic-stack
+    fix under `"shuffled"` end-to-end, disjoint-object non-interference, both `"overlay"` shapes,
+    `"sweep"` + `"subset"`, and the `"shuffled"`-replaces-`sequencing` equivalence — 414 Python
+    tests total (`pytest tests/ -q`).
+- **The calibration tool's `positionModeSelect` (Sweep/Overlay) was removed outright and folded
+  into the Preview dropdown itself, after a direct report that the two controls were
+  redundant.** Verified the claim before acting on it: the Marginal preview's rendering
+  (`objectStackAt`/`objectStacksAtPoint`) never reads `positionMode` at all — it always draws
+  every assigned point of every object, regardless of sweep/overlay — so toggling Position mode
+  while looking at Marginal had ZERO visible effect, a real, confusable dead control. Position
+  mode only ever did anything once the operator was ALSO in the Episode preview (where sweep
+  vs. overlay genuinely change what's shown). That makes the collapse lossless, not just
+  shorter: `previewMode`'s `"episode"` value split into two — `"marginal"` | `"episode_sweep"` |
+  `"episode_overlay"` — and a new `effectivePositionMode()` (`previewMode === "episode_overlay"
+  ? "overlay" : "sweep"`) replaces the standalone `positionMode` variable everywhere it was read
+  (`computeEpisodePlacements`, `maxEpisodeCount`, `updateSceneLevelControlsAvailability`,
+  `sceneLevelExportBlock`) — `"marginal"` defaults to `"sweep"` for export purposes (an
+  arbitrary but harmless choice, since Marginal never surfaces the difference either way).
+  Every reachable, MEANINGFULLY DISTINCT preview state from before (today's coverage cloud;
+  stepping through a sweeping scene; stepping through a static overlay scene to see level/
+  rotation cycling) is still reachable — only the one truly-inert 4th combination (Marginal +
+  Overlay, indistinguishable from Marginal + Sweep) was ever removed. `maybeAutoEngageEpisodePreview()`
+  (the existing fix for `site_selection: "subset"` looking like a no-op under Marginal) now
+  switches to `"episode_sweep"` specifically — the common-case default — rather than a bare
+  `"episode"` value that no longer exists. This is a calibration-tool-only UI simplification:
+  `OverlayConfig.position_mode` itself, and everything in `config.py`/`pattern.py`/`session.py`,
+  is completely unaffected — only `calibrate.js`'s OWN internal preview-state representation
+  changed. Verified via the ad-hoc Node harness: `effectivePositionMode()`'s derivation for all
+  3 `previewMode` values; the real `previewModeSelect` "change" listener driving both
+  `previewMode` and the combination/co-location controls' disabled state together; the
+  subset-auto-engage now landing on `"episode_sweep"`; and that `positionModeSelect` is no
+  longer a declared identifier anywhere in the script at all (a `ReferenceError` on access) --
+  114 JS assertions total (up from 113), plus the unaffected 414 Python tests (no Python files
+  touched in this pass).
+- **The whole scene-level model was REDESIGNED from five co-equal, implementation-named axes
+  (`position_mode`, `site_selection`+`site_count`+`site_order`+`site_seed`, `combination_mode`+
+  `combination_count`+`combination_seed`, `co_location`, `level_strategy`+`level_seed`, plus the
+  deprecated `episode_targets` alias) into a much smaller, intent-named set —
+  `per_episode`/`combinations`/`order`/`stacking`/`level`/`seed` (+ an optional `preset:`
+  shorthand) — after the project's own author reported being unable to express "I have 3
+  objects and want to guide the operator to place exactly ONE of them per episode" without
+  first working out which combination of those five axes did it.** Investigated directly: the
+  case WAS already expressible (`site_selection: subset, site_count: 1`), but reaching it
+  required understanding and discarding `combination_mode`'s 7 options, `co_location`, and
+  `level_strategy` — none of which matter for it — which is exactly the kind of accreted
+  surface area this project has repeatedly cut back before (jitter_px/presence, "phase"/
+  "stratified" sequencing, the old `episode_targets` alias itself). The fix wasn't just
+  renaming fields — it required a genuine mathematical reframe, worked out and confirmed with
+  the user before writing any code: **what Rerun actually shows each episode is just a set of
+  `{point, object, color, level}`, so the entire scene only needs to answer two questions: how
+  many targets per episode, and how the distinct episodes are enumerated** — every other old
+  axis turned out to be answering one of those two questions, just scoped or worded
+  differently.
+  - **`per_episode: "all" | "static" | <positive int>`** is the headline axis.
+    `"all"` (default, today's original behavior) is the DYNAMIC case: every object's own
+    position advances every episode (`pattern._episode_placements_sweep` — objects sharing an
+    IDENTICAL point-list are grouped into one atomic stack unit via the pre-existing
+    `group_into_units`, so a stack is always shown full, never sliced — this part is verbatim
+    unchanged from the prior "sweep" design). `"static"` and `<int>` are both STATIC — no sweep
+    at all, every point any object is assigned to is a fixed, permanent site
+    (`pattern._episode_placements_static`) — `"static"` shows every one of them every episode
+    (no rotation, a persistent coverage/reference view); `<int>` shows exactly that many,
+    rotating via `order`. **`per_episode: 1` is the direct, one-field answer to the original
+    report** — each object gets a one-point pattern, set `per_episode: 1`, done; see the new
+    `examples/one_per_episode.example.yaml`, the canonical recipe for this case.
+  - **`combinations: "synced" | "shuffled" | "all" | <positive int>`, only meaningful when
+    `per_episode == "all"`** — a config-time `ConfigError` otherwise (`config.py`'s
+    `'combinations' only applies when per_episode='all'`), rather than a silent no-op. This is
+    the user's own explicitly-requested mathematical fix for the muddled relationship between
+    a combination *count* and *mode*: a count only exists, and only ever means "sample N of the
+    combination space," in this ONE case — every other `per_episode` value has no notion of a
+    combination count at all, removing the entire old "does this mode need a count, and what
+    happens if I set one anyway" decision tree. `"synced"` (default) is plain
+    `episode_index % length` per unit — the OLD `"lockstep"` AND `"lcm"` modes turned out to be
+    mathematically identical for this purpose (lockstep's per-unit modulo already has period
+    `lcm(every unit's length)` with no extra machinery needed — `"lcm"` mode is gone, simply
+    absorbed into `"synced"`, not replaced by it). `"shuffled"` and `"all"` (the old
+    `"cartesian"`) are unchanged in meaning. `<positive int>` replaces the old
+    `combination_count` + whichever of `"systematic"/"random"/"coprime"` was selected — which
+    one now comes from the separate `order` axis below, instead of being baked into one
+    7-valued `combination_mode` enum.
+  - **`order: "even" | "random" | "coprime"`** is a SEPARATE axis from `combinations` on
+    purpose — it answers "how to spread/sample," reused identically by two different things
+    that both needed exactly this choice: sampling `combinations: <int>` (replacing
+    `combination_mode: "systematic"/"random"/"coprime"`), AND selecting which static sites a
+    `per_episode: <int>` shows each episode (replacing `site_order: "round_robin"/"random"` —
+    `"even"` here maps internally to `"round_robin"`, since both mean the same
+    deterministic-evenly-spread idea; reserved `"systematic"/"coprime"` site orders, never
+    implemented, are dropped entirely rather than carried forward as dead enum values).
+    `"coprime"` is config-time restricted to `combinations: <int>` only (`order='coprime'
+    requires combinations to be a positive integer`) — it has no equivalent meaning for
+    static-site selection.
+  - **`stacking: "stack" | "keep_apart"`** replaces `co_location` directly (same two values,
+    same meaning under `per_episode: "all"` — pile up vs. nudge apart via the unchanged
+    `resolve_keep_apart`) but GAINS a real, new meaning under a static `per_episode`: `"stack"`
+    merges objects sharing an exact point into one site (`occupied_sites`, unchanged); the new
+    **`pattern._exploded_sites`** instead treats every individual `(object, point)` pair as its
+    own, permanently un-stacked site. This is the literal, direct implementation of the user's
+    own description of the desired behavior: *"if its in stack mode it should display one
+    stack per episode but if its keep apart then it should display one point per episode while
+    it cycles through all possible points within the scenario."* Confirmed by a dedicated test
+    (`test_episode_placements_per_episode_one_keep_apart_cycles_every_individual_point`): two
+    objects sharing one point plus a private point each — `"stack"` shows 2 distinct sites (the
+    shared stack, then the private point); `"keep_apart"` shows 3 (every point individually,
+    never merging the shared one).
+  - **`level`/`seed`** replace `level_strategy`/`level_seed` (identical 4 values: `"fixed"` |
+    `"shuffle"` | `"cycle"` | `"balanced"`) plus a NEW design decision: `seed` is now ONE shared
+    field across every randomized aspect (`combinations: "shuffled"`/sampling `"random"`;
+    `order: "random"`; `level: "shuffle"/"balanced"`) instead of three separate seeds
+    (`combination_seed`/`site_seed`/`level_seed`) — a deliberate simplification matching "make
+    the YAML schema as simple as possible," with the one real risk (different randomized
+    aspects silently correlating because they share a literal seed number) handled by
+    internally salting each aspect before use (`pattern._SEED_SALT_COMBINATIONS/_LEVEL/_SITES`,
+    `seed XOR`-style combined via the pre-existing `_combine_seed`) — so one user-facing number
+    still drives genuinely independent draws underneath.
+  - **`pattern.episode_placements(point_lists, episode_index, per_episode, combinations, order,
+    stacking, level, seed) -> (placements_per_ordinal, residual_collision_ordinals)`** is the
+    single new orchestrator function `session.py`'s `show_targets` now calls directly, replacing
+    ~100 lines of inline position_mode/site_selection/co_location branching with one call —
+    dispatching to `_episode_placements_sweep` (`per_episode == "all"`) or
+    `_episode_placements_static` (`"static"`/`<int>`), both of which are thin wrappers around
+    the SAME unchanged building blocks (`group_into_units`, `resolve_unit_indices`,
+    `resolve_keep_apart`, `occupied_sites`, `select_sites`, `level_order`) plus the one genuinely
+    new function, `_exploded_sites`. `placements_per_ordinal[ordinal]` is now a list of
+    `(point, level, stack_size, visit_number)` tuples — `visit_number` (for orientation-arrow
+    cycling) is computed INSIDE this function now (per-branch: `episode_index //
+    len(point_lists[ordinal])` under `"all"`, `episode_index // num_sites` under static),
+    removing the `position_mode`-conditional visit-number formula that used to live directly in
+    `session.py`.
+  - **`ObjectConfig.variable: bool` was REMOVED entirely — every object now always has a
+    `pattern`.** Investigated directly while redesigning the object schema for clarity: a
+    `variable: false` object was filtered out by `session.py` (`variable_objects = [obj for obj
+    in config.objects if obj.variable]`) and NEVER touched again — not logged once, not shown
+    statically, nothing — pure dead config with no behavior at all. Removing it is a real
+    simplification, not just a rename: `_parse_object` now always requires `pattern` (no more
+    `variable: true` gating whether `pattern`/`orientation` are allowed), and a `variable:` key
+    in a config is now a clean-break `ConfigError` naming the removal directly, same as the
+    `sequencing` removal precedent.
+  - **Clean break, no deprecated aliases** (explicit project-author decision: "make the names
+    as clear as possible," reaffirming the existing pre-release stance) — every one of the 11
+    removed top-level keys (`position_mode`, `site_selection`, `site_count`, `site_order`,
+    `site_seed`, `combination_mode`, `combination_count`, `combination_seed`, `co_location`,
+    `level_strategy`, `level_seed`) plus `episode_targets` itself is checked FIRST in
+    `load_config` (`config.py`'s `_REMOVED_SCENE_KEYS` dict) and raises a `ConfigError` naming
+    its replacement, before any other parsing runs — never silently reinterpreted, never a
+    second accepted spelling.
+  - **`preset:` is parse-time-only sugar — never a stored field, on either the Python or JS
+    side.** `config.py`'s `_PRESETS` dict (`"sweep"` (default) | `"shuffled_sweep"` |
+    `"one_at_a_time"` | `"cycle_through_points"` | `"show_everything"` | `"every_combination"` |
+    `"sample_combinations"` | `"custom"`) supplies the DEFAULT value of each axis before any
+    explicit axis in the same file overrides it — "advanced follows the preset but can be
+    modified," per the user's explicit requirement. `OverlayConfig` itself only ever stores the
+    resolved axes; `preset` is read, expanded, and discarded inside `load_config`.
+  - **A capability genuinely would have been lost without the `"static"` value, found only by
+    cross-checking every existing test against the new model before deleting anything:** the
+    old `position_mode: "overlay"` + `site_selection: "all"` (the default) combination showed
+    EVERY occupied site simultaneously, every episode, with NO rotation at all — a real,
+    tested, persistent-coverage-view feature
+    (`test_overlay_shows_every_occupied_point_full_every_episode_with_no_sweep`), distinct from
+    both "all" (dynamic sweep) and any "<int>" (rotates a subset). Initially the new model only
+    had `"all"`/`<int>`, which had no way to express "every static site, no rotation" without
+    the operator hand-computing and hardcoding the exact current site count — fragile, and
+    silently wrong the moment `exclude_zones` or the object count changed. Fixed by adding
+    `per_episode: "static"` as a third value (`pattern.episode_placements`/
+    `_episode_placements_static` branch on it directly) rather than dropping the capability —
+    consistent with "without losing any of the functionality that is present now."
+  - **Old → new mapping** (every old combination's new equivalent, used directly to migrate
+    `examples/stacking.example.yaml`/`bimanual.example.yaml` and rewrite every affected test):
+    `position_mode: sweep` + `site_selection: all` (the old default) → `per_episode: all`
+    (the new default, byte-identical). `position_mode: overlay` + `site_selection: all` →
+    `per_episode: static`. `episode_targets: one` (`site_selection: subset, site_count: 1`) →
+    `per_episode: 1`. `combination_mode: lockstep`/`"lcm"` → `combinations: synced` (both
+    absorbed into the same value, see above). `combination_mode: shuffled` →
+    `combinations: shuffled`. `combination_mode: cartesian` → `combinations: all`.
+    `combination_mode: systematic`/`"random"`/`"coprime"` + `combination_count: N` →
+    `combinations: N` + `order: even`/`"random"`/`"coprime"` respectively. `co_location` →
+    `stacking` (unchanged values). `level_strategy`/`level_seed` → `level`/`seed`.
+  - **One old capability was deliberately DROPPED, not preserved under a new name: `position_mode:
+    sweep` + `site_selection: subset` (dynamic per-object sweeping continuing underneath, with
+    only a sampled subset actually revealed each episode).** This was the single most obscure
+    corner of the old design — CLAUDE.md's own prior write-up already characterized it as "a
+    new, real corner... that neither old value could express," i.e. it was discovered as an
+    emergent consequence of two independent axes being orthogonal, not built because of a cited
+    operational need. Under the new model, `per_episode: <int>` always means STATIC enumeration
+    (matching the user's own stated mental model of "cycle through points/stacks one at a
+    time"), so this exact combination is no longer directly reachable in the simplified schema
+    — judged an acceptable loss given "as simple as possible," consistent with this project's
+    history of cutting under-justified complexity (`jitter_px`/`presence`, "phase"/"stratified"
+    sequencing). `test_site_selection_subset_under_sweep_shows_only_k_sites_per_episode` (the
+    test that exercised it) was removed, not migrated.
+  - **The calibration tool's Objects card was restructured around the same model**: a `Preset`
+    dropdown (`calibrate.js`'s `PRESETS` table, byte-identical to `config.py`'s `_PRESETS`) plus
+    five advanced controls (`perEpisodeSelect`+`perEpisodeCountInput`, `combinationsSelect`+
+    `combinationsCountInput`, `orderSelect`, `stackingSelect`, `levelSelect`,
+    `sceneSeedInput`) replacing the old 10 controls
+    (`siteSelectionSelect`/`siteCountInput`/`siteOrderSelect`/`siteSeedInput`/
+    `combinationModeSelect`/`combinationCountInput`/`combinationSeedInput`/`coLocationSelect`/
+    `stackLevelStrategySelect`/`stackLevelSeedInput`) — editing any advanced control directly
+    flips the preset selector to `"custom"` (`markCustomPreset()`), mirroring "advanced follows
+    the preset but can be modified." The Preview dropdown SHRANK from 3 values
+    (`"marginal"`/`"episode_sweep"`/`"episode_overlay"`) to 2 (`"marginal"`/`"episode"`) and lost
+    its secret double-duty as the real scene's position-mode control entirely (see the
+    `positionModeSelect` removal bullet above for why that fusion existed) — it is now PURELY a
+    preview-view choice, with no bearing on what gets exported, now that `per_episode`'s
+    open-ended `<int>` case can't be represented by a small fixed dropdown anyway.
+    `objectsExportBlock` no longer emits a `variable: true` line per object (the removed field);
+    `sceneLevelExportBlock` emits the new field names, gated identically (only when non-default,
+    so an untouched scene still exports byte-for-byte to before this model existed).
+  - **`_exploded_sites`/`explodedSites`, `episode_placements`/`computeEpisodePlacements`'s
+    restructured dispatch, and the preset-expansion logic are all newly verified, in both
+    languages** — `tests/overlay/test_pattern.py` gained direct tests for `_exploded_sites`
+    (never merges) and `episode_placements` (the `"all"`/`"static"`/`<int>` × `"stack"`/
+    `"keep_apart"` matrix, plus the residual-only-under-`"all"` and invalid-`per_episode`
+    cases); `tests/overlay/test_config.py` and `test_session.py` were substantially rewritten
+    (every `co_location`/`position_mode`/`site_selection`/`combination_mode` test ported to its
+    new-field equivalent, plus new preset/removed-key/`"static"` tests) — 423 Python tests
+    total (`pytest tests/ -q`), all passing, including a mocked end-to-end `run_session` smoke
+    against both `examples/one_per_episode.example.yaml` (confirms the literal reported
+    scenario: 3 single-point objects, `per_episode: 1`, episodes cycle red→green→blue→red) and
+    the migrated `examples/stacking.example.yaml`. JS side reverified via the same ad-hoc Node
+    harness convention (DOM-stub `document`/`window`, the extracted `<script>` body run in one
+    `vm` context so test assertions share its top-level scope) — preset expansion for all 7
+    presets, manual-edit-flips-to-custom, `explodedSites`/`occupiedSites` divergence, the
+    `per_episode=1` cycling and `"keep_apart"` exploding behavior matching the Python tests
+    above exactly, residual-only-under-`"all"` gating, export gating in both directions, and a
+    full `renderAll()` smoke test with both zero and one object defined (covering the
+    untouched-legacy-path and the new-model episode-preview path respectively).
 
 ## Environment
 

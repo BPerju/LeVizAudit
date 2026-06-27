@@ -221,3 +221,5 @@ running at the same time as anything else.
 pip install -e ".[dev]"
 pytest
 ```
+TODO:
+add episode band in which users can manually design each episode

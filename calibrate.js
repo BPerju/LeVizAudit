@@ -43,15 +43,15 @@ const addObjectBtn = document.getElementById("addObjectBtn");
 const removeObjectBtn = document.getElementById("removeObjectBtn");
 const assignSelectedBtn = document.getElementById("assignSelectedBtn");
 const unassignSelectedBtn = document.getElementById("unassignSelectedBtn");
-const objectSequencingSelect = document.getElementById("objectSequencingSelect");
-const objectSeedInput = document.getElementById("objectSeedInput");
-const episodeTargetsSelect = document.getElementById("episodeTargetsSelect");
-const combinationCountInput = document.getElementById("combinationCountInput");
-const combinationModeSelect = document.getElementById("combinationModeSelect");
-const combinationSeedInput = document.getElementById("combinationSeedInput");
-const coLocationSelect = document.getElementById("coLocationSelect");
-const stackLevelStrategySelect = document.getElementById("stackLevelStrategySelect");
-const stackLevelSeedInput = document.getElementById("stackLevelSeedInput");
+const presetSelect = document.getElementById("presetSelect");
+const perEpisodeSelect = document.getElementById("perEpisodeSelect");
+const perEpisodeCountInput = document.getElementById("perEpisodeCountInput");
+const combinationsSelect = document.getElementById("combinationsSelect");
+const combinationsCountInput = document.getElementById("combinationsCountInput");
+const orderSelect = document.getElementById("orderSelect");
+const stackingSelect = document.getElementById("stackingSelect");
+const levelSelect = document.getElementById("levelSelect");
+const sceneSeedInput = document.getElementById("sceneSeedInput");
 const collisionWarning = document.getElementById("collisionWarning");
 const sampleCountLabel = document.getElementById("sampleCountLabel");
 const previewModeSelect = document.getElementById("previewModeSelect");
@@ -617,13 +617,11 @@ function makeObject(name, color) {
     orientationSeed: 0,
     orientationArrowLength: 40,
     orientationInitialAngle: 0,
-    // Real config.py ObjectConfig field (sequencing), not preview-only -- see pattern.py's
-    // sequence_index. "seed" feeds this object's "shuffled" sequencing (mirrors config.py's
-    // PatternConfig gaining an optional `seed:` under `shape: points` for exactly this
-    // purpose). `jitterPx`/`presence`, two earlier per-object knobs, were removed after a
-    // direct report that they didn't pull their weight -- see CLAUDE.md.
-    sequencing: "lockstep",
-    seed: 0,
+    // `sequencing`/`seed` (per-object visit order) were REMOVED and folded into the scene-level
+    // `combinations`/`seed` below -- the two were always the same underlying question (which of
+    // this thing's own assigned points to show) asked at two different scopes, so keeping both
+    // was redundant. `jitterPx`/`presence`, two earlier per-object knobs, were removed for a
+    // similar reason -- see CLAUDE.md.
   };
 }
 
@@ -633,61 +631,73 @@ let activeObjectIndex = -1; // -1 = no objects defined -- the all-existing-sessi
 // first." Included in undo snapshots (see snapshotState) so an undo/redo round-trip can't
 // make a later assignment's seq collide with or precede an earlier one's.
 let nextAssignmentSeq = 1;
-// Preview-only UI state (not undo-tracked, not exported) -- mirrors how `tool`/`activeArmIndex`
-// are already excluded from undo/redo as plain UI state, not geometry.
-let previewMode = "marginal"; // "marginal" (every object's full assigned cloud, today's-style
-                                // always-on preview) | "episode" (one simultaneous placement)
+// Preview-only UI state (not undo-tracked, not exported): which VIEW this tool shows --
+// "marginal" (today's always-on coverage cloud, every object's full assigned point set at
+// once) or "episode" (step through individual episodes via the scene-level axes below). This
+// is purely about which view to render -- it has no bearing on what gets exported (unlike the
+// older design, where this dropdown ALSO secretly carried the real scene's position_mode --
+// see CLAUDE.md for why that got unified, then un-unified once `per_episode` grew a third,
+// open-ended "<int>" value a 3-option dropdown can no longer represent).
+let previewMode = "marginal"; // "marginal" | "episode"
 let currentEpisode = 0;
 let episodePlaying = false;
 let episodePlayTimer = null;
-// SCENE-LEVEL (not per-object): how many of this episode's SITES (one occupied point, holding
-// one object or, when 2+ objects are assigned there, a GUARANTEED stack -- see occupiedSites/
-// computeEpisodePlacements) are visible at once. "all" (default, today's exact behavior): every
-// site shown simultaneously, every episode -- decoupled from any one object's own pattern
-// length via combinationCount below. "one": exactly one OCCUPIED POINT is shown per episode,
-// round-robin in declaration order over the STATIC union of every object's own assigned points
-// -- #episodes equals the number of distinct occupied points, not the longest object's pattern
-// length -- see CLAUDE.md for the reports that shaped this (stacks were rare/partial under an
-// earlier dynamic-coincidence design for this mode).
-let episodeTargets = "all"; // "all" | "one"
-// SCENE-LEVEL (not per-object), "all" mode only: how many distinct simultaneous-combination
-// episodes to cycle through via combinationIndex, instead of each object independently
-// lockstep/shuffled-sweeping its own pattern (sequenceIndex) -- decouples the visible
-// combination count from any one object's own pattern length (reported directly: "if i have 3
-// objects and 20 steps the combinations are limited to the nr of steps"). `0`/falsy (default)
-// keeps today's exact lockstep/shuffled behavior, byte-for-byte. Ignored under
-// episodeTargets === "one", which has no notion of "combination" at all.
-let combinationCount = 0;
-// SCENE-LEVEL (not per-object), "all" mode only: which of the 5 combination-generation
-// strategies combinationCount drives -- see combinationIndex/resolveCombinationIndices/
-// combinationPeriod for the full rationale of each. "systematic" (default): deterministic,
-// evenly-spread, capped per object at that object's own pattern length. "random": independent
-// seeded draws (combinationSeed) -- escapes that per-object cap, since the joint space is up
-// to the PRODUCT of every object's length. "coprime": a deterministic, no-RNG alternative to
-// "systematic" with the same per-object cap. "cartesian": the full Cartesian product,
-// enumerated deterministically -- escapes the cap with no randomness; can get very large
-// (combinationCount, if set, caps it). "lcm": plain lockstep, but run for exactly
-// lcm(every object's own length) episodes so every pairing lockstep naturally produces
-// appears once. "cartesian"/"lcm" derive their own natural period when combinationCount is
-// left unset/falsy; "random"/"coprime" need it set explicitly.
-let combinationMode = "systematic"; // "systematic" | "random" | "coprime" | "cartesian" | "lcm"
-let combinationSeed = 0; // "random" mode only
-// SCENE-LEVEL (not per-object): whether 2+ objects sharing a point this episode are a real
-// STACK (default -- z-order via stackLevelStrategy/stackLevelSeed below) or should be kept
-// apart instead, each nudged onto one of its OWN other assigned points where possible
-// (resolveKeepApart) -- see CLAUDE.md for why this replaced the earlier per-object "phase"
-// sequencing mode, which conflated object-pair decorrelation with this distinct concern. Only
-// meaningful under episodeTargets === "all" -- under "one", co-location is a static, guaranteed
-// fact derived from occupiedSites, not something that can or can't coincide per episode.
-let coLocation = "stack"; // "stack" | "keep_apart"
-// GLOBAL (not per-object): how 2+ objects' stacking order (level) varies across episodes when
-// they share a point -- both a genuine stack (coLocation === "stack") and a RESIDUAL,
-// unavoidable collision under "keep_apart" use this one setting this pass (per-stack override
-// deferred -- see CLAUDE.md). The marginal overlay's level badge deliberately stays the plain
-// assignment-order rank regardless of this setting, since there's no single "this episode" for
-// a static, always-on view to vary it across.
-let stackLevelStrategy = "fixed";
-let stackLevelSeed = 0;
+
+// ===== Scene-level model -- see CLAUDE.md for the full math/rationale =====
+//
+// What Rerun actually shows each episode is just a set of {point, object, color, level} -- so
+// the whole scene only needs to answer two questions: how many targets per episode
+// (perEpisode), and how the distinct episodes are enumerated (combinations/order, only
+// meaningful when perEpisode === "all") -- plus whether 2+ objects sharing a point this episode
+// pile up or get nudged apart (stacking), and how their z-order varies (level). This mirrors
+// config.py's OverlayConfig.per_episode/combinations/order/stacking/level/seed exactly --
+// `preset` (below) is UI sugar only, exactly like config.py's `preset:` YAML key, and is never
+// itself exported; only the resolved axes are.
+//
+// "all" (default): every object's own position advances every episode -- DYNAMIC sweep.
+// Objects sharing an IDENTICAL assigned point-list are grouped into one atomic stack unit
+// (groupIntoUnits) so a stack is always shown full, never sliced. A scene with no shared
+// point-lists degenerates to one singleton unit per object, in declaration order --
+// byte-identical to the original per-object sweep.
+// "static": STATIC enumeration, no sweep at all -- every point any object is assigned to is a
+// fixed, permanent site, and EVERY one of them is shown every episode (no rotation) -- a
+// persistent coverage/reference view.
+// <positive int> (e.g. 1): like "static", but exactly this many of those fixed sites are shown
+// per episode (selectSites, ordered by `order`). `1` is the common "place one object/stack at a
+// time" case.
+let perEpisode = "all"; // "all" | "static" | <positive int>
+// Only meaningful when perEpisode === "all" -- how the distinct (DYNAMIC) episodes are
+// enumerated. "synced" (default): plain episodeIndex % length per unit (today's exact original
+// behavior). "shuffled": each unit visits its own points in its own seeded-random order. "all":
+// every simultaneous combination of every unit's own points (the full Cartesian product,
+// deterministic). <positive int> N: sample exactly N combinations, spread by `order`.
+let combinations = "synced"; // "synced" | "shuffled" | "all" | <positive int>
+// "even" (default): a deterministic, evenly-spread choice -- used both for sampling
+// combinations: <int> and for which sites a static perEpisode: <int> shows each episode.
+// "random": a seeded random choice instead (uses `seed`). "coprime": a deterministic, no-RNG
+// alternative to "even" for sampling combinations: <int> only (not valid for a static
+// per-episode selection).
+let order = "even"; // "even" | "random" | "coprime"
+// Whether 2+ objects sharing a point this episode pile into a real stack (z-order via
+// level/seed, levelOrder) or get nudged apart instead -- under perEpisode: "all", onto one of
+// their OWN other assigned points where possible (resolveKeepApart); under a static
+// perEpisode: <int>, by never merging coincidentally-shared points into one site in the first
+// place (explodedSites), so the rotation cycles through every individual point instead of
+// every stack.
+let stacking = "stack"; // "stack" | "keep_apart"
+// How a stack's z-order (which member renders on top) varies across episodes when 2+ objects
+// share a site. "fixed" (default): declaration/assignment order, never changes.
+let level = "fixed"; // "fixed" | "shuffle" | "cycle" | "balanced"
+// One shared seed for every randomized aspect above (combinations: "shuffled"/sampling
+// "random"; order: "random"; level: "shuffle"/"balanced") -- internally salted per aspect
+// (SEED_SALT_*) so they don't silently correlate just because they share one user-facing
+// number, mirroring pattern.py's _SEED_SALT_* exactly (parity matters here -- the preview must
+// show exactly what a real session would record for these seeded knobs).
+let seed = 0;
+const SEED_SALT_COMBINATIONS = 0;
+const SEED_SALT_LEVEL = 1;
+const SEED_SALT_SITES = 2;
+let currentPreset = "custom";
 let episodeKeepApartResidual = []; // object names left colliding this episode (keep_apart only)
 
 function renderObjectChips() {
@@ -708,14 +718,11 @@ function renderObjectChips() {
   });
   removeObjectBtn.disabled = objects.length === 0;
   objectColorInput.disabled = objectNameInput.disabled = objects.length === 0;
-  objectSequencingSelect.disabled = objectSeedInput.disabled = activeObjectIndex < 0;
   previewModeSelect.disabled = objects.length === 0;
   if (activeObjectIndex >= 0) {
     const active = objects[activeObjectIndex];
     objectColorInput.value = active.color;
     objectNameInput.value = active.name;
-    objectSequencingSelect.value = active.sequencing;
-    objectSeedInput.value = active.seed;
   }
 }
 
@@ -759,82 +766,137 @@ objectColorInput.addEventListener("input", function () {
   renderObjectChips();
   renderAll();
 });
-objectSequencingSelect.addEventListener("change", function () {
-  if (activeObjectIndex < 0) return;
-  objects[activeObjectIndex].sequencing = objectSequencingSelect.value;
-  renderAll();
-});
-objectSeedInput.addEventListener("input", function () {
-  if (activeObjectIndex < 0) return;
-  objects[activeObjectIndex].seed = parseInt(objectSeedInput.value, 10) || 0;
-  renderAll();
-});
-// combinationCount/coLocation only apply under episodeTargets === "all" (combinationCount has
-// no meaning under "one", which has no notion of "combination" at all; co_location is moot
-// under "one" since co-location there is a static, guaranteed fact derived from occupiedSites,
-// not a per-episode coincidence). stackLevelStrategy/stackLevelSeed, by contrast, are relevant
-// under "one" UNCONDITIONALLY (every multi-member site there is a guaranteed stack) and under
-// "all" only when coLocation === "stack" -- so their availability is a separate check, not
-// simply tied to episodeTargets.
-function updateSceneLevelControlsAvailability() {
-  const isOne = episodeTargets === "one";
-  combinationCountInput.disabled = isOne;
-  combinationModeSelect.disabled = isOne;
-  combinationSeedInput.disabled = isOne || combinationMode !== "random";
-  coLocationSelect.disabled = isOne;
-  const levelControlsRelevant = isOne || coLocation === "stack";
-  stackLevelStrategySelect.disabled = !levelControlsRelevant;
-  stackLevelSeedInput.disabled = !levelControlsRelevant;
+// Named presets are pure UI sugar -- they set the displayed/active value of each axis below,
+// exactly like config.py's `preset:` YAML key expands into defaults for per_episode/
+// combinations/order/stacking/level before any explicit field overrides it. Selecting a preset
+// here writes concrete axis values into the controls (so "advanced follows the preset but can
+// be modified") -- editing any axis control directly afterward flips the preset selector to
+// "custom" via markCustomPreset(), mirroring config.py's _PRESETS table exactly.
+const PRESETS = {
+  sweep: { perEpisode: "all", combinations: "synced", order: "even", stacking: "stack", level: "fixed" },
+  shuffled_sweep: { perEpisode: "all", combinations: "shuffled", order: "even", stacking: "stack", level: "fixed" },
+  one_at_a_time: { perEpisode: 1, combinations: "synced", order: "even", stacking: "stack", level: "fixed" },
+  cycle_through_points: { perEpisode: 1, combinations: "synced", order: "even", stacking: "keep_apart", level: "fixed" },
+  show_everything: { perEpisode: "static", combinations: "synced", order: "even", stacking: "stack", level: "fixed" },
+  every_combination: { perEpisode: "all", combinations: "all", order: "even", stacking: "stack", level: "fixed" },
+  sample_combinations: { perEpisode: "all", combinations: 100, order: "even", stacking: "stack", level: "fixed" },
+  custom: { perEpisode: "all", combinations: "synced", order: "even", stacking: "stack", level: "fixed" },
+};
+
+function perEpisodeModeOf(value) { return value === "all" || value === "static" ? value : "n"; }
+
+function syncSceneControlsFromState() {
+  perEpisodeSelect.value = perEpisodeModeOf(perEpisode);
+  perEpisodeCountInput.value = typeof perEpisode === "number" ? perEpisode : 1;
+  combinationsSelect.value = typeof combinations === "number" ? "n" : combinations;
+  combinationsCountInput.value = typeof combinations === "number" ? combinations : 50;
+  orderSelect.value = order;
+  stackingSelect.value = stacking;
+  levelSelect.value = level;
+  sceneSeedInput.value = seed;
 }
-episodeTargetsSelect.addEventListener("change", function () {
-  episodeTargets = episodeTargetsSelect.value;
+
+function applyPreset(name) {
+  const defaults = PRESETS[name] || PRESETS.custom;
+  perEpisode = defaults.perEpisode;
+  combinations = defaults.combinations;
+  order = defaults.order;
+  stacking = defaults.stacking;
+  level = defaults.level;
+  currentPreset = name;
+  presetSelect.value = name;
+  syncSceneControlsFromState();
   updateSceneLevelControlsAvailability();
-  // episode_targets is a per-EPISODE sequencing concept: it only changes WHICH groups are
-  // shown on a given episode, which is only ever visible in the episode stepper. The marginal
-  // overlay draws every assigned point of every object at once (a coverage check across ALL
-  // episodes), so by construction it CANNOT show "one group per episode" -- toggling this while
-  // in marginal preview looked like it did nothing at all (the reported bug). So selecting "one"
-  // auto-engages the episode preview, where the rotation is actually visible. "all" leaves the
-  // current preview as-is (marginal is perfectly meaningful there -- it's today's behavior).
-  if (episodeTargets === "one" && objects.length > 0 && previewMode !== "episode") {
+  maybeAutoEngageEpisodePreview();
+  renderAll();
+}
+
+function markCustomPreset() {
+  if (currentPreset !== "custom") { currentPreset = "custom"; presetSelect.value = "custom"; }
+}
+
+// `combinations`/`order`-for-sampling only apply when perEpisode === "all" (the DYNAMIC sweep
+// axis) -- a static perEpisode ("static" or <int>) instead uses `order` for ITS OWN site
+// selection (even/random only -- "coprime" is a combinations-sampling-only strategy).
+// `level`/`seed` are always relevant (a static enumeration can still produce 2+-member sites
+// via `stacking: "stack"`, and so can a residual keep_apart collision under "all").
+function updateSceneLevelControlsAvailability() {
+  const isAll = perEpisode === "all";
+  perEpisodeCountInput.disabled = perEpisodeModeOf(perEpisode) !== "n";
+  combinationsSelect.disabled = !isAll;
+  combinationsCountInput.disabled = !isAll || combinationsSelect.value !== "n";
+  orderSelect.disabled = isAll && combinationsSelect.value !== "n";
+  stackingSelect.disabled = false;
+  levelSelect.disabled = false;
+  sceneSeedInput.disabled = false;
+}
+// perEpisode !== "all" is only ever meaningful in the episode-by-episode view -- the marginal
+// overlay draws every assigned point of every object at once (a coverage check across ALL
+// episodes), so by construction it CANNOT show "fewer sites this episode." Leaving it on
+// marginal after restricting perEpisode looked like the setting did nothing at all (the
+// originally-reported bug for the old `episodeTargets: "one"`) -- so narrowing perEpisode
+// auto-engages the episode preview. Leaving it at "all" leaves the current preview as-is
+// (marginal is perfectly meaningful there).
+function maybeAutoEngageEpisodePreview() {
+  if (perEpisode !== "all" && objects.length > 0 && previewMode === "marginal") {
     previewMode = "episode";
     previewModeSelect.value = "episode";
     episodeStepper.style.display = "";
   }
+}
+presetSelect.addEventListener("change", function () { applyPreset(presetSelect.value); });
+perEpisodeSelect.addEventListener("change", function () {
+  const mode = perEpisodeSelect.value;
+  perEpisode = mode === "n" ? Math.max(1, parseInt(perEpisodeCountInput.value, 10) || 1) : mode;
+  markCustomPreset();
+  updateSceneLevelControlsAvailability();
+  maybeAutoEngageEpisodePreview();
   renderAll();
 });
-combinationCountInput.addEventListener("input", function () {
-  combinationCount = parseInt(combinationCountInput.value, 10) || 0;
+perEpisodeCountInput.addEventListener("input", function () {
+  perEpisode = Math.max(1, parseInt(perEpisodeCountInput.value, 10) || 1);
+  markCustomPreset();
   renderAll();
 });
-combinationModeSelect.addEventListener("change", function () {
-  combinationMode = combinationModeSelect.value;
+combinationsSelect.addEventListener("change", function () {
+  const mode = combinationsSelect.value;
+  combinations = mode === "n" ? Math.max(1, parseInt(combinationsCountInput.value, 10) || 1) : mode;
+  markCustomPreset();
   updateSceneLevelControlsAvailability();
   renderAll();
 });
-combinationSeedInput.addEventListener("input", function () {
-  combinationSeed = parseInt(combinationSeedInput.value, 10) || 0;
+combinationsCountInput.addEventListener("input", function () {
+  combinations = Math.max(1, parseInt(combinationsCountInput.value, 10) || 1);
+  markCustomPreset();
   renderAll();
 });
-coLocationSelect.addEventListener("change", function () {
-  coLocation = coLocationSelect.value;
+orderSelect.addEventListener("change", function () {
+  order = orderSelect.value;
+  markCustomPreset();
+  renderAll();
+});
+stackingSelect.addEventListener("change", function () {
+  stacking = stackingSelect.value;
+  markCustomPreset();
   updateSceneLevelControlsAvailability();
   renderAll();
 });
-stackLevelStrategySelect.addEventListener("change", function () {
-  stackLevelStrategy = stackLevelStrategySelect.value;
+levelSelect.addEventListener("change", function () {
+  level = levelSelect.value;
+  markCustomPreset();
   renderAll();
 });
-stackLevelSeedInput.addEventListener("input", function () {
-  stackLevelSeed = parseInt(stackLevelSeedInput.value, 10) || 0;
+sceneSeedInput.addEventListener("input", function () {
+  seed = parseInt(sceneSeedInput.value, 10) || 0;
+  markCustomPreset();
   renderAll();
 });
 assignSelectedBtn.addEventListener("click", assignSelectedToActiveObject);
 unassignSelectedBtn.addEventListener("click", unassignSelectedFromActiveObject);
 previewModeSelect.addEventListener("change", function () {
   previewMode = previewModeSelect.value;
-  episodeStepper.style.display = previewMode === "episode" ? "" : "none";
-  if (previewMode !== "episode") stopEpisodePlayback();
+  episodeStepper.style.display = previewMode !== "marginal" ? "" : "none";
+  if (previewMode === "marginal") stopEpisodePlayback();
   renderAll();
 });
 episodePrevBtn.addEventListener("click", function () {
@@ -885,160 +947,222 @@ function objectStackAt(pointIndex, point) {
   });
 }
 
-// Whether the combinationMode/combinationCount subsystem is active for "all" mode. Diverges
-// slightly from session.py's `combination_active` (active whenever combinationCount is set OR
-// combinationMode != "systematic") for live-preview robustness: Python's config is validated
-// eagerly at load time, so "random"/"coprime" without a count can never actually reach
-// show_targets -- but this tool's dropdown/number-input can transiently be in exactly that
-// state while the operator is mid-edit (e.g. just switched to "Random" before typing a
-// count), and combinationPeriod() throws for that combination. Rather than crash renderAll()
-// on every keystroke, "random"/"coprime" only activate once a count is actually set,
-// otherwise this falls through to legacy lockstep/shuffled -- "cartesian"/"lcm" are always
-// active regardless, since they tolerate an absent count by design.
-function combinationSubsystemActive() {
-  if (combinationMode === "cartesian" || combinationMode === "lcm") return true;
-  return !!combinationCount;
+// Live-preview robustness, perEpisode === "all" only: this tool's dropdown/number-input can
+// transiently be in a state Python's eager config-time validation would reject (e.g. just
+// switched combinations to "Custom count" before typing a count) -- rather than crash
+// renderAll() on every keystroke, an incomplete/invalid combinations value falls back to
+// "synced" until a count is actually set; "synced"/"shuffled"/"all" never need one, so they're
+// always used as-is. Mirrors pattern.py's _COMBINATIONS_KEYWORD_TO_MODE/_ORDER_TO_COMBINATION_MODE.
+const COMBINATIONS_KEYWORD_TO_MODE = { synced: "lockstep", shuffled: "shuffled", all: "cartesian" };
+const ORDER_TO_COMBINATION_MODE = { even: "systematic", random: "random", coprime: "coprime" };
+const ORDER_TO_SITE_ORDER = { even: "round_robin", random: "random" };
+function resolveSweepModeForPreview() {
+  const kwMode = COMBINATIONS_KEYWORD_TO_MODE[combinations];
+  if (kwMode) return { mode: kwMode, count: null };
+  if (typeof combinations === "number" && combinations >= 1) {
+    return { mode: ORDER_TO_COMBINATION_MODE[order] || "systematic", count: combinations };
+  }
+  return { mode: "lockstep", count: null };
 }
 
-// The number of distinct episodes this scene actually has -- mirrors session.py's show_targets
-// exactly. Under `episodeTargets === "one"`: the number of distinct OCCUPIED POINTS
-// (occupiedSites), a static structural fact about the scene, not a per-episode computation --
-// an object with several assigned points gets one dedicated turn per point, so this is exactly
-// the rotation period, not a soft bound. Under "all": combinationPeriod() when the combination
-// subsystem is active (decoupling the visible combination count from any one object's own
-// pattern length), else the longest assigned-point list (today's exact lockstep/shuffled
-// behavior). At least 1 so the stepper never divides by zero with no objects/assignments yet.
+// Groups PRESENT-object ordinals (assignedLists already filtered to objects with 1+ assigned
+// points) into atomic STACK UNITS -- bit-for-bit port of pattern.py's group_into_units, adapted
+// to this tool's shared samplePointsCanonical index space: "identical point-list" here is just
+// "identical SORTED assigned-index array" (plain integer-array equality, no float-coordinate
+// keying needed -- unlike the Python original, which has to compare raw point lists since each
+// object owns its own independent list there). stackingValue === "keep_apart" disables
+// grouping entirely (every object its own singleton unit) -- keep_apart exists to SEPARATE
+// co-located objects, so bonding identical objects into one atomic unit would contradict it.
+// Returns units as arrays of indices INTO `assignedLists` (i.e. into the present-only list),
+// ordered by smallest member index -- the caller maps back to original object ordinals.
+function groupIntoUnits(assignedLists, stackingValue) {
+  if (stackingValue === "keep_apart") {
+    return assignedLists.map(function (_, i) { return [i]; });
+  }
+  const keyToIndices = {};
+  const order = [];
+  assignedLists.forEach(function (sorted, i) {
+    const key = sorted.join(",");
+    if (!keyToIndices[key]) { keyToIndices[key] = []; order.push(key); }
+    keyToIndices[key].push(i);
+  });
+  return order.map(function (key) { return keyToIndices[key]; });
+}
+
+// Bit-for-bit port of pattern.py's resolve_unit_indices -- the unified visit-order axis
+// replacing BOTH the old per-object `sequencing` field and the old combination subsystem.
+// "lockstep"/"shuffled" dispatch to sequenceIndex per unit (the unit's own index into `lengths`
+// is its objectOrdinal, lengths.length is numObjects); the other 5 modes dispatch to
+// combinationPeriod/resolveCombinationIndices exactly as the old scene-level subsystem did.
+function resolveUnitIndices(episodeIndex, lengths, mode, combinationCountValue, seed) {
+  mode = mode || "lockstep";
+  if (mode === "lockstep" || mode === "shuffled") {
+    const numUnits = lengths.length;
+    return lengths.map(function (length, ordinal) {
+      return sequenceIndex(episodeIndex, length, mode, ordinal, numUnits, seed);
+    });
+  }
+  const period = combinationPeriod(lengths, mode, combinationCountValue);
+  return resolveCombinationIndices(episodeIndex % period, lengths, mode, period, seed);
+}
+
+// Bit-for-bit port of pattern.py's select_sites -- used by computeEpisodePlacements' static
+// (perEpisode !== "all") branch: which of `numSites` fixed sites (indices 0..numSites-1, in
+// whatever stable order the caller built them) to actually show this episode.
+function selectSites(numSites, selection, count, order, seed, episodeIndex) {
+  if (selection === "all") {
+    const all = [];
+    for (let i = 0; i < numSites; i++) all.push(i);
+    return all;
+  }
+  if (numSites === 0) return [];
+  const k = Math.min(count || numSites, numSites);
+  if (order === "round_robin") {
+    const result = [];
+    for (let j = 0; j < k; j++) result.push((episodeIndex * k + j) % numSites);
+    return result.sort(function (a, b) { return a - b; });
+  }
+  if (order === "random") {
+    const perm = seededPermutation(numSites, combineSeed(seed, episodeIndex));
+    return perm.slice(0, k).sort(function (a, b) { return a - b; });
+  }
+  throw new Error("Unknown site order: " + order);
+}
+
+// The number of distinct episodes this scene actually has -- a soft preview bound, mirroring
+// pattern.py's relevant period exactly for perEpisode === "all" (a static perEpisode has no
+// positional period at all -- the static site count is a representative preview span, per
+// CLAUDE.md). At least 1 so the stepper never divides by zero with no objects/assignments yet.
 function maxEpisodeCount() {
-  if (episodeTargets === "one") {
-    return Math.max(1, occupiedSites().length);
+  let numSites;
+  if (perEpisode !== "all") {
+    numSites = (stacking === "stack" ? occupiedSites() : explodedSites()).length;
+  } else {
+    const presentAssignedLists = objects.filter(function (o) { return o.assigned.length > 0; })
+      .map(function (o) { return o.assigned.slice().sort(function (a, b) { return a - b; }); });
+    if (presentAssignedLists.length === 0) {
+      numSites = 0;
+    } else {
+      const units = groupIntoUnits(presentAssignedLists, stacking);
+      const unitLengths = units.map(function (unit) { return presentAssignedLists[unit[0]].length; });
+      const resolved = resolveSweepModeForPreview();
+      numSites = (resolved.mode === "lockstep" || resolved.mode === "shuffled")
+        ? Math.max.apply(null, unitLengths)
+        : combinationPeriod(unitLengths, resolved.mode, resolved.count);
+    }
   }
-  const lens = objects.filter(function (o) { return o.assigned.length > 0; }).map(function (o) { return o.assigned.length; });
-  if (combinationSubsystemActive()) {
-    return Math.max(1, combinationPeriod(lens, combinationMode, combinationCount));
-  }
-  return lens.length > 0 ? Math.max.apply(null, lens) : 1;
+  return Math.max(1, numSites);
 }
 
-// The exact simultaneous multi-object placement for one episode -- mirrors session.py's
-// show_targets exactly, with the same two-mode split.
+// The exact simultaneous multi-object placement for one episode -- mirrors pattern.py's
+// episode_placements exactly, dispatching on the same model.
 //
-// `episodeTargets === "one"`: exactly ONE occupied point (occupiedSites -- the STATIC union of
-// every object's own assigned points) is shown, with its full, GUARANTEED membership (a single
-// object, or, since assignment to the same point now means co-location, full stop, several at
-// once -- never a per-episode coincidence). Every object outside that one site is implicitly
-// absent. `coLocation`/`sequencing` don't apply here -- see CLAUDE.md for why an earlier,
-// dynamic-coincidence design for this mode made stacks rare and partial, which this replaced.
+// perEpisode === "all" (DYNAMIC sweep): present objects are grouped into atomic STACK UNITS
+// (groupIntoUnits) -- objects sharing an IDENTICAL assigned-index list always move together, so
+// a stack is never sliced. Each unit's own index is resolved via resolveUnitIndices (the
+// unified lockstep/shuffled/systematic/random/coprime/cartesian/lcm visit-order axis), expanded
+// back to each member, then `stacking` branches ("stack": leave natural indices untouched, so
+// two units whose resolved points coincide this episode group into a real (possibly
+// cross-unit) site; "keep_apart": resolveKeepApart nudges a colliding object onto one of its
+// own other points first -- note keep_apart always sees singleton units, see groupIntoUnits),
+// then grouped by exact resolved-index equality -- recomputed fresh EVERY episode. Every
+// resulting site is shown (no further selection).
 //
-// `episodeTargets === "all"`: every site shown simultaneously, exactly as before this setting
-// existed -- each object's own index is either the systematic `combinationIndex` spread (when
-// `combinationCount` is set) or the legacy per-object `sequenceIndex` sweep, then a branch on
-// `coLocation` ("stack": leave natural indices untouched, so two objects whose patterns
-// coincide this episode group into a real stack; "keep_apart": resolveKeepApart nudges a
-// colliding object onto one of its own other points first), then grouped by exact
-// resolved-position equality -- recomputed fresh EVERY episode.
+// perEpisode === "static" or <int>: no sweep at all -- every point any object is assigned to is
+// a fixed site (occupiedSites for "stack", explodedSites for "keep_apart" -- never merging
+// coincidentally-shared points there). "static" shows every one of them; <int> shows exactly
+// that many via `order` (selectSites).
 //
 // Returns `{sites, residual}`: `sites` is `[{point, members: [{object, tip, level}]}]` (one
-// entry per OCCUPIED point, never per member -- a stack is one site with several members, not
-// several co-located placements) and `residual` is the object NAMES left colliding this episode
-// under "keep_apart" (always `[]` under "stack", and always `[]` under "one", which has no
-// notion of keep-apart at all).
+// entry per SELECTED occupied point, never per member -- a stack is one site with several
+// members, not several co-located placements) and `residual` is the object NAMES left colliding
+// this episode under "keep_apart" (always `[]` except under perEpisode === "all", which is the
+// only branch with any per-episode coincidence to resolve in the first place).
 function computeEpisodePlacements(episodeIndex) {
-  if (episodeTargets === "one") {
-    const sites = occupiedSites();
-    if (sites.length === 0) return { sites: [], residual: [] };
-    const site = sites[episodeIndex % sites.length];
-    const idx = site.idx;
-    const point = samplePointsCanonical[idx];
-    if (!point) return { sites: [], residual: [] };
-    const here = site.members.map(function (ordinal) { return { object: objects[ordinal] }; })
-      .sort(function (a, b) { return (a.object.assignedSeq[idx] || 0) - (b.object.assignedSeq[idx] || 0); });
-    const levels = levelOrder(here.length, episodeIndex, stackLevelStrategy, stackLevelSeed);
-    const visitNumber = Math.floor(episodeIndex / sites.length);
-    const members = here.map(function (e, rank) {
-      const o = e.object;
-      const level = levels[rank];
-      const cfg = o.orientationOverrides[idx] || o;
-      let tip = null;
-      if (cfg.orientationEnabled) {
-        const angles = anglesForPoint(cfg, idx);
-        tip = orientationTipCanonical(point, angles[visitNumber % angles.length], cfg.orientationArrowLength);
-      }
-      return { object: o, point: point, tip: tip, level: level };
-    });
-    return { sites: [{ point: point, members: members }], residual: [] };
-  }
-
-  const numObjects = objects.length;
   const assignedLists = objects.map(function (o) { return o.assigned.slice().sort(function (a, b) { return a - b; }); });
+  let siteList; // [{idx, members: [ordinal, ...]}], in a stable per-episode order
+  let residualOrdinals = [];
+  let visitDivisorFor; // function(ordinal) -> orientation visit-number divisor
 
-  let naturalIndices;
-  if (combinationSubsystemActive()) {
-    // cartesian/lcm need every PRESENT object's length jointly -- absent objects (no points
-    // assigned yet, a transient calibration-tool-only state with no Python equivalent) are
-    // filtered out first, then results are mapped back onto their original ordinal position.
+  if (perEpisode === "all") {
     const presentOrdinals = [];
-    const presentLengths = [];
-    objects.forEach(function (o, ordinal) {
-      if (assignedLists[ordinal].length === 0) return;
-      presentOrdinals.push(ordinal);
-      presentLengths.push(assignedLists[ordinal].length);
-    });
-    naturalIndices = objects.map(function () { return null; });
-    if (presentLengths.length > 0) {
-      const period = combinationPeriod(presentLengths, combinationMode, combinationCount);
-      const comboIdx = episodeIndex % period;
-      const resolved = resolveCombinationIndices(comboIdx, presentLengths, combinationMode, period, combinationSeed);
-      presentOrdinals.forEach(function (ordinal, i) {
-        naturalIndices[ordinal] = assignedLists[ordinal][resolved[i]];
+    objects.forEach(function (o, ordinal) { if (assignedLists[ordinal].length > 0) presentOrdinals.push(ordinal); });
+    const presentAssignedLists = presentOrdinals.map(function (ordinal) { return assignedLists[ordinal]; });
+    const units = groupIntoUnits(presentAssignedLists, stacking); // indices into presentOrdinals
+    const unitLengths = units.map(function (unit) { return presentAssignedLists[unit[0]].length; });
+
+    const naturalIndices = objects.map(function () { return null; }); // by ORIGINAL ordinal
+    if (unitLengths.length > 0) {
+      const resolved = resolveSweepModeForPreview();
+      const unitIndices = resolveUnitIndices(
+        episodeIndex, unitLengths, resolved.mode, resolved.count, combineSeed(seed, SEED_SALT_COMBINATIONS),
+      );
+      units.forEach(function (unit, ui) {
+        const chosen = unitIndices[ui];
+        unit.forEach(function (presentLocalIdx) {
+          const originalOrdinal = presentOrdinals[presentLocalIdx];
+          naturalIndices[originalOrdinal] = assignedLists[originalOrdinal][chosen];
+        });
       });
     }
-  } else {
-    naturalIndices = objects.map(function (o, ordinal) {
-      if (o.assigned.length === 0) return null;
-      const sorted = assignedLists[ordinal];
-      const seqIdx = sequenceIndex(episodeIndex, sorted.length, o.sequencing, ordinal, numObjects, o.seed);
-      return sorted[seqIdx];
+
+    let resolvedIndices;
+    if (stacking === "keep_apart") {
+      const result = resolveKeepApart(naturalIndices, assignedLists, episodeIndex);
+      resolvedIndices = result[0];
+      residualOrdinals = result[1];
+    } else {
+      resolvedIndices = naturalIndices;
+    }
+
+    const byIndex = {};
+    const orderList = [];
+    objects.forEach(function (o, ordinal) {
+      const idx = resolvedIndices[ordinal];
+      if (idx === null || idx === undefined) return;
+      if (!byIndex[idx]) { byIndex[idx] = []; orderList.push(idx); }
+      byIndex[idx].push(ordinal);
     });
-  }
-
-  let resolvedIndices, residualOrdinals;
-  if (coLocation === "keep_apart") {
-    const result = resolveKeepApart(naturalIndices, assignedLists, episodeIndex);
-    resolvedIndices = result[0];
-    residualOrdinals = result[1];
+    siteList = orderList.map(function (idx) { return { idx: idx, members: byIndex[idx] }; });
+    visitDivisorFor = function (ordinal) { return objects[ordinal].assigned.length; };
   } else {
-    resolvedIndices = naturalIndices;
-    residualOrdinals = [];
+    siteList = stacking === "stack" ? occupiedSites() : explodedSites();
+    const numSites = siteList.length;
+    visitDivisorFor = function () { return numSites; };
   }
 
-  const byIndex = {};
-  objects.forEach(function (o, ordinal) {
-    const idx = resolvedIndices[ordinal];
-    if (idx === null || idx === undefined) return;
-    (byIndex[idx] = byIndex[idx] || []).push({ object: o, ordinal: ordinal });
-  });
+  if (siteList.length === 0) return { sites: [], residual: [] };
 
-  const entries = Object.keys(byIndex).map(function (key) {
-    return { idx: parseInt(key, 10), members: byIndex[key] };
-  });
+  let selected;
+  if (perEpisode === "all" || perEpisode === "static") {
+    selected = siteList.map(function (_, i) { return i; });
+  } else {
+    const siteOrderValue = ORDER_TO_SITE_ORDER[order] || "round_robin";
+    selected = selectSites(
+      siteList.length, "subset", perEpisode, siteOrderValue, combineSeed(seed, SEED_SALT_SITES), episodeIndex,
+    );
+  }
 
   const sites = [];
-  entries.forEach(function (entry) {
-    const idx = entry.idx;
+  selected.forEach(function (i) {
+    const site = siteList[i];
+    const idx = site.idx;
     const point = samplePointsCanonical[idx];
     if (!point) return;
-    const here = entry.members.slice().sort(function (a, b) { return (a.object.assignedSeq[idx] || 0) - (b.object.assignedSeq[idx] || 0); });
-    const levels = levelOrder(here.length, episodeIndex, stackLevelStrategy, stackLevelSeed);
+    const here = site.members.map(function (ordinal) { return { ordinal: ordinal, object: objects[ordinal] }; })
+      .sort(function (a, b) { return (a.object.assignedSeq[idx] || 0) - (b.object.assignedSeq[idx] || 0); });
+    const levels = levelOrder(here.length, episodeIndex, level, combineSeed(seed, SEED_SALT_LEVEL));
     const members = here.map(function (e, rank) {
       const o = e.object;
-      const level = levels[rank];
+      const lvl = levels[rank];
       const cfg = o.orientationOverrides[idx] || o;
       let tip = null;
       if (cfg.orientationEnabled) {
         const angles = anglesForPoint(cfg, idx);
-        tip = orientationTipCanonical(point, angles[episodeIndex % angles.length], cfg.orientationArrowLength);
+        const visitNumber = Math.floor(episodeIndex / visitDivisorFor(e.ordinal));
+        tip = orientationTipCanonical(point, angles[visitNumber % angles.length], cfg.orientationArrowLength);
       }
-      return { object: o, point: point, tip: tip, level: level };
+      return { object: o, point: point, tip: tip, level: lvl };
     });
     sites.push({ point: point, members: members });
   });
@@ -1403,7 +1527,7 @@ function sequenceIndex(episodeIndex, length, mode, objectOrdinal, numObjects, se
   }
   // A third mode, "phase", shipped briefly and was removed: it conflated "decorrelate two
   // SEPARATE objects' sweeps" with "keep two objects that share a point from ever
-  // co-occupying it," which is the distinct, scene-level `coLocation === "keep_apart"` concern
+  // co-occupying it," which is the distinct, scene-level `stacking === "keep_apart"` concern
   // handled by resolveKeepApart below instead -- see CLAUDE.md.
   throw new Error("Unknown sequencing mode: " + mode);
 }
@@ -1557,7 +1681,23 @@ function occupiedSites() {
   return indices.map(function (idx) { return { idx: idx, members: byIndex[idx] }; });
 }
 
-// Mirrors pattern.py's resolve_keep_apart exactly. For `coLocation === "keep_apart"`: given
+// Bit-for-bit port of pattern.py's _exploded_sites -- like occupiedSites, but NEVER merges two
+// objects' points sharing the same exact sample index into one site: every (object, point)
+// pair is its own, permanently un-stacked site. Used by computeEpisodePlacements/
+// maxEpisodeCount for `stacking === "keep_apart"` under a static perEpisode, where the
+// explicit intent is "cycle through every individual point, one at a time" rather than "cycle
+// through stacks" (occupiedSites, used for `stacking === "stack"`).
+function explodedSites() {
+  const sites = [];
+  objects.forEach(function (o, ordinal) {
+    o.assigned.slice().sort(function (a, b) { return a - b; }).forEach(function (idx) {
+      sites.push({ idx: idx, members: [ordinal] });
+    });
+  });
+  return sites;
+}
+
+// Mirrors pattern.py's resolve_keep_apart exactly. For `stacking === "keep_apart"`: given
 // each present object's NATURAL (already-sequenceIndex-resolved) point index this episode
 // (`null` for an absent object, left untouched), greedily resolves same-episode collisions in
 // DECLARATION order (array order == object ordinal): the first object wanting a point keeps
@@ -2856,7 +2996,7 @@ let orientationTipsCanonical = [], orientationTipsCamera = [];
 // renderCameraView/renderOrthoView. Only meaningful once objects.length > 0.
 let objectStacksAtPoint = [];
 // This episode's exact simultaneous multi-object placement (computeEpisodePlacements), only
-// recomputed when previewMode === "episode" -- consumed by the episode-stepper render branch.
+// recomputed when previewMode !== "marginal" -- consumed by the episode-stepper render branch.
 let episodePlacements = [];
 let orthoScale = 1;
 let lastCanonicalSize = null; // for rescaleCanonicalShapes() -- see below
@@ -3065,7 +3205,7 @@ function renderAll() {
   episodeLabel.textContent = "episode " + (currentEpisode + 1) + "/" + episodeCount;
   episodePrevBtn.disabled = currentEpisode <= 0;
   episodeNextBtn.disabled = currentEpisode >= episodeCount - 1;
-  if (objects.length > 0 && previewMode === "episode") {
+  if (objects.length > 0 && previewMode !== "marginal") {
     const result = computeEpisodePlacements(currentEpisode);
     episodePlacements = result.sites;
     episodeKeepApartResidual = result.residual;
@@ -3088,7 +3228,10 @@ function renderAll() {
 // episodes up front instead of one at a time during recording).
 const KEEP_APART_SCAN_LIMIT = 50;
 function updateCollisionWarning() {
-  if (coLocation !== "keep_apart" || objects.length === 0) {
+  // residual collisions only ever arise under perEpisode === "all" (the only branch with any
+  // per-episode coincidence to resolve in the first place -- a static perEpisode instead
+  // decides whether sites merge or explode up front, with no conflict left to resolve).
+  if (stacking !== "keep_apart" || perEpisode !== "all" || objects.length === 0) {
     collisionWarning.style.display = "none";
     return;
   }
@@ -3407,7 +3550,7 @@ function renderCameraView() {
 // drawn -- every other object's dot/arrows render in its own color with no ring.
 function renderObjectPlacementsCamera(ctx, sampleRadius) {
   const activeObject = activeObjectIndex >= 0 ? objects[activeObjectIndex] : null;
-  if (previewMode === "episode") {
+  if (previewMode !== "marginal") {
     // Faint context dots for every point not part of this episode's placement, so the
     // operator can still see the whole cloud while focusing on the one simultaneous scene.
     samplePointsCamera.forEach(function (p) {
@@ -3627,7 +3770,7 @@ function renderOrthoView() {
 function renderObjectPlacementsOrtho(ctx, sampleRadius) {
   const activeObject = activeObjectIndex >= 0 ? objects[activeObjectIndex] : null;
   function scaled(p) { return [p[0] * orthoScale, p[1] * orthoScale]; }
-  if (previewMode === "episode") {
+  if (previewMode !== "marginal") {
     samplePointsCanonical.forEach(function (p) {
       const sp = scaled(p);
       ctx.beginPath(); ctx.arc(sp[0], sp[1], 2, 0, 2 * Math.PI); ctx.fillStyle = "rgba(91,98,116,0.6)"; ctx.fill();
@@ -3725,17 +3868,15 @@ function objectsExportBlock() {
     const sortedIdx = o.assigned.slice().sort(function (a, b) { return a - b; }).filter(function (i) { return !!samplePointsCanonical[i]; });
     const pixelPoints = sortedIdx.map(function (i) { return toPixel(samplePointsCanonical[i]); });
     body += "  - name: " + JSON.stringify(o.name) + "\n";
-    body += "    variable: true\n";
     body += "    marker:\n      color_rgba: " + hexToRgbaArrayString(o.color) + "\n";
     body += "    pattern:\n";
     body += "      shape: points\n";
     body += "      points: [" +
       pixelPoints.map(function (p) { return "[" + Math.round(p[0]) + ", " + Math.round(p[1]) + "]"; }).join(", ") +
       "]\n";
-    // Only emitted when non-default, so an object that never touched these knobs exports
-    // exactly as it did before they existed.
-    if (o.seed) body += "      seed: " + o.seed + "\n";
-    if (o.sequencing && o.sequencing !== "lockstep") body += "    sequencing: " + o.sequencing + "\n";
+    // `seed`/`sequencing` are gone -- the points pattern's own `seed` field had no remaining
+    // consumer once per-object sequencing was folded into scene-level `combinations`, and was
+    // removed from config.py's schema entirely (see CLAUDE.md).
     if (o.orientationEnabled) body += indentLines(orientationExportBlock(o), "    ");
   });
   body += sceneLevelExportBlock();
@@ -3743,20 +3884,24 @@ function objectsExportBlock() {
 }
 
 // SCENE-LEVEL (sibling to `objects:`, not nested under it -- matches config.py's
-// OverlayConfig.episode_targets/co_location/level_strategy/level_seed exactly). Stacking is
-// read directly off which objects' `pattern: {shape: points}` lists happen to share a
-// coordinate -- there's no separate authored-site block to export. Only emitted when
-// non-default, so a session that never touched these exports byte-identically to before they
+// OverlayConfig.per_episode/combinations/order/stacking/level/seed exactly; `preset` is never
+// exported -- it's parse-time sugar only, on both the Python and JS sides). Stacking is read
+// directly off which objects' `pattern: {shape: points}` lists happen to share a coordinate --
+// there's no separate authored-site block to export. Only emitted when non-default, so a
+// session that never touched these exports byte-identically to before this scene-level model
 // existed.
 function sceneLevelExportBlock() {
   let body = "";
-  if (episodeTargets !== "all") body += "episode_targets: " + episodeTargets + "\n";
-  if (combinationCount) body += "combination_count: " + combinationCount + "\n";
-  if (combinationMode !== "systematic") body += "combination_mode: " + combinationMode + "\n";
-  if (combinationSeed) body += "combination_seed: " + combinationSeed + "\n";
-  if (coLocation !== "stack") body += "co_location: " + coLocation + "\n";
-  if (stackLevelStrategy !== "fixed") body += "level_strategy: " + stackLevelStrategy + "\n";
-  if (stackLevelSeed) body += "level_seed: " + stackLevelSeed + "\n";
+  if (perEpisode !== "all") body += "per_episode: " + perEpisode + "\n";
+  if (perEpisode === "all") {
+    if (combinations !== "synced") body += "combinations: " + combinations + "\n";
+    if (typeof combinations === "number" && order !== "even") body += "order: " + order + "\n";
+  } else if (typeof perEpisode === "number" && order !== "even") {
+    body += "order: " + order + "\n";
+  }
+  if (stacking !== "stack") body += "stacking: " + stacking + "\n";
+  if (level !== "fixed") body += "level: " + level + "\n";
+  if (seed) body += "seed: " + seed + "\n";
   return body;
 }
 
@@ -4491,4 +4636,5 @@ updateToolUI();
 updateUndoRedoUI();
 renderArmChips();
 renderObjectChips();
+updateSceneLevelControlsAvailability();
 renderAll();

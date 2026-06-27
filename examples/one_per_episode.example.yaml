@@ -1,0 +1,38 @@
+# vizaudit-overlay pattern config demonstrating the simplest multi-object case: "I have N
+# objects and want to guide the operator to place exactly ONE of them per episode" -- this was
+# the case that motivated the scene-level model's redesign (see CLAUDE.md). The whole answer is
+# one field: `per_episode: 1`.
+#
+# Each object below has its own single, fixed point (`shape: points` with one entry) --
+# `per_episode: 1` then cycles through them, one per episode, in declaration order: episode 0
+# shows red_cube, episode 1 shows green_cube, episode 2 shows blue_cube, episode 3 repeats
+# red_cube, and so on. No `combinations`/`order`/`stacking`/`level` axis matters for this case
+# (every object has only one point, and none of them share a point with another), so none are
+# set -- they keep their defaults, inert for this scene.
+#
+# Equivalent, more memorable spelling: `preset: one_at_a_time` instead of `per_episode: 1`.
+
+camera_key: observation.images.top
+
+objects:
+  - name: red_cube
+    count: 1
+    pattern: { shape: points, points: [[160, 240]] }
+    marker: { color_rgba: [239, 68, 68, 255] }
+
+  - name: green_cube
+    count: 1
+    pattern: { shape: points, points: [[320, 240]] }
+    marker: { color_rgba: [74, 222, 128, 255] }
+
+  - name: blue_cube
+    count: 1
+    pattern: { shape: points, points: [[480, 240]] }
+    marker: { color_rgba: [59, 130, 246, 255] }
+
+marker:
+  radius_px: 10
+  color_rgba: [255, 64, 64, 255]
+  label: true
+
+per_episode: 1
