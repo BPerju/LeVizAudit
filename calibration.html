@@ -7,260 +7,234 @@
 </head>
 <body>
 <h1>VizAudit calibration</h1>
-<p class="subtitle">
-  Marks a robot's reachable workspace on a live camera feed and configures how target points
-  are sampled within it, for guided data-collection.<br>
-  <strong>How to:</strong> in Workspace setup -- 1) drag the 4 corners onto the work surface;
-  2) "Mark reach points" and click 3+ spots at the edges of where the arm can physically
-  reach; 3) "Fit circle". Then tune Pattern/Rotation below and copy the YAML below.
-</p>
 
-<div class="panel">
-  <h2>Setup</h2>
-  <div class="setup-columns">
-    <div class="subsection">
-      <div class="subsection-label">Camera</div>
-      <div class="toolbar-group-inner">
-        <select id="deviceSelect"></select>
-        <button id="startBtn">Start camera</button>
-      </div>
-    </div>
-    <div class="subsection">
-      <div class="subsection-label">Arms</div>
-      <div class="toolbar-group-inner" id="armChips"></div>
-      <div class="toolbar-group-inner" style="margin-top: 9px;">
-        <input type="color" id="armColorInput" title="Active arm's color" value="#34d399">
-        <input type="text" id="armNameInput" placeholder="Arm name" style="width: 96px;">
-        <button id="addArmBtn" class="icon-btn" title="Add another arm">+</button>
-        <button id="removeArmBtn" class="icon-btn danger" title="Remove the active arm">&#10005;</button>
-        <label title="When two arms' reach circles overlap, sample the UNION as one shared area (the overlap isn't double-density) instead of each circle independently. Off by default. Forced on, and disabled, with only one arm.">
-          <input type="checkbox" id="independentToggle"> Independent
-        </label>
-      </div>
-    </div>
-    <div class="subsection">
-      <div class="subsection-label">Workspace edit tools</div>
-      <div class="toolbar-group-inner">
-        <button id="toolCorners" class="icon-btn active" title="Edit: corners, edges, the reach circle &amp; reach points">
-          <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
-            <rect x="2" y="2" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6"/>
-            <circle cx="2" cy="2" r="1.6" fill="currentColor"/><circle cx="14" cy="2" r="1.6" fill="currentColor"/>
-            <circle cx="14" cy="14" r="1.6" fill="currentColor"/><circle cx="2" cy="14" r="1.6" fill="currentColor"/>
-            <rect x="7" y="1" width="2" height="2" fill="currentColor"/><rect x="7" y="13" width="2" height="2" fill="currentColor"/>
-            <rect x="1" y="7" width="2" height="2" fill="currentColor"/><rect x="13" y="7" width="2" height="2" fill="currentColor"/>
-          </svg>
-        </button>
-        <button id="lockCornersBtn" class="icon-btn" title="Lock corners/edges">&#x1F513;</button>
-        <button id="resetCornersBtn">Reset corners</button>
-        <button id="toolExtreme" title="Mark reach points">Mark reach points</button>
-        <button id="fitCircleBtn" disabled title="Fit a circle to the marked reach points">Fit circle</button>
-        <button id="lockCircleBtn" class="icon-btn" title="Lock the fitted reach circle">&#x1F513;</button>
-        <button id="clearExtremeBtn">Clear points</button>
-      </div>
-    </div>
-  </div>
-</div>
-<div class="panel">
-  <div class="subsection">
-    <div class="card-header">
-      <h2 id="patternPreviewLabel" style="margin: 0;">Pattern</h2>
-      <button id="lockPatternBtn" class="icon-btn" title="Lock pattern: also blocks moving/adding/removing sample points">&#x1F513;</button>
-    </div>
-    <div class="toolbar-group-inner">
-      <label>Steps <input type="number" id="stepsInput" value="20" min="1"></label>
-      <span class="note" id="actualCountLabel"></span>
-      <label>Seed <input type="number" id="seedInput" value="0"></label>
-      <label>Distribution
-        <select id="distributionSelect">
-          <option value="grid" selected>Grid</option>
-          <option value="radial" id="distributionRadialOption">Radial (beta)</option>
-          <option value="random">Random</option>
-        </select>
-      </label>
-      <label>Border width <input type="number" id="borderWidthInput" value="0" min="0"></label>
-      <label>Count mode
-        <select id="countModeSelect">
-          <option value="fixed" selected>Fixed</option>
-          <option value="variable" id="countModeVariableOption">Variable</option>
-        </select>
-      </label>
-    </div>
-  </div>
-  <div class="subsection">
-    <h2 id="orientationPreviewLabel" style="margin: 0 0 10px;">Rotation</h2>
-    <div class="toolbar-group-inner">
-      <label title="A real config option (orientation:), not just a local preview -- Rerun won't show direction arrows during recording unless this is enabled too."><input type="checkbox" id="orientationToggle"> Enable</label>
-    </div>
-    <div id="orientationDetailFields" class="toolbar-group-inner" style="display: none; margin-top: 9px;">
-      <label>Count <input type="number" id="orientationCountInput" value="1" min="1"></label>
-      <label>Method
-        <select id="orientationMethodSelect">
-          <option value="uniform" selected>Uniform</option>
-          <option value="random">Random</option>
-        </select>
-      </label>
-      <label>Initial&deg; <input type="number" id="orientationInitialAngleInput" value="0"></label>
-      <label>Start&deg; <input type="number" id="orientationAngleStartInput" value="0"></label>
-      <label>End&deg; <input type="number" id="orientationAngleEndInput" value="360"></label>
-      <label>Seed <input type="number" id="orientationSeedInput" value="0"></label>
-      <label>Arrow len <input type="number" id="orientationArrowLengthInput" value="40" min="1"></label>
-      <button id="resetOrientationBtn" class="danger" title="Selected points: clear their override, reverting to this default. Nothing selected: clear every point's override.">Reset to default</button>
-    </div>
-  </div>
-</div>
-<div class="panel">
-  <h2>Objects</h2>
-  <p class="note" style="margin: 0 0 10px;">
-    Define the things this scene places (one per gripper, one per block, etc.). To place one:
-    pick its chip below, then use the floating toolbar's "select" tool (box-drag or click) on
-    either view to select sample points, then click "Assign" here -- "Unassign" removes the
-    active object from the current selection. A point can hold several objects; their stacking
-    order is figured out automatically from the order you assigned them, not something you set
-    by hand -- the episode preview below draws a stack as one dot plus a small legend showing
-    which object is on top. The knobs below are REAL config fields the live overlay reads, not
-    just a local preview -- see CLAUDE.md.
-  </p>
-  <div class="toolbar-group-inner" id="objectChips"></div>
-  <div class="toolbar-group-inner" style="margin-top: 9px;">
-    <input type="color" id="objectColorInput" title="Active object's color" value="#f87171" disabled>
-    <input type="text" id="objectNameInput" placeholder="Object name" style="width: 96px;" disabled>
-    <button id="addObjectBtn" class="icon-btn" title="Add another object">+</button>
-    <button id="removeObjectBtn" class="icon-btn danger" title="Remove the active object" disabled>&#10005;</button>
-    <button id="assignSelectedBtn" title="Assign the active object to every currently-selected sample point (select points first with the select tool)" disabled>Assign</button>
-    <button id="unassignSelectedBtn" title="Remove the active object from every currently-selected sample point" disabled>Unassign</button>
-  </div>
-  <div class="toolbar-group-inner" style="margin-top: 9px;">
-    <label title="A shorthand that sets every axis below at once -- pick one, or pick 'Custom' and set axes individually. Editing any axis directly afterward switches this back to Custom automatically.">Preset
-      <select id="presetSelect">
-        <option value="sweep" selected>Sweep (default -- every object, every episode)</option>
-        <option value="shuffled_sweep">Shuffled sweep</option>
-        <option value="one_at_a_time">One at a time</option>
-        <option value="cycle_through_points">Cycle through points</option>
-        <option value="show_everything">Show everything (no rotation)</option>
-        <option value="every_combination">Every combination</option>
-        <option value="sample_combinations">Sample combinations</option>
-        <option value="custom">Custom</option>
-      </select>
-    </label>
-  </div>
-  <div class="toolbar-group-inner" style="margin-top: 9px;">
-    <label title="SCENE-LEVEL: how many targets are shown each episode. All (default): every object's own position advances every episode (a dynamic sweep). Static: every point any object is assigned to is shown at once, every episode, with no rotation at all. N at a time: exactly N of those fixed points/stacks rotate through, one selection per episode -- N=1 is the common 'place one object/stack at a time' case.">Per episode
-      <select id="perEpisodeSelect">
-        <option value="all" selected>All (default)</option>
-        <option value="static">Static (every point)</option>
-        <option value="n">N at a time</option>
-      </select>
-    </label>
-    <label title="'N at a time' only: how many fixed sites to show per episode.">Count <input type="number" id="perEpisodeCountInput" value="1" min="1" disabled></label>
-    <label title="When 2+ objects share a point this episode, how their stacking order (level) varies across episodes. Fixed = today's assignment-order rank, always.">Level
-      <select id="levelSelect">
-        <option value="fixed" selected>Fixed</option>
-        <option value="shuffle">Shuffle</option>
-        <option value="cycle">Cycle</option>
-        <option value="balanced">Balanced</option>
-      </select>
-    </label>
-    <label title="Seed for every randomized aspect above (Combinations=Shuffled/Custom count, Order=Random, Level=Shuffle/Balanced) -- internally kept separate per aspect so they don't silently correlate.">Seed <input type="number" id="sceneSeedInput" value="0"></label>
-  </div>
-  <div class="toolbar-group-inner" style="margin-top: 9px;">
-    <label title="Per episode='All' only: the visit-order axis -- which of a stack unit's own assigned points to show each episode. Synced (default): plain i%length cycle. Shuffled: a seeded-random visit order, decorrelating units of equal length from always pairing the same way. All: every simultaneous combination of every unit's own points (the full Cartesian product). Custom count: sample exactly N combinations, spread by Order below -- decouples the visible combination count from any one unit's own pattern length (e.g. 3 objects with 20 points each can have far more than 20 distinct combinations).">Combinations
-      <select id="combinationsSelect">
-        <option value="synced" selected>Synced (default)</option>
-        <option value="shuffled">Shuffled</option>
-        <option value="all">All</option>
-        <option value="n">Custom count</option>
-      </select>
-    </label>
-    <label title="Combinations='Custom count' only.">Count <input type="number" id="combinationsCountInput" value="50" min="1" disabled></label>
-    <label title="Even (default): a deterministic, evenly-spread choice -- used both for sampling Combinations='Custom count' and for which sites a Per episode='N at a time' selection shows each episode. Random: a seeded random choice instead. Coprime: a deterministic, no-RNG alternative to Even for sampling Combinations='Custom count' only.">Order
-      <select id="orderSelect">
-        <option value="even" selected>Even</option>
-        <option value="random">Random</option>
-        <option value="coprime">Coprime</option>
-      </select>
-    </label>
-    <label title="SCENE-LEVEL: when 2+ objects' own sequenced positions land on the same point this episode, should they STACK there together (one site, several levels), or should the scene actively try to KEEP THEM APART? Under Per episode='All', a later object is nudged onto its own other assigned point (degrades to a stack, with a warning below, if none is free). Under a static Per episode, this instead decides whether the rotation cycles through whole stacks ('Stack') or through every individual point ('Keep apart'), never merging coincidentally-shared points.">Stacking
-      <select id="stackingSelect">
-        <option value="stack" selected>Stack (default)</option>
-        <option value="keep_apart">Keep apart</option>
-      </select>
-    </label>
-  </div>
-  <p class="note" id="collisionWarning" style="display: none; color: var(--cut); margin: 6px 0 0;"></p>
-  <div class="toolbar-group-inner" style="margin-top: 9px;">
-    <label title="Which VIEW this tool shows -- purely a preview choice, with no bearing on what gets exported (that's entirely the Per episode/Combinations/Order/Stacking/Level axes above). Marginal: today's always-on coverage cloud, every assigned point of every object at once. Episode: step through individual episodes using the scene-level axes above.">Preview
-      <select id="previewModeSelect" disabled>
-        <option value="marginal" selected>Marginal (every assigned point)</option>
-        <option value="episode">Episode</option>
-      </select>
-    </label>
-    <span class="toolbar-group-inner" id="episodeStepper" style="display: none;">
-      <button id="episodePrevBtn" class="icon-btn" title="Previous episode">&#8249;</button>
-      <span class="note" id="episodeLabel">episode 1/1</span>
-      <button id="episodeNextBtn" class="icon-btn" title="Next episode">&#8250;</button>
-      <button id="episodePlayBtn" class="icon-btn" title="Animate: auto-advance episodes">&#9654;</button>
-    </span>
-  </div>
-  <p class="note" id="sampleCountLabel" style="margin: 9px 0 0;"></p>
-</div>
-
-<div class="views">
-  <div class="panel view-panel">
-    <div class="view-header">
-      <h2>Camera view</h2>
-      <div class="floating-toolbar" style="margin-left: auto;">
-        <button id="undoBtn" class="icon-btn" title="Undo (Ctrl+Z)" disabled>&#8634;</button>
-        <button id="redoBtn" class="icon-btn" title="Redo (Ctrl+Shift+Z)" disabled>&#8635;</button>
-        <span class="toolbar-divider"></span>
-        <button id="toolbarToggleBtn" class="icon-btn" title="Show/hide editing tools">&#9776;</button>
-        <div id="floatingToolbarTools" style="display: none;">
-          <button id="toolSelect" class="icon-btn" title="Drag a box to select sample points (then drag any of them to move the whole selection, press Delete/Backspace to remove them, or use the Objects card's Assign/Unassign on the selection), or drag/click one point directly; click a cut's body to select it (Delete/Backspace removes it) or drag its handle to reshape it; click empty space to deselect">&#11034;</button>
-          <button id="toolAddRemovePoint" class="icon-btn" title="Click empty space to add a sample point; click an existing one to remove it">&#10010;</button>
-          <span class="toolbar-divider"></span>
-          <button id="toolRect" class="icon-btn" title="Rectangle cut">&#9645;</button>
-          <button id="toolCircle" class="icon-btn" title="Circle cut">&#9711;</button>
-          <button id="toolPolygon" class="icon-btn" title="Polygon cut (double-click or Esc to finish)">&#11040;</button>
-          <span class="toolbar-divider"></span>
-          <button id="clearCutsBtn" class="icon-btn danger" title="Clear all cuts">&#10005;</button>
+<div class="workspace">
+  <div class="canvas-area">
+    <div class="views">
+      <div class="panel view-panel">
+        <div class="view-header">
+          <h2 id="viewTitle">Camera view</h2>
+          <div class="floating-toolbar" style="margin-left: auto;">
+            <button id="viewSwitchBtn" class="icon-btn" title="Switch to orthographic view">&#8644;</button>
+            <span class="toolbar-divider"></span>
+            <button id="undoBtn" class="icon-btn" title="Undo (Ctrl+Z)" disabled>&#8634;</button>
+            <button id="redoBtn" class="icon-btn" title="Redo (Ctrl+Shift+Z)" disabled>&#8635;</button>
+            <span class="toolbar-divider"></span>
+            <button id="toolbarToggleBtn" class="icon-btn" title="Show/hide editing tools">&#9776;</button>
+            <div id="floatingToolbarTools" style="display: none;">
+              <button id="toolSelect" class="icon-btn" title="Drag a box to select sample points (then drag any of them to move the whole selection, press Delete/Backspace to remove them, or use the Objects card's Assign/Unassign on the selection), or drag/click one point directly; click a cut's body to select it (Delete/Backspace removes it) or drag its handle to reshape it; click empty space to deselect">&#11034;</button>
+              <button id="toolAddRemovePoint" class="icon-btn" title="Click empty space to add a sample point; click an existing one to remove it">&#10010;</button>
+              <span class="toolbar-divider"></span>
+              <button id="toolRect" class="icon-btn" title="Rectangle cut">&#9645;</button>
+              <button id="toolCircle" class="icon-btn" title="Circle cut">&#9711;</button>
+              <button id="toolPolygon" class="icon-btn" title="Polygon cut (double-click or Esc to finish)">&#11040;</button>
+              <span class="toolbar-divider"></span>
+              <button id="clearCutsBtn" class="icon-btn danger" title="Clear all cuts">&#10005;</button>
+            </div>
+            <span id="gridToggleDivider" class="toolbar-divider" style="display: none;"></span>
+            <label id="gridToggleLabel" style="display: none;"><input type="checkbox" id="gridToggle" checked> Grid</label>
+          </div>
+        </div>
+        <div class="video-wrap" id="cameraViewWrap">
+          <video id="video" autoplay playsinline muted></video>
+          <canvas id="cameraCanvas"></canvas>
+          <div id="cameraOverlay" class="camera-overlay">
+            <div class="spinner"></div>
+            <p id="cameraOverlayMsg">Requesting camera&hellip;</p>
+            <button id="cameraRetryBtn" style="display: none;">Retry</button>
+          </div>
+        </div>
+        <canvas id="orthoCanvas" style="display: none;"></canvas>
+        <div class="legend" id="orthoLegend" style="display: none;">
+          <span><i class="dot" style="background:var(--accent)"></i> surface / grid</span>
+          <span><i class="dot" style="background:var(--cut)"></i> cuts (no points spawn here)</span>
+          <span id="armColorLegend">extreme-reach points / fitted circle / samples are colored per arm -- see the "Arms" chips in the Setup panel</span>
         </div>
       </div>
     </div>
-    <div class="video-wrap">
-      <video id="video" autoplay playsinline muted></video>
-      <canvas id="cameraCanvas"></canvas>
-    </div>
   </div>
-  <div class="panel view-panel">
-    <div class="view-header">
-      <h2>Orthographic view</h2>
-      <label style="margin-left: auto;"><input type="checkbox" id="gridToggle" checked> Grid</label>
+  <aside class="inspector">
+    <div class="panel">
+      <h2>Setup</h2>
+      <div class="subsection">
+        <div class="subsection-label">Arms</div>
+        <div class="toolbar-group-inner" id="armChips"></div>
+        <div class="toolbar-group-inner" style="margin-top: 9px;">
+          <input type="color" id="armColorInput" title="Active arm's color" value="#34d399">
+          <input type="text" id="armNameInput" placeholder="Arm name" style="width: 96px;">
+          <button id="addArmBtn" class="icon-btn" title="Add another arm">+</button>
+          <button id="removeArmBtn" class="icon-btn danger" title="Remove the active arm">&#10005;</button>
+          <label title="When two arms' reach circles overlap, sample the UNION as one shared area (the overlap isn't double-density) instead of each circle independently. Off by default. Forced on, and disabled, with only one arm.">
+            <input type="checkbox" id="independentToggle"> Independent
+          </label>
+        </div>
+      </div>
+      <div class="subsection">
+        <div class="subsection-label">Workspace edit tools</div>
+        <div class="toolbar-group-inner">
+          <button id="toolCorners" class="icon-btn active" title="Edit: corners, edges, the reach circle &amp; reach points">
+            <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+              <rect x="2" y="2" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6"/>
+              <circle cx="2" cy="2" r="1.6" fill="currentColor"/><circle cx="14" cy="2" r="1.6" fill="currentColor"/>
+              <circle cx="14" cy="14" r="1.6" fill="currentColor"/><circle cx="2" cy="14" r="1.6" fill="currentColor"/>
+              <rect x="7" y="1" width="2" height="2" fill="currentColor"/><rect x="7" y="13" width="2" height="2" fill="currentColor"/>
+              <rect x="1" y="7" width="2" height="2" fill="currentColor"/><rect x="13" y="7" width="2" height="2" fill="currentColor"/>
+            </svg>
+          </button>
+          <button id="lockCornersBtn" class="icon-btn" title="Lock corners/edges">&#x1F513;</button>
+          <button id="resetCornersBtn">Reset corners</button>
+        </div>
+        <div class="toolbar-group-inner" style="margin-top: 9px;">
+          <button id="toolExtreme" title="Mark reach points">Mark reach points</button>
+          <button id="fitCircleBtn" disabled title="Fit a circle to the marked reach points">Fit circle</button>
+          <button id="lockCircleBtn" class="icon-btn" title="Lock the fitted reach circle">&#x1F513;</button>
+          <button id="clearExtremeBtn">Clear points</button>
+        </div>
+      </div>
     </div>
-    <canvas id="orthoCanvas"></canvas>
-    <div class="legend">
-      <span><i class="dot" style="background:var(--accent)"></i> surface / grid</span>
-      <span><i class="dot" style="background:var(--cut)"></i> cuts (no points spawn here)</span>
-      <span id="armColorLegend">extreme-reach points / fitted circle / samples are colored per arm -- see the "Arms" chips above</span>
+    <div class="panel">
+      <div class="subsection">
+        <div class="card-header">
+          <h2 id="patternPreviewLabel" style="margin: 0;">Pattern</h2>
+          <button id="lockPatternBtn" class="icon-btn" title="Lock pattern: also blocks moving/adding/removing sample points">&#x1F513;</button>
+        </div>
+        <div class="toolbar-group-inner">
+          <label>Steps <input type="number" id="stepsInput" value="20" min="1"></label>
+          <span class="note" id="actualCountLabel"></span>
+          <label>Seed <input type="number" id="seedInput" value="0"></label>
+          <label>Distribution
+            <select id="distributionSelect">
+              <option value="grid" selected>Grid</option>
+              <option value="radial" id="distributionRadialOption">Radial (beta)</option>
+              <option value="random">Random</option>
+            </select>
+          </label>
+          <label>Border width <input type="number" id="borderWidthInput" value="0" min="0"></label>
+          <label>Count mode
+            <select id="countModeSelect">
+              <option value="fixed" selected>Fixed</option>
+              <option value="variable" id="countModeVariableOption">Variable</option>
+            </select>
+          </label>
+        </div>
+      </div>
+      <div class="subsection">
+        <h2 id="orientationPreviewLabel" style="margin: 0 0 10px;">Rotation</h2>
+        <div class="toolbar-group-inner">
+          <label title="A real config option (orientation:), not just a local preview -- Rerun won't show direction arrows during recording unless this is enabled too."><input type="checkbox" id="orientationToggle"> Enable</label>
+        </div>
+        <div id="orientationDetailFields" class="toolbar-group-inner" style="display: none; margin-top: 9px;">
+          <label>Count <input type="number" id="orientationCountInput" value="1" min="1"></label>
+          <label>Method
+            <select id="orientationMethodSelect">
+              <option value="uniform" selected>Uniform</option>
+              <option value="random">Random</option>
+            </select>
+          </label>
+          <label>Initial&deg; <input type="number" id="orientationInitialAngleInput" value="0"></label>
+          <label>Start&deg; <input type="number" id="orientationAngleStartInput" value="0"></label>
+          <label>End&deg; <input type="number" id="orientationAngleEndInput" value="360"></label>
+          <label>Seed <input type="number" id="orientationSeedInput" value="0"></label>
+          <label>Arrow len <input type="number" id="orientationArrowLengthInput" value="40" min="1"></label>
+          <button id="resetOrientationBtn" class="danger" title="Selected points: clear their override, reverting to this default. Nothing selected: clear every point's override.">Reset to default</button>
+        </div>
+      </div>
     </div>
-  </div>
+    <div class="panel">
+      <h2>Objects</h2>
+      <div class="toolbar-group-inner" id="objectChips"></div>
+      <div class="toolbar-group-inner" style="margin-top: 9px;">
+        <input type="color" id="objectColorInput" title="Active object's color" value="#f87171" disabled>
+        <input type="text" id="objectNameInput" placeholder="Object name" style="width: 96px;" disabled>
+        <button id="addObjectBtn" class="icon-btn" title="Add another object">+</button>
+        <button id="removeObjectBtn" class="icon-btn danger" title="Remove the active object" disabled>&#10005;</button>
+        <button id="assignSelectedBtn" title="Assign the active object to every currently-selected sample point (select points first with the select tool)" disabled>Assign</button>
+        <button id="unassignSelectedBtn" title="Remove the active object from every currently-selected sample point" disabled>Unassign</button>
+      </div>
+      <div class="toolbar-group-inner" style="margin-top: 9px;">
+        <label title="A shorthand that sets every axis below at once -- pick one, or pick 'Custom' and set axes individually. Editing any axis directly afterward switches this back to Custom automatically.">Preset
+          <select id="presetSelect">
+            <option value="sweep" selected>Sweep (default -- every object, every episode)</option>
+            <option value="shuffled_sweep">Shuffled sweep</option>
+            <option value="one_at_a_time">One at a time</option>
+            <option value="cycle_through_points">Cycle through points</option>
+            <option value="show_everything">Show everything (no rotation)</option>
+            <option value="every_combination">Every combination</option>
+            <option value="sample_combinations">Sample combinations</option>
+            <option value="custom">Custom</option>
+          </select>
+        </label>
+      </div>
+      <div class="toolbar-group-inner" style="margin-top: 9px;">
+        <label title="SCENE-LEVEL: how many targets are shown each episode. All (default): every object's own position advances every episode (a dynamic sweep). Static: every point any object is assigned to is shown at once, every episode, with no rotation at all. N at a time: exactly N of those fixed points/stacks rotate through, one selection per episode -- N=1 is the common 'place one object/stack at a time' case.">Per episode
+          <select id="perEpisodeSelect">
+            <option value="all" selected>All (default)</option>
+            <option value="static">Static (every point)</option>
+            <option value="n">N at a time</option>
+          </select>
+        </label>
+        <label title="'N at a time' only: how many fixed sites to show per episode.">Count <input type="number" id="perEpisodeCountInput" value="1" min="1" disabled></label>
+        <label title="When 2+ objects share a point this episode, how their stacking order (level) varies across episodes. Fixed = today's assignment-order rank, always.">Level
+          <select id="levelSelect">
+            <option value="fixed" selected>Fixed</option>
+            <option value="shuffle">Shuffle</option>
+            <option value="cycle">Cycle</option>
+            <option value="balanced">Balanced</option>
+          </select>
+        </label>
+        <label title="Seed for every randomized aspect above (Combinations=Shuffled/Custom count, Order=Random, Level=Shuffle/Balanced) -- internally kept separate per aspect so they don't silently correlate.">Seed <input type="number" id="sceneSeedInput" value="0"></label>
+      </div>
+      <div class="toolbar-group-inner" style="margin-top: 9px;">
+        <label title="Per episode='All' only: the visit-order axis -- which of a stack unit's own assigned points to show each episode. Synced (default): plain i%length cycle. Shuffled: a seeded-random visit order, decorrelating units of equal length from always pairing the same way. All: every simultaneous combination of every unit's own points (the full Cartesian product). Custom count: sample exactly N combinations, spread by Order below -- decouples the visible combination count from any one unit's own pattern length (e.g. 3 objects with 20 points each can have far more than 20 distinct combinations).">Combinations
+          <select id="combinationsSelect">
+            <option value="synced" selected>Synced (default)</option>
+            <option value="shuffled">Shuffled</option>
+            <option value="all">All</option>
+            <option value="n">Custom count</option>
+          </select>
+        </label>
+        <label title="Combinations='Custom count' only.">Count <input type="number" id="combinationsCountInput" value="50" min="1" disabled></label>
+        <label title="Even (default): a deterministic, evenly-spread choice -- used both for sampling Combinations='Custom count' and for which sites a Per episode='N at a time' selection shows each episode. Random: a seeded random choice instead. Coprime: a deterministic, no-RNG alternative to Even for sampling Combinations='Custom count' only.">Order
+          <select id="orderSelect">
+            <option value="even" selected>Even</option>
+            <option value="random">Random</option>
+            <option value="coprime">Coprime</option>
+          </select>
+        </label>
+        <label title="SCENE-LEVEL: when 2+ objects' own sequenced positions land on the same point this episode, should they STACK there together (one site, several levels), or should the scene actively try to KEEP THEM APART? Under Per episode='All', a later object is nudged onto its own other assigned point (degrades to a stack, with a warning below, if none is free). Under a static Per episode, this instead decides whether the rotation cycles through whole stacks ('Stack') or through every individual point ('Keep apart'), never merging coincidentally-shared points.">Stacking
+          <select id="stackingSelect">
+            <option value="stack" selected>Stack (default)</option>
+            <option value="keep_apart">Keep apart</option>
+          </select>
+        </label>
+      </div>
+      <p class="note" id="collisionWarning" style="display: none; color: var(--cut); margin: 6px 0 0;"></p>
+      <div class="toolbar-group-inner" style="margin-top: 9px;">
+        <label title="Which VIEW this tool shows -- purely a preview choice, with no bearing on what gets exported (that's entirely the Per episode/Combinations/Order/Stacking/Level axes above). Marginal: today's always-on coverage cloud, every assigned point of every object at once. Episode: step through individual episodes using the scene-level axes above.">Preview
+          <select id="previewModeSelect" disabled>
+            <option value="marginal" selected>Marginal (every assigned point)</option>
+            <option value="episode">Episode</option>
+          </select>
+        </label>
+        <span class="toolbar-group-inner" id="episodeStepper" style="display: none;">
+          <button id="episodePrevBtn" class="icon-btn" title="Previous episode">&#8249;</button>
+          <span class="note" id="episodeLabel">episode 1/1</span>
+          <button id="episodeNextBtn" class="icon-btn" title="Next episode">&#8250;</button>
+          <button id="episodePlayBtn" class="icon-btn" title="Animate: auto-advance episodes">&#9654;</button>
+        </span>
+      </div>
+      <p class="note" id="sampleCountLabel" style="margin: 9px 0 0;"></p>
+    </div>
+    <div class="panel">
+      <h2>Config snippet</h2>
+      <textarea id="yamlOut" readonly></textarea>
+      <div class="toolbar-group" style="margin-top: 10px;">
+        <button id="saveConfigBtn">Save to file...</button>
+        <span id="saveStatus" class="note"></span>
+      </div>
+    </div>
+  </aside>
 </div>
-
-<div class="panel">
-  <h2>Config snippet</h2>
-  <textarea id="yamlOut" readonly></textarea>
-  <div class="toolbar-group" style="margin-top: 10px;">
-    <button id="saveConfigBtn">Save to file...</button>
-    <span id="saveStatus" class="note"></span>
-  </div>
-</div>
-
-<p class="note">If the browser refuses camera access on this page: <code>vizaudit-calibrate</code>
-serves it on <code>http://localhost</code> and opens your default browser automatically by
-default, which avoids the camera-permission restrictions some browsers apply to
-<code>file://</code> pages (and that a VS Code/editor preview pane applies regardless of
-origin). If you opened this file directly some other way, run
-<code>vizaudit-calibrate --output calibration.html</code> without <code>--no-serve</code>
-instead, or manually serve it yourself, e.g. <code>python -m http.server</code> in this
-file's directory.</p>
 
 <script src="calibrate.js"></script>
 </body>

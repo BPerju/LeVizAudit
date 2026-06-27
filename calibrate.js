@@ -5,7 +5,9 @@
 // what lets a Node harness run this file's body directly in one scope to test it.
 //
 // Section index (grep the exact banner text to jump to one):
-//   "── Camera setup ──"                   getUserMedia device list + live video element
+//   "── Camera setup ──"                   getUserMedia (default camera) + loading/error overlay
+//   "── View switch..."                    toggles which of camera/ortho is shown in the one
+//                                           collapsed view frame
 //   "── State (source of truth..."         the one mutable `tool`/lock/corner state every
 //                                           other section reads
 //   "── Arms (bimanual support) ──"        per-arm reach-circle calibration + combined/
@@ -27,8 +29,15 @@
 const video = document.getElementById("video");
 const cameraCanvas = document.getElementById("cameraCanvas");
 const orthoCanvas = document.getElementById("orthoCanvas");
-const deviceSelect = document.getElementById("deviceSelect");
-const startBtn = document.getElementById("startBtn");
+const cameraOverlay = document.getElementById("cameraOverlay");
+const cameraOverlayMsg = document.getElementById("cameraOverlayMsg");
+const cameraRetryBtn = document.getElementById("cameraRetryBtn");
+const viewTitle = document.getElementById("viewTitle");
+const viewSwitchBtn = document.getElementById("viewSwitchBtn");
+const cameraViewWrap = document.getElementById("cameraViewWrap");
+const orthoLegend = document.getElementById("orthoLegend");
+const gridToggleLabel = document.getElementById("gridToggleLabel");
+const gridToggleDivider = document.getElementById("gridToggleDivider");
 const armChips = document.getElementById("armChips");
 const armColorInput = document.getElementById("armColorInput");
 const armNameInput = document.getElementById("armNameInput");
@@ -105,36 +114,31 @@ const saveStatus = document.getElementById("saveStatus");
 
 let currentStream = null;
 
-async function listDevices() {
-  const devices = await navigator.mediaDevices.enumerateDevices();
-  const videoInputs = devices.filter(function (d) { return d.kind === "videoinput"; });
-  deviceSelect.innerHTML = "";
-  videoInputs.forEach(function (d, i) {
-    const opt = document.createElement("option");
-    opt.value = d.deviceId;
-    opt.textContent = d.label || ("Camera " + (i + 1));
-    deviceSelect.appendChild(opt);
-  });
-}
-
 async function startCamera() {
   if (currentStream) {
     currentStream.getTracks().forEach(function (t) { t.stop(); });
   }
-  const deviceId = deviceSelect.value;
-  const constraints = { video: deviceId ? { deviceId: { exact: deviceId } } : true };
-  currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+  currentStream = await navigator.mediaDevices.getUserMedia({ video: true });
   video.srcObject = currentStream;
-  await listDevices();
 }
 
-startBtn.addEventListener("click", function () {
+function showCameraOverlay(message, showRetry) {
+  cameraOverlayMsg.textContent = message;
+  cameraRetryBtn.style.display = showRetry ? "" : "none";
+  cameraOverlay.classList.remove("hidden");
+}
+
+function requestCamera() {
+  showCameraOverlay("Requesting camera…", false);
   startCamera().catch(function (err) {
-    alert("Could not access camera: " + err.message);
+    showCameraOverlay("Could not access camera: " + err.message, true);
   });
-});
+}
+
+cameraRetryBtn.addEventListener("click", requestCamera);
 
 video.addEventListener("loadedmetadata", function () {
+  cameraOverlay.classList.add("hidden");
   cameraCanvas.width = video.videoWidth;
   cameraCanvas.height = video.videoHeight;
   if (cameraCorners.length === 0) {
@@ -145,14 +149,41 @@ video.addEventListener("loadedmetadata", function () {
 
 window.addEventListener("resize", function () { renderAll(); });
 
-listDevices();
-// Request camera permission proactively on load, rather than waiting for the operator to
-// find and click "Start camera" first. If this is denied or there's no camera yet, the
-// button below still works as a manual retry (e.g. after granting permission in the
-// browser's UI, or after plugging in a camera).
-startCamera().catch(function (err) {
-  console.warn("Camera not started automatically on load:", err.message);
+// Request camera permission proactively on load, showing a loading spinner until the feed is
+// ready, rather than a blank panel. If denied or there's no camera yet, the overlay's Retry
+// button re-requests (e.g. after granting permission in the browser's UI, or plugging in a
+// camera).
+requestCamera();
+
+// ── View switch (camera/orthographic collapsed into one frame) ───────────
+// The two views used to sit side by side, permanently visible; now only one is shown at a
+// time in a single frame, toggled by viewSwitchBtn, to leave more width for each view. Both
+// canvases/the video stay in the DOM and keep rendering every renderAll() regardless of which
+// is visible (cheap canvas operations) -- only the CSS display of the inactive one's elements
+// changes, so no rendering logic needed to branch on activeView.
+let activeView = "camera";
+
+function applyActiveView() {
+  const isCamera = activeView === "camera";
+  viewTitle.textContent = isCamera ? "Camera view" : "Orthographic view";
+  viewSwitchBtn.title = isCamera ? "Switch to orthographic view" : "Switch to camera view";
+  cameraViewWrap.style.display = isCamera ? "" : "none";
+  orthoCanvas.style.display = isCamera ? "none" : "";
+  orthoLegend.style.display = isCamera ? "none" : "";
+  gridToggleLabel.style.display = isCamera ? "none" : "";
+  gridToggleDivider.style.display = isCamera ? "none" : "";
+}
+
+viewSwitchBtn.addEventListener("click", function () {
+  activeView = activeView === "camera" ? "ortho" : "camera";
+  applyActiveView();
+  // The ortho canvas sizes itself from its (now-visible) container's clientWidth on render --
+  // re-render so it picks up the correct size immediately instead of staying at whatever size
+  // it last had while hidden.
+  renderAll();
 });
+
+applyActiveView();
 
 // ── State (source of truth; everything else is derived in renderAll()) ───
 // One mutually-exclusive radio-button state for every interaction mode -- "corners" |
@@ -1954,6 +1985,57 @@ function findOrthoEditTarget(cp) {
   return bestHandle ? { kind: "shape", handle: bestHandle } : null;
 }
 
+// Keeps the workspace quad simple/convex while a corner or edge is being dragged. Moving even
+// ONE corner can flip the angle at up to 3 of the 4 vertices, not just the one being dragged --
+// e.g. dragging the top-left corner across the diagonal can blow out the angle at the TOP-RIGHT
+// corner instead (where the top and right edges meet), well before the dragged corner's own
+// angle (measured against its immediate neighbors) looks invalid. An earlier version of this
+// fix only checked the dragged corner's own angle and missed exactly this case (reported
+// directly: "the top edge and right edge reach more than 180 degrees" while dragging the
+// top-left corner). Rather than hand-deriving which OTHER vertex's line each drag kind can
+// threaten (error-prone -- a quad has only 4 vertices but the affected set differs for a
+// corner-drag vs. an edge-drag), `quadStillConvex` checks ALL 4 vertices directly and uniformly,
+// and `clampCornersForConvexity` finds the largest fraction of the raw (unclamped) movement,
+// from the drag-start corners toward the candidate corners, that keeps every vertex's sign
+// matching what it was at drag-start -- via binary search rather than a closed-form per-vertex
+// projection, since that search is correct by construction for any number/combination of moved
+// corners (1 for a corner drag, 2 for an edge drag) without needing a separate derivation per
+// case. 25 iterations gives sub-pixel precision at negligible cost for a 4-point polygon.
+function cornerSigns(corners) {
+  const signs = [];
+  for (let v = 0; v < 4; v++) {
+    const prev = corners[(v + 3) % 4], next = corners[(v + 1) % 4], cur = corners[v];
+    const cross = (next[0] - prev[0]) * (cur[1] - prev[1]) - (next[1] - prev[1]) * (cur[0] - prev[0]);
+    signs.push(Math.sign(cross) || 1);
+  }
+  return signs;
+}
+function quadStillConvex(corners, refSigns) {
+  for (let v = 0; v < 4; v++) {
+    const prev = corners[(v + 3) % 4], next = corners[(v + 1) % 4], cur = corners[v];
+    const cross = (next[0] - prev[0]) * (cur[1] - prev[1]) - (next[1] - prev[1]) * (cur[0] - prev[0]);
+    if (Math.sign(cross) !== refSigns[v]) return false;
+  }
+  return true;
+}
+function clampCornersForConvexity(startCorners, candidateCorners, refSigns) {
+  if (quadStillConvex(candidateCorners, refSigns)) return candidateCorners;
+  function lerp(frac) {
+    return candidateCorners.map(function (c, k) {
+      return [
+        startCorners[k][0] + (c[0] - startCorners[k][0]) * frac,
+        startCorners[k][1] + (c[1] - startCorners[k][1]) * frac,
+      ];
+    });
+  }
+  let lo = 0, hi = 1; // lo: known-still-valid fraction of the move, hi: known-invalid
+  for (let iter = 0; iter < 25; iter++) {
+    const mid = (lo + hi) / 2;
+    if (quadStillConvex(lerp(mid), refSigns)) lo = mid; else hi = mid;
+  }
+  return lerp(lo);
+}
+
 // Workspace setup's "corners" tool: corners, edge midpoints (dragging one translates both its
 // corners together, so a whole side slides/scales rather than only ever pulling one vertex --
 // requested explicitly), the active arm's fitted reach circle, and reach points -- everything
@@ -1968,7 +2050,13 @@ function findCameraCornersTarget(p) {
       const d = Math.hypot(c[0] - p[0], c[1] - p[1]);
       if (d < bestDist) { bestDist = d; bestIdx = i; }
     });
-    if (bestIdx >= 0) return { kind: "corner", index: bestIdx };
+    if (bestIdx >= 0) {
+      return {
+        kind: "corner", index: bestIdx,
+        startCorners: cameraCorners.map(function (c) { return c.slice(); }),
+        refSigns: cornerSigns(cameraCorners),
+      };
+    }
     // Hit-test the whole segment, not just its midpoint -- a midpoint-only test made long
     // edges (typically top/bottom, in a landscape frame) practically ungrabbable anywhere
     // except their exact center, while short edges (typically left/right) were grabbable
@@ -1990,7 +2078,11 @@ function findCameraCornersTarget(p) {
       // constrained corners on every move) avoids the classification flapping near 45 degrees.
       const a = cameraCorners[bestEdge], b = cameraCorners[(bestEdge + 1) % 4];
       const isVertical = Math.abs(a[1] - b[1]) > Math.abs(a[0] - b[0]);
-      return { kind: "edge", index: bestEdge, isVertical: isVertical };
+      return {
+        kind: "edge", index: bestEdge, isVertical: isVertical,
+        startCorners: cameraCorners.map(function (c) { return c.slice(); }),
+        refSigns: cornerSigns(cameraCorners),
+      };
     }
   }
   if (homography && fittedCircle && !circleLocked) {
@@ -3006,7 +3098,7 @@ let lastCanonicalSize = null; // for rescaleCanonicalShapes() -- see below
 // to draw a light "here's roughly where this arm's circle/extreme points are" outline.
 let otherArmsRenderData = [];
 
-function rescaleCanonicalShapes(scaleX, scaleY) {
+function rescaleCanonicalShapes(scaleX, scaleY, oldInverseHomography) {
   // canonicalSize is RE-DERIVED from the corners' own pixel distances every render
   // (canonicalRectDims) -- so nudging a corner even slightly changes the canonical
   // coordinate system's scale. fittedCircle/cutShapesCanonical hold ABSOLUTE canonical
@@ -3029,6 +3121,26 @@ function rescaleCanonicalShapes(scaleX, scaleY) {
       circle.radius *= avgScale;
     }
   });
+  // extremePointsCamera is stored in PIXEL space (a literal observation of where the arm was in
+  // the live image, not a canonical-space shape) -- so unlike fittedCircle/cuts above, it was
+  // never touched by a corner edit at all, leaving every previously-marked reach point pointing
+  // at the OLD, now-wrong patch of the image after a corner nudge (reported directly: "mark
+  // reach points do not follow the workspace when I modify it"). Fixed by re-anchoring each
+  // point to the SAME *canonical* position it had before the edit -- old pixel -> old canonical
+  // (via the OLD inverse homography, captured by the caller before it got overwritten) ->
+  // proportionally rescaled exactly like every other canonical-space shape above -> new pixel
+  // (via the NEW, already-recomputed `homography`). Every arm needs this, not just the active
+  // one, mirroring the fittedCircle loop above for the same reason.
+  if (oldInverseHomography && homography) {
+    arms.forEach(function (arm, i) {
+      const points = i === activeArmIndex ? extremePointsCamera : arm.extremePointsCamera;
+      for (let k = 0; k < points.length; k++) {
+        const oldCanonical = applyHomography(oldInverseHomography, points[k]);
+        const newCanonical = [oldCanonical[0] * scaleX, oldCanonical[1] * scaleY];
+        points[k] = applyHomography(homography, newCanonical);
+      }
+    });
+  }
   // sampleOverrides/extraSamplePoints are SETTINGS_FIELDS entries shared by name across
   // combinedSettings and every arm's own settings -- but the ACTUAL array/object a given name
   // points to can be the literal SAME reference as the live global: always when
@@ -3079,12 +3191,15 @@ function renderAll() {
   syncActiveArmFromGlobals(); // keep arms[activeArmIndex] fresh for export/other-arm rendering
   orientationDetailFields.style.display = orientationToggle.checked ? "" : "none";
   armColorLegend.style.display = arms.length > 1 ? "" : "none";
+  // Captured before being overwritten below -- rescaleCanonicalShapes needs the OLD mapping to
+  // re-anchor extreme points (see its own comment for why).
+  const oldInverseHomography = inverseHomography;
   homography = (cameraCorners.length === 4) ? computeHomography(cameraCorners) : null;
   inverseHomography = homography ? invertMatrix3(homography) : null;
   canonicalSize = homography ? canonicalRectDims(cameraCorners) : null;
   if (canonicalSize && lastCanonicalSize &&
       (canonicalSize[0] !== lastCanonicalSize[0] || canonicalSize[1] !== lastCanonicalSize[1])) {
-    rescaleCanonicalShapes(canonicalSize[0] / lastCanonicalSize[0], canonicalSize[1] / lastCanonicalSize[1]);
+    rescaleCanonicalShapes(canonicalSize[0] / lastCanonicalSize[0], canonicalSize[1] / lastCanonicalSize[1], oldInverseHomography);
   }
   lastCanonicalSize = canonicalSize;
   extremePointsCanonical = inverseHomography
@@ -4378,19 +4493,24 @@ cameraCanvas.addEventListener("mousemove", function (e) {
   const p = getCanvasPoint(cameraCanvas, e);
   if (activeDrag) {
     if (activeDrag.kind === "corner") {
-      cameraCorners[activeDrag.index] = p;
+      const candidateCorners = activeDrag.startCorners.map(function (c, k) {
+        return k === activeDrag.index ? p : c;
+      });
+      cameraCorners = clampCornersForConvexity(activeDrag.startCorners, candidateCorners, activeDrag.refSigns);
       renderAll();
     } else if (activeDrag.kind === "edge") {
       const i = activeDrag.index, j = (i + 1) % 4;
-      const a = cameraCorners[i], b = cameraCorners[j];
+      const a = activeDrag.startCorners[i], b = activeDrag.startCorners[j];
       const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
       // Axis-locked: a vertical (left/right) edge only ever changes x, a horizontal
       // (top/bottom) edge only ever changes y -- otherwise a side could drift off-axis while
       // "scaling" (reported directly).
       const dx = activeDrag.isVertical ? p[0] - mid[0] : 0;
       const dy = activeDrag.isVertical ? 0 : p[1] - mid[1];
-      cameraCorners[i] = [a[0] + dx, a[1] + dy];
-      cameraCorners[j] = [b[0] + dx, b[1] + dy];
+      const candidateCorners = activeDrag.startCorners.map(function (c, k) {
+        return (k === i || k === j) ? [c[0] + dx, c[1] + dy] : c;
+      });
+      cameraCorners = clampCornersForConvexity(activeDrag.startCorners, candidateCorners, activeDrag.refSigns);
       renderAll();
     } else if (activeDrag.kind === "scaleAll") {
       const d = Math.hypot(p[0] - activeDrag.centroid[0], p[1] - activeDrag.centroid[1]);

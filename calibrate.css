@@ -56,14 +56,11 @@
     font-size: 0.68rem; font-weight: 600; color: var(--text-faint);
     text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px;
   }
+  /* Setup's subsections (Arms/Workspace edit tools) stack vertically with a horizontal rule
+     between them -- same as every other multi-subsection card (Pattern/Rotation). The inspector
+     column is narrow (~400px), so side-by-side columns with a vertical rule (an earlier design)
+     cramped together and wrapped raggedly; reported directly. */
   .subsection + .subsection { border-top: 1px solid var(--border-subtle); margin-top: 16px; padding-top: 16px; }
-  /* The Setup card's 3 subsections (Camera/Arms/Workspace edit tools) sit side by side as
-     columns, not stacked rows -- requested directly. Overrides the stacked-subsection rule
-     above with a vertical rule between columns instead of a horizontal one above each;
-     wraps to stacked rows on a narrow viewport, same as every other flex-wrap group here. */
-  .setup-columns { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
-  .setup-columns > .subsection { flex: 1 1 220px; border-top: none; margin-top: 0; padding-top: 0; }
-  .setup-columns > .subsection + .subsection { border-left: 1px solid var(--border-subtle); padding-left: 24px; }
 
   button, select, input[type="number"] {
     background: var(--surface-1);
@@ -86,6 +83,39 @@
   label { font-size: 0.82rem; color: var(--text-muted); display: flex; align-items: center; gap: 5px; }
   input[type="checkbox"] { accent-color: var(--accent); }
 
+  /* Canvas + inspector layout: the two views stay pinned in the viewport (sticky) while every
+     control card scrolls past in a separate column -- fixes the original single-column page,
+     where editing a control (top) and seeing its effect on the views (further down) meant
+     scrolling up and down repeatedly. The inspector is a flat 40% of the workspace's width
+     (requested directly, replacing an earlier fixed-600px column) -- it grows/shrinks
+     proportionally with the window instead of leaving a fixed amount of space, and narrows or
+     widens the remaining canvas-area to match, which -- since the video/canvas scale
+     width-first (width:100%; height:auto) -- adjusts the camera/ortho view's rendered height
+     too, without needing any height-capping CSS on the view itself. Below 1300px there isn't
+     room for both columns, so this collapses to the original stacked-vertically flow (views on
+     top, controls below, no sticky). */
+  .workspace { display: flex; gap: 16px; align-items: flex-start; }
+  .canvas-area { flex: 1 1 0; min-width: 0; position: sticky; top: 24px; align-self: flex-start; }
+  .inspector { flex: 0 0 40%; min-width: 320px; }
+  .inspector .panel:last-child { margin-bottom: 0; }
+  /* Selects (unlike buttons/number/text/color inputs, which should stay sized to their short
+     content regardless of how wide the inspector gets) grow to fill their row's leftover width
+     instead of sitting at native/content-driven size -- requested directly ("make the items
+     inside scale appropriately horizontally"), since a 40%-wide column can now be anywhere from
+     ~500px to 1000+px depending on the screen, and a dropdown holding a long option (e.g. the
+     Preset select's descriptions) looked the same cramped size regardless. `:has()` targets only
+     the label wrapping a select (every other label -- a checkbox, a number input, a button-like
+     toggle -- is unaffected and stays compact); `min-width: 0` overrides the flex item default of
+     `auto`, which would otherwise floor the select at its own content width and defeat shrinking
+     in a tight row. */
+  .toolbar-group-inner label:has(select) { flex: 1 1 160px; }
+  .toolbar-group-inner label:has(select) select { flex: 1 1 auto; min-width: 0; width: 100%; }
+  @media (max-width: 1300px) {
+    .workspace { flex-wrap: wrap; }
+    .canvas-area { position: static; flex-basis: 100%; }
+    .inspector { flex-basis: 100%; }
+  }
+
   .views { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
   .view-panel { flex: 1 1 380px; min-width: 320px; }
   .view-header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
@@ -99,14 +129,7 @@
   .floating-toolbar { display: flex; align-items: center; gap: 6px; }
   #floatingToolbarTools { display: flex; align-items: center; gap: 6px; }
   .video-wrap { position: relative; width: 100%; line-height: 0; }
-  video, #cameraCanvas {
-    width: 100%;
-    height: auto;
-    border-radius: var(--radius);
-    background: var(--surface-0);
-    display: block;
-  }
-  #orthoCanvas {
+  video, #cameraCanvas, #orthoCanvas {
     width: 100%;
     height: auto;
     border-radius: var(--radius);
@@ -117,6 +140,23 @@
      inherit an opaque background, or it paints over and hides the feed. */
   #cameraCanvas { position: absolute; top: 0; left: 0; cursor: crosshair; background: transparent; }
   #orthoCanvas { cursor: crosshair; }
+  /* Shown over the video while the browser is still acquiring the camera (or if permission was
+     denied), so the operator sees feedback instead of a blank panel that silently becomes the
+     feed once getUserMedia resolves. Hidden once the video's loadedmetadata event fires. */
+  .camera-overlay {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px;
+    background: var(--surface-0); border-radius: var(--radius);
+    color: var(--text-muted); font-size: 0.85rem; line-height: 1.4; text-align: center;
+    padding: 16px;
+  }
+  .camera-overlay.hidden { display: none; }
+  .spinner {
+    width: 28px; height: 28px; border-radius: 50%;
+    border: 3px solid var(--border-strong); border-top-color: var(--accent);
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
   /* A knife cursor while a cut-drawing tool is active, requested explicitly so the cut
      tool reads as "cut" rather than the generic crosshair used for every other mode. The
      ", crosshair" fallback covers browsers that can't parse the inline-SVG cursor.
